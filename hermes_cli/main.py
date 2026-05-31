@@ -1191,6 +1191,12 @@ def _tui_need_npm_install(root: Path) -> bool:
     ``package.json``), skip reinstall entirely — the bundle is self-contained
     and there is nothing to install.
 
+    With npm workspaces the single ``package-lock.json`` and the hoisted
+    ``node_modules/`` live at the workspace root (the parent of the
+    ``ui-tui/`` directory).  The lockfile / ink / marker checks use that
+    workspace root; only the prebuilt-bundle sentinel stays relative to
+    *root* (``ui-tui/dist/entry.js``).
+
     Compares ``package-lock.json`` against ``node_modules/.package-lock.json``
     (npm's hidden lockfile) by **content**, not mtime: git checkouts and npm
     rewrites can bump the root lockfile's timestamp even when installed deps
@@ -1208,19 +1214,21 @@ def _tui_need_npm_install(root: Path) -> bool:
     we'd rather not force a reinstall for them. Falls back to mtime
     comparison if either lockfile is unparseable.
     """
-    lock = root / "package-lock.json"
-    entry = root / "dist" / "entry.js"
     # Prebuilt self-contained bundle (nix / packaged release): no lockfile
     # shipped, dist/entry.js is the single runtime artefact.
+    entry = root / "dist" / "entry.js"
+    # With npm workspaces the lockfile lives at the workspace root.
+    ws_root = root.parent if (root / "package.json").is_file() and not (root / "package-lock.json").is_file() and (root.parent / "package-lock.json").is_file() else root
+    lock = ws_root / "package-lock.json"
     if entry.is_file() and not lock.is_file():
         return False
 
-    ink = root / "node_modules" / "@hermes" / "ink" / "package.json"
+    ink = ws_root / "node_modules" / "@hermes" / "ink" / "package.json"
     if not ink.is_file():
         return True
     if not lock.is_file():
         return False
-    marker = root / "node_modules" / ".package-lock.json"
+    marker = ws_root / "node_modules" / ".package-lock.json"
     if not marker.is_file():
         return True
 
@@ -1269,7 +1277,6 @@ _TUI_BUILD_INPUT_FILES = (
     "babel.compiler.config.cjs",
     "scripts/build.mjs",
     "packages/hermes-ink/package.json",
-    "packages/hermes-ink/package-lock.json",
     "packages/hermes-ink/index.js",
     "packages/hermes-ink/text-input.js",
 )
@@ -1436,6 +1443,8 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
 
     # 2. Normal flow: npm install if needed, always esbuild, then node dist/entry.js.
     #    --dev flow: npm install if needed, then tsx src/entry.tsx.
+    #    npm install runs from the workspace root (where package-lock.json lives);
+    #    npm workspaces resolves ui-tui deps automatically.
     did_install = False
     if _tui_need_npm_install(tui_dir):
         npm = _node_bin("npm")
@@ -1443,7 +1452,7 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
             print("Installing TUI dependencies…")
         result = subprocess.run(
             [npm, "install", "--silent", "--no-fund", "--no-audit", "--progress=false"],
-            cwd=str(tui_dir),
+            cwd=str(tui_dir.parent if (tui_dir.parent / "package-lock.json").is_file() else tui_dir),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -6602,7 +6611,6 @@ def _web_ui_build_needed(web_dir: Path) -> bool:
                     return True
     for meta in (
         "package.json",
-        "package-lock.json",
         "yarn.lock",
         "pnpm-lock.yaml",
         "vite.config.ts",
@@ -6611,6 +6619,10 @@ def _web_ui_build_needed(web_dir: Path) -> bool:
         mp = web_dir / meta
         if mp.exists() and mp.stat().st_mtime > dist_mtime:
             return True
+    # Workspace root lockfile (single package-lock.json covers all workspaces).
+    root_lock = project_root / "package-lock.json"
+    if root_lock.exists() and root_lock.stat().st_mtime > dist_mtime:
+        return True
     return False
 
 
@@ -6807,7 +6819,11 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
             if text:
                 _say(text)
 
-    r1 = _run_npm_install_deterministic(npm, web_dir, extra_args=("--silent",))
+    r1 = _run_npm_install_deterministic(
+        npm,
+        web_dir.parent if (web_dir.parent / "package-lock.json").is_file() else web_dir,
+        extra_args=("--silent",),
+    )
     if r1.returncode != 0:
         _say(
             f"  {'✗' if fatal else '⚠'} Web UI npm install failed"
@@ -8554,44 +8570,25 @@ def _update_node_dependencies() -> None:
     if not npm:
         return
 
-    paths = (
-        ("repo root", PROJECT_ROOT),
-        ("ui-tui", PROJECT_ROOT / "ui-tui"),
-    )
-    if not any((path / "package.json").exists() for _, path in paths):
+    if not (PROJECT_ROOT / "package.json").exists():
         return
 
+    # With a single workspace lockfile, one root install covers all
+    # workspaces (ui-tui, web, apps/desktop).  Previously each workspace
+    # had its own lockfile and was installed separately.
     print("→ Updating Node.js dependencies...")
-    for label, path in paths:
-        if not (path / "package.json").exists():
-            continue
+    extra_args = ["--no-fund", "--no-audit", "--progress=false"]
 
-        # Stream npm output (no `--silent`, no `capture_output`) so any
-        # optional dependency postinstall scripts (e.g. `agent-browser`'s
-        # Chromium fetch on first install) print progress instead of
-        # appearing to hang silently for minutes (#18840).  The
-        # `_UpdateOutputStream` wrapper installed by the updater mirrors
-        # streamed output to ``~/.hermes/logs/update.log`` so nothing is lost.
-        #
-        # The repo root install also passes `--workspaces=false` so npm
-        # does not recursively install every `apps/*` workspace (dashboard,
-        # desktop, shared) — those are installed/built on demand via
-        # `_build_web_ui()` and the desktop launchers.
-        extra_args = ["--no-fund", "--no-audit", "--progress=false"]
-        if path == PROJECT_ROOT:
-            extra_args.append("--workspaces=false")
-
-        result = _run_npm_install_deterministic(
-            npm,
-            path,
-            extra_args=tuple(extra_args),
-            capture_output=False,
-        )
-        if result.returncode == 0:
-            print(f"  ✓ {label}")
-            continue
-
-        print(f"  ⚠ npm install failed in {label}")
+    result = _run_npm_install_deterministic(
+        npm,
+        PROJECT_ROOT,
+        extra_args=tuple(extra_args),
+        capture_output=False,
+    )
+    if result.returncode == 0:
+        print("  ✓ repo root (all workspaces)")
+    else:
+        print("  ⚠ npm install failed in repo root")
         stderr = (result.stderr or "").strip() if result.stderr else ""
         if stderr:
             print(f"    {stderr.splitlines()[-1]}")
