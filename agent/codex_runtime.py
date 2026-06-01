@@ -329,6 +329,42 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 )
                 return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
             raise
+        except TypeError as exc:
+            # ChatGPT Codex backend can emit valid output deltas/items and then
+            # end with a terminal frame whose SDK snapshot has nullable fields.
+            # openai-python 2.32.0 raises ``TypeError: 'NoneType' object is not
+            # iterable`` inside parse_response after the answer is already
+            # streamed. Preserve the completed text instead of routing the turn
+            # to fallback.
+            err_text = str(exc)
+            if "NoneType" in err_text and "iterable" in err_text:
+                if collected_output_items:
+                    logger.warning(
+                        "Codex stream SDK terminal parse failed; using %d collected output item(s). %s err=%s",
+                        len(collected_output_items), agent._client_log_context(), err_text,
+                    )
+                    return SimpleNamespace(
+                        status="completed",
+                        model=api_kwargs.get("model"),
+                        output=list(collected_output_items),
+                    )
+                if agent._codex_streamed_text_parts and not has_tool_calls:
+                    assembled = "".join(agent._codex_streamed_text_parts)
+                    logger.warning(
+                        "Codex stream SDK terminal parse failed; synthesized response from %d text delta(s). %s err=%s",
+                        len(agent._codex_streamed_text_parts), agent._client_log_context(), err_text,
+                    )
+                    return SimpleNamespace(
+                        status="completed",
+                        model=api_kwargs.get("model"),
+                        output=[SimpleNamespace(
+                            type="message",
+                            role="assistant",
+                            status="completed",
+                            content=[SimpleNamespace(type="output_text", text=assembled)],
+                        )],
+                    )
+            raise
 
 
 
