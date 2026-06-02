@@ -330,7 +330,7 @@ When you run `hermes update`, the web frontend is automatically rebuilt if `npm`
 
 ## Themes & plugins
 
-The dashboard ships with six built-in themes and can be extended with user-defined themes, plugin tabs, and backend API routes — all drop-in, no repo clone needed.
+The dashboard ships with seven built-in themes and can be extended with user-defined themes, plugin tabs, and backend API routes — all drop-in, no repo clone needed.
 
 **Switch themes live** from the header bar — click the palette icon next to the language switcher. Selection persists to `config.yaml` under `dashboard.theme` and is restored on page load.
 
@@ -338,6 +338,7 @@ Built-in themes:
 
 | Theme | Character |
 |-------|-----------|
+| **Atelier** (`atelier`) | Editorial cream + sage, Fraunces display + DM Sans, spacious cards |
 | **Hermes Teal** (`default`) | Dark teal + cream, system fonts, comfortable spacing |
 | **Hermes Teal (Large)** (`default-large`) | Same as default with 18px text and roomier spacing |
 | **Midnight** (`midnight`) | Deep blue-violet, Inter + JetBrains Mono |

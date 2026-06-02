@@ -416,7 +416,7 @@ export default function App() {
   return (
     <div
       data-layout-variant={layoutVariant}
-      className="font-mondwest flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden bg-black uppercase text-midground antialiased"
+      className="hermes-shell flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden bg-background-base text-midground antialiased"
     >
       <SelectionSwitcher />
       <Backdrop />
@@ -426,8 +426,8 @@ export default function App() {
         className={cn(
           "lg:hidden fixed top-0 left-0 right-0 z-40 min-h-14",
           "flex items-center gap-2 px-4 py-2",
-          "border-b border-current/20",
-          "bg-background-base/90 backdrop-blur-sm",
+          "border-b border-current/15 shadow-[0_18px_50px_-38px_rgba(0,0,0,0.45)]",
+          "bg-background-base/90 backdrop-blur-xl",
         )}
         style={{
           background: "var(--component-header-background)",
@@ -448,7 +448,7 @@ export default function App() {
         </Button>
 
         <Typography
-          className="font-bold text-[0.95rem] leading-[0.95] tracking-[0.05em] text-midground"
+          className="font-display-ui text-[1rem] font-semibold leading-none tracking-[0.01em] text-midground normal-case"
           style={{ mixBlendMode: "plus-lighter" }}
         >
           {t.app.brand}
@@ -462,7 +462,7 @@ export default function App() {
           onClick={closeMobile}
           className={cn(
             "lg:hidden fixed inset-0 z-40 p-0 block",
-            "bg-black/60 backdrop-blur-sm",
+            "bg-black/45 backdrop-blur-md",
           )}
         />
       )}
@@ -476,8 +476,8 @@ export default function App() {
             aria-label={t.app.navigation}
             className={cn(
               "fixed top-0 left-0 z-50 flex h-dvh max-h-dvh w-64 min-h-0 flex-col",
-              "border-r border-current/20",
-              "bg-background-base/95 backdrop-blur-sm",
+              "border-r border-current/15 shadow-[22px_0_60px_-46px_rgba(0,0,0,0.55)]",
+              "bg-background-base/95 backdrop-blur-xl",
               "transition-transform duration-200 ease-out",
               mobileOpen ? "translate-x-0" : "-translate-x-full",
               "lg:sticky lg:top-0 lg:translate-x-0 lg:shrink-0",
@@ -498,7 +498,7 @@ export default function App() {
                 <PluginSlot name="header-left" />
 
                 <Typography
-                  className="font-bold text-[1.125rem] leading-[0.95] tracking-[0.0525rem] text-midground"
+                  className="font-display-ui text-[1.25rem] font-semibold leading-[0.9] tracking-[0.01em] text-midground normal-case"
                   style={{ mixBlendMode: "plus-lighter" }}
                 >
                   Hermes
@@ -519,7 +519,7 @@ export default function App() {
             </div>
 
             <nav
-              className="min-h-0 w-full flex-1 overflow-y-auto overflow-x-hidden border-t border-current/10 py-2"
+              className="min-h-0 w-full flex-1 overflow-y-auto overflow-x-hidden border-t border-current/10 py-3"
               aria-label={t.app.navigation}
             >
               <ul className="flex flex-col">
@@ -542,7 +542,7 @@ export default function App() {
                   <span
                     className={cn(
                       "px-5 pt-2.5 pb-1",
-                      "font-mondwest text-[0.6rem] tracking-[0.15em] uppercase opacity-30",
+                      "text-[0.66rem] font-semibold tracking-[0.14em] uppercase opacity-40",
                     )}
                     id="hermes-sidebar-plugin-nav-heading"
                   >
@@ -586,7 +586,7 @@ export default function App() {
             <div
               className={cn(
                 "relative z-2 flex min-w-0 min-h-0 flex-1 flex-col",
-                "px-3 sm:px-6",
+                "px-4 sm:px-6 lg:px-8",
                 isChatRoute
                   ? "pb-0 pt-1 sm:pt-2 lg:pt-4"
                   : "pt-2 sm:pt-4 lg:pt-6",
@@ -670,11 +670,13 @@ function SidebarNavLink({ closeMobile, item, t }: SidebarNavLinkProps) {
         className={({ isActive }) =>
           cn(
             "group relative flex items-center gap-3",
-            "px-5 py-2.5",
-            "font-mondwest text-[0.8rem] tracking-[0.12em]",
-            "whitespace-nowrap transition-colors cursor-pointer",
-            "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-midground",
-            isActive ? "text-midground" : "opacity-60 hover:opacity-100",
+            "mx-2 my-0.5 rounded-full px-3.5 py-2.5",
+            "text-[0.86rem] font-medium tracking-[0.01em] normal-case",
+            "whitespace-nowrap transition-[background-color,opacity,color,box-shadow] cursor-pointer",
+            "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
+            isActive
+              ? "bg-midground/[0.12] text-midground opacity-100 ring-1 ring-midground/[0.15]"
+              : "opacity-65 hover:bg-midground/[0.08] hover:opacity-100",
           )
         }
         style={{
@@ -688,13 +690,13 @@ function SidebarNavLink({ closeMobile, item, t }: SidebarNavLinkProps) {
 
             <span
               aria-hidden
-              className="absolute inset-y-0.5 left-1.5 right-1.5 bg-midground opacity-0 pointer-events-none transition-opacity duration-200 group-hover:opacity-5"
+              className="absolute inset-0 rounded-full bg-midground opacity-0 pointer-events-none transition-opacity duration-200 group-hover:opacity-[0.08]"
             />
 
             {isActive && (
               <span
                 aria-hidden
-                className="absolute left-0 top-0 bottom-0 w-px bg-midground"
+                className="absolute right-3 top-1/2 h-1.5 w-1.5 -translate-y-1/2 rounded-full bg-midground"
                 style={{ mixBlendMode: "plus-lighter" }}
               />
             )}
@@ -746,7 +748,7 @@ function SidebarSystemActions({ onNavigate }: { onNavigate: () => void }) {
       <span
         className={cn(
           "px-5 pt-0.5 pb-0.5",
-          "font-mondwest text-[0.6rem] tracking-[0.15em] uppercase opacity-30",
+          "text-[0.66rem] font-semibold tracking-[0.14em] uppercase opacity-40",
         )}
       >
         {t.app.system}
@@ -772,7 +774,7 @@ function SidebarSystemActions({ onNavigate }: { onNavigate: () => void }) {
                 active={busy}
                 className={cn(
                   "gap-3 px-5 py-1.5 whitespace-nowrap",
-                  "font-mondwest text-[0.75rem] tracking-[0.1em]",
+                  "text-[0.78rem] font-medium tracking-[0.01em] normal-case",
                   "transition-opacity",
                   busy
                     ? "text-midground opacity-100"
@@ -797,13 +799,13 @@ function SidebarSystemActions({ onNavigate }: { onNavigate: () => void }) {
 
                 <span
                   aria-hidden
-                  className="absolute inset-y-0.5 left-1.5 right-1.5 bg-midground opacity-0 pointer-events-none transition-opacity duration-200 group-hover:opacity-5"
+                  className="absolute inset-0 rounded-full bg-midground opacity-0 pointer-events-none transition-opacity duration-200 group-hover:opacity-[0.08]"
                 />
 
                 {busy && (
                   <span
                     aria-hidden
-                    className="absolute left-0 top-0 bottom-0 w-px bg-midground"
+                    className="absolute right-3 top-1/2 h-1.5 w-1.5 -translate-y-1/2 rounded-full bg-midground"
                     style={{ mixBlendMode: "plus-lighter" }}
                   />
                 )}

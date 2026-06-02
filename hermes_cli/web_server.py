@@ -297,7 +297,7 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "dashboard.theme": {
         "type": "select",
         "description": "Web dashboard visual theme",
-        "options": ["default", "midnight", "ember", "mono", "cyberpunk", "rose"],
+        "options": ["atelier", "default", "midnight", "ember", "mono", "cyberpunk", "rose"],
     },
     "display.resume_display": {
         "type": "select",
@@ -3748,6 +3748,7 @@ def mount_spa(application: FastAPI):
 # Built-in dashboard themes — label + description only.  The actual color
 # definitions live in the frontend (web/src/themes/presets.ts).
 _BUILTIN_DASHBOARD_THEMES = [
+    {"name": "atelier",      "label": "Atelier",             "description": "Editorial cream, sage and rose — polished dashboard styling"},
     {"name": "default",       "label": "Hermes Teal",         "description": "Classic dark teal — the canonical Hermes look"},
     {"name": "default-large", "label": "Hermes Teal (Large)", "description": "Hermes Teal with bigger fonts and roomier spacing"},
     {"name": "midnight",      "label": "Midnight",            "description": "Deep blue-violet with cool accents"},
@@ -4005,7 +4006,7 @@ async def get_dashboard_themes():
     them without a stub.
     """
     config = load_config()
-    active = cfg_get(config, "dashboard", "theme", default="default")
+    active = cfg_get(config, "dashboard", "theme", default="atelier")
     user_themes = _discover_user_themes()
     seen = set()
     themes = []

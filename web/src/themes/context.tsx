@@ -7,7 +7,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { BUILTIN_THEMES, defaultTheme } from "./presets";
+import { BUILTIN_THEMES, DEFAULT_DASHBOARD_THEME_NAME, defaultTheme } from "./presets";
 import type {
   DashboardTheme,
   ThemeAssets,
@@ -263,6 +263,7 @@ function injectFontStylesheet(url: string | undefined) {
 function applyTheme(theme: DashboardTheme) {
   if (typeof document === "undefined") return;
   const root = document.documentElement;
+  root.dataset.dashboardTheme = theme.name;
 
   // Clear any overrides from a previous theme before applying the new set.
   for (const cssVar of ALL_OVERRIDE_VARS) {
@@ -306,8 +307,8 @@ function applyTheme(theme: DashboardTheme) {
 export function ThemeProvider({ children }: { children: ReactNode }) {
   /** Name of the currently active theme (built-in id or user YAML name). */
   const [themeName, setThemeName] = useState<string>(() => {
-    if (typeof window === "undefined") return "default";
-    return window.localStorage.getItem(STORAGE_KEY) ?? "default";
+    if (typeof window === "undefined") return DEFAULT_DASHBOARD_THEME_NAME;
+    return window.localStorage.getItem(STORAGE_KEY) ?? DEFAULT_DASHBOARD_THEME_NAME;
   });
 
   /** All selectable themes (shown in the picker). Starts with just the
@@ -333,6 +334,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
       return (
         BUILTIN_THEMES[name] ??
         userThemeDefs[name] ??
+        BUILTIN_THEMES[DEFAULT_DASHBOARD_THEME_NAME] ??
         defaultTheme
       );
     },
@@ -391,7 +393,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
         ...availableThemes.map((t) => t.name),
         ...Object.keys(userThemeDefs),
       ]);
-      const next = knownNames.has(name) ? name : "default";
+      const next = knownNames.has(name) ? name : DEFAULT_DASHBOARD_THEME_NAME;
       setThemeName(next);
       if (typeof window !== "undefined") {
         window.localStorage.setItem(STORAGE_KEY, next);
@@ -419,8 +421,8 @@ export function useTheme(): ThemeContextValue {
 }
 
 const ThemeContext = createContext<ThemeContextValue>({
-  theme: defaultTheme,
-  themeName: "default",
+  theme: BUILTIN_THEMES[DEFAULT_DASHBOARD_THEME_NAME] ?? defaultTheme,
+  themeName: DEFAULT_DASHBOARD_THEME_NAME,
   availableThemes: Object.values(BUILTIN_THEMES).map((t) => ({
     name: t.name,
     label: t.label,

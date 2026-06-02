@@ -183,6 +183,99 @@ export const roseTheme: DashboardTheme = {
   },
 };
 
+export const atelierTheme: DashboardTheme = {
+  name: "atelier",
+  label: "Atelier",
+  description: "Editorial cream, sage and rose — polished dashboard styling",
+  palette: {
+    background: { hex: "#eeece4", alpha: 1 },
+    midground: { hex: "#536b4f", alpha: 1 },
+    foreground: { hex: "#1f2a22", alpha: 0.88 },
+    warmGlow: "rgba(202, 123, 107, 0.24)",
+    noiseOpacity: 0.22,
+  },
+  typography: {
+    ...DEFAULT_TYPOGRAPHY,
+    fontSans: `"DM Sans", ${SYSTEM_SANS}`,
+    fontMono: `"JetBrains Mono", ${SYSTEM_MONO}`,
+    fontDisplay: `"Fraunces", Georgia, "Times New Roman", serif`,
+    fontUrl:
+      "https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=JetBrains+Mono:wght@400;500;700&display=swap",
+    baseSize: "15.5px",
+    lineHeight: "1.6",
+    letterSpacing: "0.005em",
+  },
+  layout: {
+    ...DEFAULT_LAYOUT,
+    radius: "1.25rem",
+    density: "spacious",
+  },
+  colorOverrides: {
+    card: "color-mix(in srgb, #fffaf1 82%, #eeece4)",
+    cardForeground: "#334234",
+    popover: "#fffaf1",
+    popoverForeground: "#334234",
+    primary: "#536b4f",
+    primaryForeground: "#fffaf1",
+    secondary: "#e6dfd2",
+    secondaryForeground: "#536b4f",
+    muted: "#e4dfd5",
+    mutedForeground: "color-mix(in srgb, #536b4f 70%, transparent)",
+    accent: "#f3d1c4",
+    accentForeground: "#5d463d",
+    destructive: "#b75245",
+    destructiveForeground: "#fffaf1",
+    success: "#738a6e",
+    warning: "#ca7b6b",
+    border: "color-mix(in srgb, #536b4f 22%, transparent)",
+    input: "color-mix(in srgb, #536b4f 24%, transparent)",
+    ring: "#ca7b6b",
+  },
+  componentStyles: {
+    backdrop: {
+      fillerBlendMode: "multiply",
+      fillerOpacity: "0.045",
+      backgroundSize: "1200px auto",
+      backgroundPosition: "top right",
+    },
+    card: {
+      background:
+        "linear-gradient(145deg, color-mix(in srgb, #fffaf1 92%, transparent), color-mix(in srgb, #f3d1c4 28%, #eeece4))",
+      boxShadow:
+        "0 26px 80px -54px rgba(55, 72, 50, 0.62), inset 0 1px 0 rgba(255, 255, 255, 0.65)",
+    },
+    header: {
+      background:
+        "linear-gradient(180deg, rgba(255, 250, 241, 0.94), rgba(238, 236, 228, 0.82))",
+    },
+    sidebar: {
+      background:
+        "linear-gradient(180deg, rgba(255, 250, 241, 0.94), rgba(232, 225, 211, 0.9))",
+    },
+    tab: {
+      clipPath: "inset(0 round 999px)",
+    },
+  },
+  customCSS: `
+    [data-dashboard-theme="atelier"] .hermes-shell {
+      text-transform: none;
+      background:
+        radial-gradient(circle at 12% 8%, rgba(243, 209, 196, 0.42), transparent 30rem),
+        radial-gradient(circle at 88% 12%, rgba(115, 138, 110, 0.16), transparent 28rem),
+        var(--background-base);
+    }
+    [data-dashboard-theme="atelier"] .hermes-shell .blend-lighter {
+      mix-blend-mode: normal;
+    }
+    [data-dashboard-theme="atelier"] .hermes-shell ::selection {
+      background: rgba(202, 123, 107, 0.24);
+      color: #334234;
+    }
+  `,
+};
+
+export const DEFAULT_DASHBOARD_THEME_NAME = "atelier";
+
 /**
  * Same look as ``defaultTheme`` but with a larger root font size, looser
  * line-height, and ``spacious`` density so every rem-based size in the
@@ -205,6 +298,7 @@ export const defaultLargeTheme: DashboardTheme = {
 };
 
 export const BUILTIN_THEMES: Record<string, DashboardTheme> = {
+  atelier: atelierTheme,
   default: defaultTheme,
   "default-large": defaultLargeTheme,
   midnight: midnightTheme,
