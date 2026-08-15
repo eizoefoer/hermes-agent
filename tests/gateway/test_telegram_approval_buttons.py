@@ -124,6 +124,31 @@ class TestTelegramExecApproval:
         assert adapter._approval_state[approval_id] == "my-session-key"
 
     @pytest.mark.asyncio
+    async def test_persists_durable_hermes_session_prompt(self):
+        adapter = _make_adapter()
+        mock_msg = MagicMock(message_id=42)
+        adapter._bot.send_message = AsyncMock(return_value=mock_msg)
+        adapter._telegram_approval_service = MagicMock()
+
+        await adapter.send_exec_approval(
+            chat_id="12345",
+            command="echo durable",
+            session_key="my-session-key",
+            metadata={
+                "approval_continuation": {
+                    "kind": "hermes_session",
+                    "payload": {"session_id": "session-1", "prompt": "continue"},
+                    "idempotency_key": "turn-1",
+                }
+            },
+        )
+
+        create = adapter._telegram_approval_service.create.call_args.kwargs
+        assert create["request_id"].startswith("d")
+        assert create["continuation_kind"] == "hermes_session"
+        assert create["idempotency_key"] == "turn-1"
+
+    @pytest.mark.asyncio
     async def test_sends_in_thread(self):
         adapter = _make_adapter()
         mock_msg = MagicMock()
@@ -269,6 +294,33 @@ class TestTelegramApprovalCallback:
 
         # State should be cleaned up
         assert 1 not in adapter._approval_state
+
+    @pytest.mark.asyncio
+    async def test_durable_callback_after_restart_does_not_resolve_local_queue(self):
+        adapter = _make_adapter()
+        adapter._telegram_approval_service = MagicMock()
+        adapter._telegram_approval_service.decide.return_value = SimpleNamespace(
+            durable=True,
+            local_resolution_count=0,
+            continuation=SimpleNamespace(state="pending"),
+        )
+
+        query = AsyncMock()
+        query.data = "ea:once:drestartsafe"
+        query.message = MagicMock(chat_id=12345)
+        query.from_user = MagicMock(id="12345", first_name="Norbert")
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        update = MagicMock(callback_query=query)
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("tools.approval.resolve_gateway_approval") as local_resolve:
+                await adapter._handle_callback_query(update, MagicMock())
+
+        adapter._telegram_approval_service.decide.assert_called_once_with(
+            "drestartsafe", "once", decided_by="12345"
+        )
+        local_resolve.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_resume_typing_after_inline_approval(self):
