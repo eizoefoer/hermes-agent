@@ -86,6 +86,27 @@ class ContinuationWorker:
         if item is None:
             return None
         consumer = self._consumers.get(item.kind)
+        heartbeat_stop = threading.Event()
+
+        def _heartbeat() -> None:
+            interval = max(0.05, self.lease_seconds / 3)
+            while not heartbeat_stop.wait(interval):
+                try:
+                    if not self.store.renew_lease(
+                        item.id,
+                        self.worker_id,
+                        lease_seconds=self.lease_seconds,
+                    ):
+                        return
+                except Exception:
+                    return
+
+        heartbeat = threading.Thread(
+            target=_heartbeat,
+            name=f"continuation-lease-{item.id[:8]}",
+            daemon=True,
+        )
+        heartbeat.start()
         try:
             # hermes_session deliberately goes through the gateway hook.  It
             # must never call tools.approval.resolve_gateway_approval here:
@@ -123,6 +144,9 @@ class ContinuationWorker:
                 base_backoff=self.base_backoff,
                 max_backoff=self.max_backoff,
             )
+        finally:
+            heartbeat_stop.set()
+            heartbeat.join(timeout=1)
         return self.store.complete(item.id, self.worker_id, result)
 
 

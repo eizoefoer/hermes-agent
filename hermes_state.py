@@ -300,11 +300,21 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS session_turn_leases (
+    session_id TEXT PRIMARY KEY,
+    holder TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    acquired_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
+CREATE INDEX IF NOT EXISTS idx_session_turn_leases_expires ON session_turn_leases(expires_at);
 """
 
 # Indexes that reference columns added in later schema versions must be
@@ -980,6 +990,95 @@ class SessionDB:
             conn.execute("UPDATE sessions SET cwd = ? WHERE id = ?", (cwd, session_id))
 
         self._execute_write(_do)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Session turn leases
+    # ──────────────────────────────────────────────────────────────────────
+    def try_acquire_session_turn_lease(
+        self,
+        session_id: str,
+        holder: str,
+        turn_id: str,
+        ttl_seconds: float = 300.0,
+    ) -> bool:
+        """Atomically lease one semantic turn for a persisted session.
+
+        Gateway adapter guards are process-local.  This lease is the durable
+        counterpart used by restart consumers before they re-enter the normal
+        inbound turn path.  Expired owners are reclaimed after a crash.
+        """
+        if not session_id or not holder or not turn_id:
+            return False
+        now = time.time()
+
+        def _do(conn):
+            if conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone() is None:
+                return False
+            conn.execute(
+                "DELETE FROM session_turn_leases "
+                "WHERE session_id = ? AND expires_at <= ?",
+                (session_id, now),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO session_turn_leases "
+                "(session_id, holder, turn_id, acquired_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (session_id, holder, turn_id, now, now + ttl_seconds),
+            )
+            row = conn.execute(
+                "SELECT holder, turn_id FROM session_turn_leases WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return bool(
+                row
+                and row["holder"] == holder
+                and row["turn_id"] == turn_id
+            )
+
+        return bool(self._execute_write(_do))
+
+    def renew_session_turn_lease(
+        self,
+        session_id: str,
+        holder: str,
+        turn_id: str,
+        ttl_seconds: float = 300.0,
+    ) -> bool:
+        """Extend a turn lease iff the same logical turn still owns it."""
+        now = time.time()
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE session_turn_leases SET expires_at = ? "
+                "WHERE session_id = ? AND holder = ? AND turn_id = ?",
+                (now + ttl_seconds, session_id, holder, turn_id),
+            )
+            return cursor.rowcount == 1
+
+        return bool(self._execute_write(_do))
+
+    def release_session_turn_lease(
+        self, session_id: str, holder: str, turn_id: str
+    ) -> None:
+        """Release a turn lease iff the same logical turn owns it."""
+        self._execute_write(
+            lambda conn: conn.execute(
+                "DELETE FROM session_turn_leases "
+                "WHERE session_id = ? AND holder = ? AND turn_id = ?",
+                (session_id, holder, turn_id),
+            )
+        )
+
+    def get_last_message_id(self, session_id: str) -> int:
+        """Return the durable transcript watermark for a session."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM messages WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return int(row[0])
     # ──────────────────────────────────────────────────────────────────────
     # Compression locks
     # ──────────────────────────────────────────────────────────────────────

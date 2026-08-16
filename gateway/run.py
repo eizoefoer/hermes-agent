@@ -38,6 +38,7 @@ import tempfile
 import threading
 import time
 import sqlite3
+import uuid
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
@@ -2008,6 +2009,9 @@ class GatewayRunner:
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        self._approval_continuation_store = None
+        self._approval_continuation_consumer = None
+        self._approval_continuation_task = None
 
 
     def _wire_teams_pipeline_runtime(self) -> None:
@@ -4166,6 +4170,296 @@ class GatewayRunner:
             )
         return scheduled
 
+    def _find_continuation_session_entry(self, session_key: str):
+        """Resolve a durable continuation against the persisted gateway map."""
+        with self.session_store._lock:  # noqa: SLF001 - lifecycle snapshot
+            self.session_store._ensure_loaded_locked()  # noqa: SLF001
+            return self.session_store._entries.get(session_key)  # noqa: SLF001
+
+    def _classify_continuation_turn_ack(self, binding) -> Optional[dict[str, Any]]:
+        """Return a recovered terminal ack, or ``None`` when not terminal."""
+        if self._session_db is None:
+            return None
+        marker = f"[approval-continuation:{binding.turn_id}]"
+        messages = self._session_db.get_messages(binding.session_id)
+        after = [m for m in messages if int(m.get("id") or 0) > binding.history_message_id]
+        marker_at = next(
+            (
+                index
+                for index, message in enumerate(after)
+                if marker in str(message.get("content") or "")
+            ),
+            None,
+        )
+        if marker_at is None:
+            return None
+        if any(
+            message.get("role") == "assistant"
+            and not message.get("tool_calls")
+            and bool(str(message.get("content") or "").strip())
+            for message in after[marker_at + 1 :]
+        ):
+            return {
+                "turn_id": binding.turn_id,
+                "session_id": binding.session_id,
+                "recovered_ack": True,
+            }
+        return None
+
+    async def _consume_hermes_session_continuation_async(self, continuation):
+        """Run one durable approval continuation through normal gateway ingress."""
+        from gateway.approval_continuation import (
+            ContinuationUnavailable,
+            UnrecoverableContinuation,
+        )
+
+        store = self._approval_continuation_store
+        if store is None or self._session_db is None or not self._running:
+            raise ContinuationUnavailable("gateway continuation runtime unavailable")
+
+        entry = self._find_continuation_session_entry(continuation.session_key)
+        if entry is None or entry.origin is None:
+            raise UnrecoverableContinuation("gateway session binding no longer exists")
+
+        requested_session_id = str(continuation.payload.get("session_id") or "")
+        session_id = str(entry.session_id or "")
+        if not session_id or not self._session_db.get_session(session_id):
+            raise UnrecoverableContinuation("persisted gateway session was deleted")
+        if requested_session_id and requested_session_id != session_id:
+            try:
+                requested_tip = self._session_db.get_compression_tip(requested_session_id)
+            except Exception:
+                requested_tip = requested_session_id
+            if requested_tip != session_id:
+                raise UnrecoverableContinuation(
+                    "approval continuation no longer matches the active session"
+                )
+
+        existing = store.get_turn_binding(continuation.id)
+        if existing is not None:
+            if existing.state == "completed":
+                return existing.result or {
+                    "turn_id": existing.turn_id,
+                    "session_id": existing.session_id,
+                }
+            recovered = self._classify_continuation_turn_ack(existing)
+            if recovered is not None:
+                store.acknowledge_turn_binding(continuation.id, recovered)
+                return recovered
+            if existing.state in {"running", "ambiguous"}:
+                error = (
+                    "continuation turn acknowledgement is ambiguous; refusing replay"
+                )
+                store.mark_turn_binding_ambiguous(continuation.id, error)
+                raise UnrecoverableContinuation(error)
+
+        turn_id = existing.turn_id if existing else uuid.uuid4().hex
+        holder = f"gateway:{os.getpid()}:{continuation.id}"
+        if not self._session_db.try_acquire_session_turn_lease(
+            session_id, holder, turn_id, ttl_seconds=300
+        ):
+            raise ContinuationUnavailable("gateway session turn is busy")
+
+        renew_stop = asyncio.Event()
+
+        async def _renew_turn_lease() -> None:
+            while True:
+                try:
+                    await asyncio.wait_for(renew_stop.wait(), timeout=100)
+                    return
+                except asyncio.TimeoutError:
+                    owned = await asyncio.to_thread(
+                        self._session_db.renew_session_turn_lease,
+                        session_id,
+                        holder,
+                        turn_id,
+                        300,
+                    )
+                    if not owned:
+                        return
+
+        renew_task = asyncio.create_task(_renew_turn_lease())
+        temporary_approval_keys: list[str] = []
+        try:
+            adapter = self.adapters.get(entry.origin.platform)
+            session_key = entry.session_key
+            if adapter is None:
+                raise ContinuationUnavailable("gateway platform adapter unavailable")
+            if (
+                session_key in self._running_agents
+                or session_key in adapter._active_sessions  # noqa: SLF001
+            ):
+                raise ContinuationUnavailable("gateway session turn is busy")
+
+            binding = store.get_or_create_turn_binding(
+                continuation.id,
+                session_id=session_id,
+                turn_id=turn_id,
+                history_message_id=self._session_db.get_last_message_id(session_id),
+            )
+            if binding.state == "completed":
+                return binding.result or {"turn_id": turn_id, "session_id": session_id}
+            store.mark_turn_binding_running(continuation.id)
+
+            decision = continuation.decision
+            command = str(continuation.payload.get("command") or "")
+            description = str(continuation.payload.get("description") or "")
+            pattern_keys = [
+                str(key)
+                for key in (continuation.payload.get("pattern_keys") or [])
+                if key
+            ]
+            if not pattern_keys and continuation.payload.get("pattern_key"):
+                pattern_keys = [str(continuation.payload["pattern_key"])]
+            if decision != "deny" and pattern_keys:
+                from tools.approval import (
+                    approve_permanent,
+                    approve_session,
+                    is_approved,
+                    load_permanent_allowlist,
+                    save_permanent_allowlist,
+                )
+
+                if decision == "once":
+                    temporary_approval_keys = [
+                        key for key in pattern_keys if not is_approved(session_key, key)
+                    ]
+                    for key in temporary_approval_keys:
+                        approve_session(session_key, key)
+                else:
+                    for key in pattern_keys:
+                        approve_session(session_key, key)
+                    if decision == "always":
+                        permanent_keys = {
+                            str(key)
+                            for key in (
+                                continuation.payload.get("permanent_pattern_keys") or []
+                            )
+                            if key
+                        }
+                        if permanent_keys:
+                            persisted = load_permanent_allowlist()
+                            for key in permanent_keys:
+                                approve_permanent(key)
+                            save_permanent_allowlist(persisted | permanent_keys)
+            marker = f"[approval-continuation:{turn_id}]"
+            if decision == "deny":
+                semantic = (
+                    f"{marker}\nThe user denied the dangerous command requested in the "
+                    "interrupted turn. Do not execute or retry it. Continue from the "
+                    "persisted conversation history and tell the user the workflow was stopped."
+                )
+            else:
+                semantic = (
+                    f"{marker}\nThe user approved the dangerous command from the interrupted "
+                    f"turn with decision `{decision}`. Reconstruct the pending workflow from "
+                    "the persisted conversation history, execute the approved action only if "
+                    "it is still pending, and then report the outcome.\n\n"
+                    f"Approved command:\n```\n{command}\n```"
+                )
+                if description:
+                    semantic += f"\nApproval reason: {description}"
+
+            event = MessageEvent(
+                text=semantic,
+                message_type=MessageType.TEXT,
+                source=dataclasses.replace(entry.origin),
+                message_id=f"approval-continuation:{turn_id}",
+                internal=True,
+            )
+            await adapter.handle_message(event)
+            task = adapter._session_tasks.get(session_key)  # noqa: SLF001
+            if task is None:
+                error = "gateway did not acknowledge continuation turn ownership"
+                store.mark_turn_binding_ambiguous(continuation.id, error)
+                raise UnrecoverableContinuation(error)
+            await task
+
+            binding = store.get_turn_binding(continuation.id)
+            ack = self._classify_continuation_turn_ack(binding)
+            if ack is None:
+                error = "continuation turn completed without a terminal transcript acknowledgement"
+                store.mark_turn_binding_ambiguous(continuation.id, error)
+                raise UnrecoverableContinuation(error)
+            store.acknowledge_turn_binding(continuation.id, ack)
+            return ack
+        finally:
+            if temporary_approval_keys:
+                from tools.approval import revoke_session_approvals
+
+                revoke_session_approvals(session_key, temporary_approval_keys)
+            renew_stop.set()
+            renew_task.cancel()
+            try:
+                await renew_task
+            except asyncio.CancelledError:
+                pass
+            self._session_db.release_session_turn_lease(session_id, holder, turn_id)
+
+    def _consume_hermes_session_continuation(self, continuation):
+        """Thread-side registry callback bridged onto the gateway loop."""
+        from gateway.approval_continuation import ContinuationUnavailable
+
+        loop = self._gateway_loop
+        if loop is None or not loop.is_running():
+            raise ContinuationUnavailable("gateway event loop unavailable")
+        future = asyncio.run_coroutine_threadsafe(
+            self._consume_hermes_session_continuation_async(continuation), loop
+        )
+        return future.result()
+
+    async def _approval_continuation_watcher(self, poll_interval: float = 0.5) -> None:
+        """Poll the durable approval inbox for the lifetime of this gateway."""
+        from gateway.approval_continuation import ContinuationWorker
+
+        worker = ContinuationWorker(
+            self._approval_continuation_store,
+            worker_id=f"gateway:{os.getpid()}:{uuid.uuid4().hex[:8]}",
+            lease_seconds=30,
+            base_backoff=1,
+            max_backoff=60,
+        )
+        while self._running:
+            try:
+                item = await asyncio.to_thread(worker.run_once)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "durable approval continuation poll failed", exc_info=True
+                )
+                await asyncio.sleep(poll_interval)
+                continue
+            if item is None:
+                await asyncio.sleep(poll_interval)
+
+    def _start_approval_continuation_runtime(self) -> None:
+        """Register the live consumer and start durable inbox polling."""
+        from gateway.approval_continuation import gateway_continuation_registry
+        from gateway.approval_store import ApprovalStore
+        from hermes_constants import get_hermes_home
+
+        self._approval_continuation_store = ApprovalStore(
+            get_hermes_home() / "approvals.db"
+        )
+        self._approval_continuation_consumer = self._consume_hermes_session_continuation
+        gateway_continuation_registry.register(
+            "hermes_session", self._approval_continuation_consumer
+        )
+        try:
+            task = asyncio.create_task(self._approval_continuation_watcher())
+        except Exception:
+            gateway_continuation_registry.unregister(
+                "hermes_session", self._approval_continuation_consumer
+            )
+            self._approval_continuation_store.close()
+            self._approval_continuation_store = None
+            self._approval_continuation_consumer = None
+            raise
+        self._approval_continuation_task = task
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
     async def start(self) -> bool:
         """
         Start the gateway and all configured platform adapters.
@@ -4600,6 +4894,13 @@ class GatewayRunner:
 
         self._running = True
         self._update_runtime_status("running")
+        try:
+            self._start_approval_continuation_runtime()
+        except Exception:
+            logger.warning(
+                "durable approval continuation runtime failed to start",
+                exc_info=True,
+            )
         
         # Emit gateway:startup hook
         hook_count = len(self.hooks.loaded_hooks)
@@ -6309,6 +6610,14 @@ class GatewayRunner:
 
             self._running = False
             self._draining = True
+            if getattr(self, "_approval_continuation_consumer", None) is not None:
+                try:
+                    from gateway.approval_continuation import gateway_continuation_registry
+                    gateway_continuation_registry.unregister(
+                        "hermes_session", self._approval_continuation_consumer
+                    )
+                except Exception:
+                    logger.debug("continuation consumer unregister failed", exc_info=True)
 
             # Notify all chats with active agents BEFORE draining.
             # Adapters are still connected here, so messages can be sent.
@@ -6480,6 +6789,23 @@ class GatewayRunner:
                     continue
                 _task.cancel()
             self._background_tasks.clear()
+
+            _continuation_task = getattr(self, "_approval_continuation_task", None)
+            if _continuation_task is not None:
+                try:
+                    await _continuation_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.debug("continuation watcher shutdown failed", exc_info=True)
+                self._approval_continuation_task = None
+            if getattr(self, "_approval_continuation_store", None) is not None:
+                try:
+                    self._approval_continuation_store.close()
+                except Exception:
+                    logger.debug("approval continuation store close failed", exc_info=True)
+                self._approval_continuation_store = None
+            self._approval_continuation_consumer = None
 
             self.adapters.clear()
             self._running_agents.clear()
@@ -17787,13 +18113,33 @@ class GatewayRunner:
                 # false positives from MagicMock auto-attribute creation in tests.
                 if getattr(type(_status_adapter), "send_exec_approval", None) is not None:
                     try:
+                        _approval_metadata = dict(_status_thread_metadata or {})
+                        _approval_metadata["approval_continuation"] = {
+                            "kind": "hermes_session",
+                            "payload": {
+                                "session_id": session_id,
+                                "command": cmd,
+                                "description": desc,
+                                "pattern_key": approval_data.get("pattern_key"),
+                                "pattern_keys": list(
+                                    approval_data.get("pattern_keys") or []
+                                ),
+                                "permanent_pattern_keys": list(
+                                    approval_data.get("permanent_pattern_keys") or []
+                                ),
+                                "process_local_fast_path": True,
+                            },
+                            "idempotency_key": (
+                                f"gateway-approval:{session_id}:{uuid.uuid4().hex}"
+                            ),
+                        }
                         _approval_fut = safe_schedule_threadsafe(
                             _status_adapter.send_exec_approval(
                                 chat_id=_status_chat_id,
                                 command=cmd,
                                 session_key=_approval_session_key,
                                 description=desc,
-                                metadata=_status_thread_metadata,
+                                metadata=_approval_metadata,
                             ),
                             _loop_for_step,
                             logger=logger,

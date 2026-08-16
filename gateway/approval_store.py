@@ -63,6 +63,17 @@ class ExternalIntent:
     result: Optional[dict[str, Any]]
 
 
+@dataclass(frozen=True)
+class ContinuationTurnBinding:
+    continuation_id: str
+    session_id: str
+    turn_id: str
+    state: str
+    history_message_id: int
+    last_error: Optional[str]
+    result: Optional[dict[str, Any]]
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS approval_requests (
     request_id TEXT PRIMARY KEY,
@@ -105,6 +116,19 @@ CREATE TABLE IF NOT EXISTS approval_external_intents (
     state TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     external_id TEXT,
+    last_error TEXT,
+    result_json TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY(continuation_id) REFERENCES approval_continuations(id)
+);
+
+CREATE TABLE IF NOT EXISTS approval_continuation_turns (
+    continuation_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL,
+    history_message_id INTEGER NOT NULL,
     last_error TEXT,
     result_json TEXT,
     created_at REAL NOT NULL,
@@ -219,7 +243,13 @@ class ApprovalStore:
         return self._approval(row) if row else None
 
     def decide(
-        self, request_id: str, decision: str, *, decided_by: str
+        self,
+        request_id: str,
+        decision: str,
+        *,
+        decided_by: str,
+        lease_owner: Optional[str] = None,
+        lease_seconds: float = 30,
     ) -> Continuation:
         """Persist the first decision and create its continuation atomically."""
         now = self._clock()
@@ -259,7 +289,48 @@ class ApprovalStore:
                 "SELECT * FROM approval_continuations WHERE idempotency_key=?",
                 (request["idempotency_key"],),
             ).fetchone()
+            if lease_owner and row["state"] in ("pending", "retry"):
+                self._conn.execute(
+                    """UPDATE approval_continuations
+                       SET state='leased', lease_owner=?, lease_until=?, updated_at=?
+                       WHERE id=? AND state IN ('pending', 'retry')""",
+                    (lease_owner, now + lease_seconds, now, row["id"]),
+                )
+                row = self._conn.execute(
+                    "SELECT * FROM approval_continuations WHERE id=?", (row["id"],)
+                ).fetchone()
         return self._continuation(row)
+
+    def release_lease(self, continuation_id: str, worker_id: str) -> Continuation:
+        """Return an owned lease to the pending inbox without an attempt."""
+        now = self._clock()
+        with self._transaction():
+            self._conn.execute(
+                """UPDATE approval_continuations
+                   SET state='pending', next_attempt_at=?, lease_owner=NULL,
+                       lease_until=NULL, updated_at=?
+                   WHERE id=? AND state='leased' AND lease_owner=?""",
+                (now, now, continuation_id, worker_id),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM approval_continuations WHERE id=?", (continuation_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(continuation_id)
+        return self._continuation(row)
+
+    def renew_lease(
+        self, continuation_id: str, worker_id: str, *, lease_seconds: float
+    ) -> bool:
+        """Extend an inbox lease iff ``worker_id`` still owns it."""
+        now = self._clock()
+        with self._transaction():
+            cursor = self._conn.execute(
+                """UPDATE approval_continuations SET lease_until=?, updated_at=?
+                   WHERE id=? AND state='leased' AND lease_owner=?""",
+                (now + lease_seconds, now, continuation_id, worker_id),
+            )
+        return cursor.rowcount == 1
 
     def get_continuation(self, continuation_id: str) -> Optional[Continuation]:
         with self._lock:
@@ -557,6 +628,117 @@ class ApprovalStore:
                 "SELECT * FROM approval_continuations WHERE id=?", (continuation_id,)
             ).fetchone()
         return self._continuation(row)
+
+    @staticmethod
+    def _turn_binding(row: sqlite3.Row) -> ContinuationTurnBinding:
+        return ContinuationTurnBinding(
+            continuation_id=row["continuation_id"],
+            session_id=row["session_id"],
+            turn_id=row["turn_id"],
+            state=row["state"],
+            history_message_id=int(row["history_message_id"]),
+            last_error=row["last_error"],
+            result=json.loads(row["result_json"]) if row["result_json"] else None,
+        )
+
+    def get_or_create_turn_binding(
+        self,
+        continuation_id: str,
+        *,
+        session_id: str,
+        turn_id: str,
+        history_message_id: int,
+    ) -> ContinuationTurnBinding:
+        """Persist continuation→turn identity before gateway execution."""
+        now = self._clock()
+        with self._transaction():
+            self._conn.execute(
+                """INSERT OR IGNORE INTO approval_continuation_turns
+                   (continuation_id, session_id, turn_id, state,
+                    history_message_id, created_at, updated_at)
+                   VALUES (?, ?, ?, 'prepared', ?, ?, ?)""",
+                (
+                    continuation_id,
+                    session_id,
+                    turn_id,
+                    int(history_message_id),
+                    now,
+                    now,
+                ),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM approval_continuation_turns WHERE continuation_id=?",
+                (continuation_id,),
+            ).fetchone()
+        return self._turn_binding(row)
+
+    def get_turn_binding(
+        self, continuation_id: str
+    ) -> Optional[ContinuationTurnBinding]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM approval_continuation_turns WHERE continuation_id=?",
+                (continuation_id,),
+            ).fetchone()
+        return self._turn_binding(row) if row else None
+
+    def mark_turn_binding_running(
+        self, continuation_id: str
+    ) -> ContinuationTurnBinding:
+        now = self._clock()
+        with self._transaction():
+            self._conn.execute(
+                """UPDATE approval_continuation_turns
+                   SET state='running', updated_at=?
+                   WHERE continuation_id=? AND state='prepared'""",
+                (now, continuation_id),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM approval_continuation_turns WHERE continuation_id=?",
+                (continuation_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(continuation_id)
+        return self._turn_binding(row)
+
+    def acknowledge_turn_binding(
+        self, continuation_id: str, result: dict[str, Any]
+    ) -> ContinuationTurnBinding:
+        now = self._clock()
+        result_json = json.dumps(result, sort_keys=True, separators=(",", ":"))
+        with self._transaction():
+            self._conn.execute(
+                """UPDATE approval_continuation_turns
+                   SET state='completed', result_json=?, last_error=NULL, updated_at=?
+                   WHERE continuation_id=? AND state IN ('running', 'completed')""",
+                (result_json, now, continuation_id),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM approval_continuation_turns WHERE continuation_id=?",
+                (continuation_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(continuation_id)
+        return self._turn_binding(row)
+
+    def mark_turn_binding_ambiguous(
+        self, continuation_id: str, error: str
+    ) -> ContinuationTurnBinding:
+        now = self._clock()
+        with self._transaction():
+            self._conn.execute(
+                """UPDATE approval_continuation_turns
+                   SET state='ambiguous', last_error=?, updated_at=?
+                   WHERE continuation_id=? AND state != 'completed'""",
+                (error, now, continuation_id),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM approval_continuation_turns WHERE continuation_id=?",
+                (continuation_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(continuation_id)
+        return self._turn_binding(row)
 
 
 class _ImmediateTransaction:
