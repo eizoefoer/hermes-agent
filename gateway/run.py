@@ -2786,6 +2786,30 @@ class GatewayRunner:
         else:
             pending_slot[session_key] = queued_event
 
+    def _admit_and_enqueue_session_event(
+        self,
+        event: "MessageEvent",
+        *,
+        session_entry: Any,
+        adapter: Any,
+    ) -> Optional[dict]:
+        """Persist future work before placing its local delivery hint in FIFO.
+
+        ``_pending_messages`` is deliberately only a process-local wake-up
+        mechanism.  Every producer of a separate future agent turn must first
+        pass through the canonical durable facade; the later normal ingress
+        claims that same row.  This method never awaits the current session.
+        """
+        if getattr(self, "_session_db", None) is None:
+            # Lightweight adapters/tests without durable state retain the
+            # historical FIFO behaviour; production gateways always persist.
+            self._enqueue_fifo(session_entry.session_key, event, adapter)
+            return {"outcome": "unmanaged"}
+        admission = self.admit_session_event(event, session_entry, claim=False)
+        if admission and admission.get("outcome") != "duplicate-completed":
+            self._enqueue_fifo(session_entry.session_key, event, adapter)
+        return admission
+
     def _promote_queued_event(
         self,
         session_key: str,
@@ -3312,7 +3336,7 @@ class GatewayRunner:
         if not event.get_command():
             try:
                 entry = self.session_store.get_or_create_session(event.source)
-                admitted = self._admit_gateway_logical_turn(event, entry, claim=False)
+                admitted = self.admit_session_event(event, entry, claim=False)
                 if admitted and admitted.get("outcome") in {"queued", "duplicate-completed"}:
                     return True
             except Exception:
@@ -4174,6 +4198,8 @@ class GatewayRunner:
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
+                session_event_id=f"recovered-session:{entry.session_id}",
+                session_event_type="recovered",
             )
             task = asyncio.create_task(adapter.handle_message(event))
             self._background_tasks.add(task)
@@ -4252,11 +4278,6 @@ class GatewayRunner:
                     "approval continuation no longer matches the active session"
                 )
 
-        # Continuations share ordinary logical-turn admission.  Only a real
-        # durable lease is contention; a loaded session/cache is not.
-        if self._session_db.get_session_turn_lease(session_id) is not None:
-            raise ContinuationUnavailable("gateway session turn is busy")
-
         existing = store.get_turn_binding(continuation.id)
         if existing is not None:
             if existing.state == "completed":
@@ -4274,6 +4295,13 @@ class GatewayRunner:
                 )
                 store.mark_turn_binding_ambiguous(continuation.id, error)
                 raise UnrecoverableContinuation(error)
+
+        # Continuations share ordinary logical-turn admission.  Only a real
+        # durable lease is contention; a loaded session/cache is not.  This
+        # follows terminal-binding recovery so a known completed transcript
+        # acknowledgement can be returned without replaying work.
+        if self._session_db.get_session_turn_lease(session_id) is not None:
+            raise ContinuationUnavailable("gateway session turn is busy")
 
         turn_id = existing.turn_id if existing else uuid.uuid4().hex
         temporary_approval_keys: list[str] = []
@@ -4363,7 +4391,18 @@ class GatewayRunner:
                 source=dataclasses.replace(entry.origin),
                 message_id=f"approval-continuation:{turn_id}",
                 internal=True,
+                session_event_id=f"approval:{continuation.id}",
+                session_event_type="approval-continuation",
+                task_id=turn_id,
+                goal_id=str(continuation.payload.get("goal_id") or "") or None,
+                branch=str(continuation.payload.get("branch") or "") or None,
+                worktree=str(continuation.payload.get("worktree") or "") or None,
             )
+            admission = self.admit_session_event(event, entry)
+            if admission.get("outcome") != "claimed":
+                raise ContinuationUnavailable(
+                    "gateway session turn is busy"
+                )
             await adapter.handle_message(event)
             task = adapter._session_tasks.get(session_key)  # noqa: SLF001
             if task is None:
@@ -5197,6 +5236,9 @@ class GatewayRunner:
             text=synthetic_text,
             source=dest_source,
             internal=True,
+            session_event_id=f"cli-handoff:{cli_session_id}:{session_key}",
+            session_event_type="handoff",
+            task_id=cli_session_id,
         )
 
         logger.info(
@@ -7909,8 +7951,17 @@ class GatewayRunner:
                         source=event.source,
                         message_id=event.message_id,
                         channel_prompt=event.channel_prompt,
+                        session_event_id=f"queue:{uuid.uuid4().hex}",
+                        session_event_type="queued-command",
+                        task_id=getattr(event, "task_id", None),
+                        goal_id=getattr(event, "goal_id", None),
+                        branch=getattr(event, "branch", None),
+                        worktree=getattr(event, "worktree", None),
                     )
-                    self._enqueue_fifo(_quick_key, queued_event, adapter)
+                    entry = self.session_store.get_or_create_session(event.source)
+                    self._admit_and_enqueue_session_event(
+                        queued_event, session_entry=entry, adapter=adapter,
+                    )
                 depth = self._queue_depth(_quick_key, adapter=self.adapters.get(source.platform))
                 if depth <= 1:
                     return "Queued for the next turn."
@@ -7936,8 +7987,13 @@ class GatewayRunner:
                             source=event.source,
                             message_id=event.message_id,
                             channel_prompt=event.channel_prompt,
+                            session_event_id=f"steer-fallback:{uuid.uuid4().hex}",
+                            session_event_type="steer-fallback",
                         )
-                        adapter._pending_messages[_quick_key] = queued_event
+                        entry = self.session_store.get_or_create_session(event.source)
+                        self._admit_and_enqueue_session_event(
+                            queued_event, session_entry=entry, adapter=adapter,
+                        )
                     return "Agent still starting — /steer queued for the next turn."
                 if running_agent and hasattr(running_agent, "steer"):
                     try:
@@ -7958,8 +8014,13 @@ class GatewayRunner:
                         source=event.source,
                         message_id=event.message_id,
                         channel_prompt=event.channel_prompt,
+                        session_event_id=f"steer-fallback:{uuid.uuid4().hex}",
+                        session_event_type="steer-fallback",
                     )
-                    adapter._pending_messages[_quick_key] = queued_event
+                    entry = self.session_store.get_or_create_session(event.source)
+                    self._admit_and_enqueue_session_event(
+                        queued_event, session_entry=entry, adapter=adapter,
+                    )
                 return "No active agent — /steer queued for the next turn."
 
             # /model must not be used while the agent is running.
@@ -8956,12 +9017,12 @@ class GatewayRunner:
                 pass
         return source
 
-    def _admit_gateway_logical_turn(self, event, session_entry, *, claim: bool = True) -> Optional[dict]:
-        """Durably admit and claim an ordinary inbound turn.
+    def admit_session_event(self, event, session_entry, *, claim: bool = True) -> Optional[dict]:
+        """Canonical runtime facade for every event that can create a turn.
 
-        Adapter guards are a local delivery optimisation only.  This is the
-        ownership gate: a fresh gateway process must never infer contention
-        merely because it loaded a SessionEntry or cached an AIAgent.
+        ``claim=False`` persists durable-next-turn work while a current turn
+        owns the session. It never waits on the same-session adapter task.
+        Current-turn approval resolution deliberately bypasses this facade.
         """
         state = self._session_db
         if state is None:
@@ -8970,7 +9031,13 @@ class GatewayRunner:
         platform = getattr(getattr(source, "platform", None), "value", "unknown")
         update_id = getattr(event, "platform_update_id", None)
         message_id = getattr(event, "message_id", None)
-        if update_id is not None:
+        event_type = str(getattr(event, "session_event_type", None) or (
+            "internal" if getattr(event, "internal", False) else "inbound"
+        ))
+        event_id = getattr(event, "session_event_id", None)
+        if event_id:
+            source_identity = f"{platform}:event:{event_type}:{event_id}"
+        elif update_id is not None:
             source_identity = f"{platform}:update:{source.chat_id}:{update_id}"
         elif message_id:
             source_identity = f"{platform}:message:{source.chat_id}:{message_id}"
@@ -8985,15 +9052,18 @@ class GatewayRunner:
                 platform,
                 user_id=getattr(source, "user_id", None),
             )
-        admitted = state.admit_logical_turn(
+        admitted = state.admit_session_event(
             session_id=session_entry.session_id,
             session_key=session_entry.session_key,
             source_identity=source_identity,
+            event_type=event_type,
             payload={
                 "text": event.text,
                 "message_id": message_id,
                 "platform_update_id": update_id,
                 "internal": bool(getattr(event, "internal", False)),
+                "session_event_id": event_id,
+                "session_event_type": event_type,
                 "source": source.to_dict() if hasattr(source, "to_dict") else {},
             },
             task_id=getattr(event, "task_id", None),
@@ -9015,6 +9085,63 @@ class GatewayRunner:
             setattr(event, "_logical_turn_id", admitted["logical_turn_id"])
             setattr(event, "_logical_attempt_id", claim["attempt_id"])
         return claim
+
+    def session_event_diagnostics(self, session_entry) -> list[dict]:
+        """Expose local/durable disagreement without "healing" it away.
+
+        These records are intentionally diagnostic evidence, not a recovery
+        action.  A local guard can be stale and a durable lease can belong to a
+        different process; neither is safe to silently overwrite.
+        """
+        if self._session_db is None:
+            return []
+        session_id, session_key = session_entry.session_id, session_entry.session_key
+        lease = self._session_db.get_session_turn_lease(session_id)
+        turns = self._session_db.list_session_logical_turns(session_id)
+        local_active = session_key in getattr(self, "_running_agents", {})
+        local_turn_ids = {
+            str(getattr(agent, "_logical_turn_id", ""))
+            for agent in getattr(self, "_running_agents", {}).values()
+            if agent is not _AGENT_PENDING_SENTINEL
+        }
+        local_owner_prefix = f"gateway:{os.getpid()}:"
+        records = []
+        for turn in turns:
+            state = turn.get("state")
+            issue = None
+            if (
+                local_active
+                and lease
+                and not str(lease.get("holder") or "").startswith(local_owner_prefix)
+            ):
+                issue = "local_active_durable_owner_mismatch"
+            elif local_active and state not in {"claimed", "executing"} and not lease:
+                issue = "local_active_without_durable_turn_or_lease"
+            elif state in {"claimed", "executing"} and not local_active:
+                issue = "durable_running_without_local_owner"
+            elif state == "completed" and local_active:
+                issue = "completed_turn_locally_active"
+            elif state in {"queued", "retry"} and not lease and not local_active:
+                issue = "queued_turn_without_dispatcher"
+            if lease and turn.get("current_attempt_id") == lease.get("turn_id") and (
+                turn.get("lease_holder") != lease.get("holder")
+            ):
+                issue = "lease_holder_mismatch"
+            if issue:
+                records.append({
+                    "issue": issue, "session_key": session_key,
+                    "logical_turn_id": turn.get("logical_turn_id"),
+                    "attempt_id": turn.get("current_attempt_id"),
+                    "task_id": turn.get("task_id"), "goal_id": turn.get("goal_id"),
+                    "lease_holder": (lease or {}).get("holder"),
+                    "pid": turn.get("owner_pid"), "local_active": local_active,
+                    "turn_state": state,
+                })
+        return records
+
+    def _log_session_event_diagnostics(self, session_entry) -> None:
+        for record in self.session_event_diagnostics(session_entry):
+            logger.warning("session event durable/local disagreement: %s", record)
 
     def _complete_gateway_logical_turn(self, event, result) -> None:
         turn_id = getattr(event, "_logical_turn_id", None)
@@ -9055,43 +9182,54 @@ class GatewayRunner:
         else:
             self._session_db.fail_logical_turn_delivery(turn_id, attempt_id, error or "delivery failed")
 
+    @staticmethod
+    def _message_event_from_logical_turn(turn: dict) -> Optional["MessageEvent"]:
+        """Rehydrate one durable future-work row without changing its identity."""
+        payload = turn.get("payload") or {}
+        source_data = payload.get("source") or {}
+        if not source_data:
+            return None
+        source = SessionSource.from_dict(source_data)
+        return MessageEvent(
+            text=str(payload.get("text") or ""),
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=payload.get("message_id"),
+            platform_update_id=payload.get("platform_update_id"),
+            internal=bool(payload.get("internal")),
+            session_event_id=payload.get("session_event_id"),
+            session_event_type=payload.get("session_event_type") or payload.get("event_type"),
+            task_id=turn.get("task_id"),
+            goal_id=turn.get("goal_id"),
+            branch=turn.get("branch"),
+            worktree=turn.get("worktree"),
+        )
+
     async def _drain_durable_logical_turn(self, completed_turn_id: str) -> None:
-        """Re-inject the next persisted turn after local guard release, never self-wait."""
+        """Publish the next persisted turn to the adapter without self-waiting."""
         if self._session_db is None:
             return
         completed = self._session_db.get_logical_turn(completed_turn_id)
         if not completed:
             return
-        # The completion callback runs before the adapter finishes sending and
-        # relinquishes its process-local guard.  It is status only, so wait
-        # boundedly rather than recursively queueing behind ourselves.
-        source_data = (completed.get("payload") or {}).get("source") or {}
-        source = SessionSource.from_dict(source_data) if source_data else None
-        adapter = self.adapters.get(source.platform) if source is not None else None
-        for _ in range(32):
-            if adapter is None or completed["session_key"] not in adapter._active_sessions:
-                break
-            await asyncio.sleep(0)
         next_turn = self._session_db.next_queued_logical_turn(completed["session_id"])
         if not next_turn or self._session_db.get_session_turn_lease(completed["session_id"]):
             return
-        payload = next_turn.get("payload") or {}
-        source_data = payload.get("source") or {}
-        if not source_data:
-            return
         try:
-            source = SessionSource.from_dict(source_data)
+            event = self._message_event_from_logical_turn(next_turn)
+            if event is None:
+                logger.warning("Logical turn %s has no durable source; leaving queued", next_turn["logical_turn_id"])
+                return
+            source = event.source
             adapter = self.adapters.get(source.platform)
             if adapter is None:
                 return
-            event = MessageEvent(
-                text=str(payload.get("text") or ""),
-                message_type=MessageType.TEXT,
-                source=source,
-                message_id=payload.get("message_id"),
-                platform_update_id=payload.get("platform_update_id"),
-                internal=bool(payload.get("internal")),
-            )
+            if hasattr(adapter, "_pending_messages"):
+                # The active adapter task will hand off after its delivery
+                # boundary.  Never await the task which currently owns this
+                # same session: that is a self-wait deadlock.
+                self._enqueue_fifo(completed["session_key"], event, adapter)
+                return
             await adapter.handle_message(event)
         except Exception:
             logger.warning("durable logical-turn drain failed", exc_info=True)
@@ -9102,24 +9240,15 @@ class GatewayRunner:
             return 0
         scheduled = 0
         for turn in self._session_db.list_ready_logical_turns(limit=limit):
-            payload = turn.get("payload") or {}
-            source_data = payload.get("source") or {}
-            if not source_data:
+            event = self._message_event_from_logical_turn(turn)
+            if event is None:
                 logger.warning("Logical turn %s has no durable source; leaving queued", turn["logical_turn_id"])
                 continue
             try:
-                source = SessionSource.from_dict(source_data)
+                source = event.source
                 adapter = self.adapters.get(source.platform)
                 if adapter is None:
                     continue
-                event = MessageEvent(
-                    text=str(payload.get("text") or ""),
-                    message_type=MessageType.TEXT,
-                    source=source,
-                    message_id=payload.get("message_id"),
-                    platform_update_id=payload.get("platform_update_id"),
-                    internal=bool(payload.get("internal")),
-                )
                 task = asyncio.create_task(adapter.handle_message(event))
                 self._background_tasks.add(task)
                 task.add_done_callback(self._background_tasks.discard)
@@ -9192,7 +9321,16 @@ class GatewayRunner:
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
         self._cache_session_source(session_key, source)
-        admission = self._admit_gateway_logical_turn(event, session_entry)
+        self._log_session_event_diagnostics(session_entry)
+        preclaimed_turn_id = getattr(event, "_logical_turn_id", None)
+        preclaimed_attempt_id = getattr(event, "_logical_attempt_id", None)
+        if preclaimed_turn_id and preclaimed_attempt_id:
+            # A producer that must run through the adapter (approval
+            # continuation) already claimed the canonical durable row. Do not
+            # re-claim it through normal ingress and mistakenly self-queue.
+            admission = {"outcome": "claimed", "preclaimed": True}
+        else:
+            admission = self.admit_session_event(event, session_entry)
         if admission and admission.get("outcome") != "claimed":
             # A real durable lease produces ``busy`` and leaves this logical
             # turn queued.  A loaded/cached session with no lease produces a
@@ -11869,6 +12007,12 @@ class GatewayRunner:
             source=source,
             raw_message=event.raw_message,
             channel_prompt=event.channel_prompt,
+            session_event_id=f"retry:{uuid.uuid4().hex}",
+            session_event_type="retry",
+            task_id=getattr(event, "task_id", None),
+            goal_id=getattr(event, "goal_id", None),
+            branch=getattr(event, "branch", None),
+            worktree=getattr(event, "worktree", None),
         )
         
         # Let the normal message handler process it
@@ -11990,8 +12134,16 @@ class GatewayRunner:
                     source=event.source,
                     message_id=event.message_id,
                     channel_prompt=event.channel_prompt,
+                    session_event_id=f"goal-kickoff:{session_entry.session_id}:{uuid.uuid4().hex}",
+                    session_event_type="goal-kickoff",
+                    task_id=getattr(event, "task_id", None),
+                    goal_id=session_entry.session_id,
+                    branch=getattr(event, "branch", None),
+                    worktree=getattr(event, "worktree", None),
                 )
-                self._enqueue_fifo(_quick_key, kickoff_event, adapter)
+                self._admit_and_enqueue_session_event(
+                    kickoff_event, session_entry=session_entry, adapter=adapter,
+                )
             except Exception as exc:
                 logger.debug("goal kickoff enqueue failed: %s", exc)
 
@@ -12174,8 +12326,14 @@ class GatewayRunner:
                     source=source,
                     message_id=None,
                     channel_prompt=None,
+                    session_event_id=f"goal:{sid}:{uuid.uuid4().hex}",
+                    session_event_type="goal-continuation",
+                    task_id=getattr(session_entry, "task_id", None),
+                    goal_id=sid,
                 )
-                self._enqueue_fifo(_quick_key, cont_event, adapter)
+                self._admit_and_enqueue_session_event(
+                    cont_event, session_entry=session_entry, adapter=adapter,
+                )
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
 
@@ -16174,6 +16332,9 @@ class GatewayRunner:
                 source=source,
                 internal=True,
                 message_id=str(evt.get("message_id") or "").strip() or None,
+                session_event_id=str(evt.get("event_id") or f"process:{evt.get('session_id')}:watch:{synth_text}"),
+                session_event_type="background-watch",
+                task_id=evt.get("task_id"),
             )
             logger.info(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",
@@ -16292,6 +16453,9 @@ class GatewayRunner:
                                 source=source,
                                 internal=True,
                                 message_id=message_id,
+                                session_event_id=f"process:{session_id}:complete",
+                                session_event_type="background-complete",
+                                task_id=watcher.get("task_id"),
                             )
                             logger.info(
                                 "Process %s finished — injecting agent notification for session %s chat=%s thread=%s",

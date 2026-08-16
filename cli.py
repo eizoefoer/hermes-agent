@@ -11908,12 +11908,13 @@ class HermesCLI:
             ).stdout.strip() or None
         except Exception:
             branch = None
-        admitted = state.admit_logical_turn(
+        admitted = state.admit_session_event(
             session_id=self.session_id,
             session_key=f"cli:{self.session_id}",
             # A CLI input has no platform update id.  Its random id is persisted
             # before execution and remains stable across attempts/recovery.
             source_identity=f"cli:input:{uuid.uuid4().hex}",
+            event_type="cli-input",
             payload={"text": str(message), "source": "cli"},
             task_id=self.session_id,
             branch=branch,

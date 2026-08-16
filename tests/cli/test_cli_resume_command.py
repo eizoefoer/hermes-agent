@@ -25,7 +25,7 @@ class TestCliResumeCommand:
         cli_obj.session_id = "resumed_session"
         cli_obj._resumed = True
         cli_obj._session_db.get_session_turn_lease.return_value = None
-        cli_obj._session_db.admit_logical_turn.return_value = {
+        cli_obj._session_db.admit_session_event.return_value = {
             "logical_turn_id": "logical-1", "state": "queued", "duplicate": False,
         }
         cli_obj._session_db.claim_logical_turn.return_value = {
@@ -35,7 +35,7 @@ class TestCliResumeCommand:
         claim = cli_obj._admit_cli_logical_turn("continue the historical session")
 
         assert claim["outcome"] == "claimed"
-        cli_obj._session_db.admit_logical_turn.assert_called_once()
+        cli_obj._session_db.admit_session_event.assert_called_once()
         cli_obj._session_db.claim_logical_turn.assert_called_once_with(
             "logical-1", owner=cli_obj._session_db.claim_logical_turn.call_args.kwargs["owner"],
             pid=cli_obj._session_db.claim_logical_turn.call_args.kwargs["pid"],

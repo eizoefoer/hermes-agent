@@ -1193,6 +1193,42 @@ class SessionDB:
 
         return self._execute_write(_do)
 
+    def admit_session_event(
+        self,
+        *,
+        session_id: str,
+        session_key: str,
+        source_identity: str,
+        event_type: str,
+        payload: Optional[Dict[str, Any]] = None,
+        task_id: Optional[str] = None,
+        goal_id: Optional[str] = None,
+        branch: Optional[str] = None,
+        worktree: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Canonical durable admission for any event that can create a turn.
+
+        Claiming stays separate so a producer can record durable-next-turn
+        work without synchronously waiting for its current session turn.
+        """
+        payload = dict(payload or {})
+        payload.setdefault("event_type", event_type)
+        return self.admit_logical_turn(
+            session_id=session_id, session_key=session_key,
+            source_identity=source_identity, payload=payload,
+            task_id=task_id, goal_id=goal_id, branch=branch, worktree=worktree,
+        )
+
+    def list_session_logical_turns(self, session_id: str) -> list[Dict[str, Any]]:
+        """Return a diagnostic snapshot without hiding contradictory state."""
+        with self._lock:
+            assert self._conn is not None
+            rows = self._conn.execute(
+                "SELECT * FROM logical_turns WHERE session_id = ? ORDER BY created_at",
+                (session_id,),
+            ).fetchall()
+        return [turn for row in rows if (turn := self._logical_turn_row(row)) is not None]
+
     def get_logical_turn(self, logical_turn_id: str) -> Optional[Dict[str, Any]]:
         with self._lock:
             row = self._conn.execute(

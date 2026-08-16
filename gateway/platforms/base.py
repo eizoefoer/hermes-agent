@@ -1340,6 +1340,15 @@ class MessageEvent:
     # completion notifications) that must bypass user authorization checks.
     internal: bool = False
 
+    # Stable identity for future work. A reply/message id is only an outbound
+    # anchor and cannot deduplicate an unrelated synthetic logical turn.
+    session_event_id: Optional[str] = None
+    session_event_type: Optional[str] = None
+    task_id: Optional[str] = None
+    goal_id: Optional[str] = None
+    branch: Optional[str] = None
+    worktree: Optional[str] = None
+
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
     
