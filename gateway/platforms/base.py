@@ -1346,6 +1346,9 @@ class MessageEvent:
     session_event_type: Optional[str] = None
     task_id: Optional[str] = None
     goal_id: Optional[str] = None
+    delegation_id: Optional[str] = None
+    barrier_id: Optional[str] = None
+    parent_logical_turn_id: Optional[str] = None
     branch: Optional[str] = None
     worktree: Optional[str] = None
 

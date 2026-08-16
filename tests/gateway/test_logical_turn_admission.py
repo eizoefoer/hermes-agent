@@ -317,6 +317,7 @@ def test_canonical_session_event_facade_keeps_background_completion_distinct_fro
         source=source, platform_update_id=None, message_id="anchor-1", text="done",
         internal=True, session_event_id="process:proc-1:complete",
         session_event_type="background-complete", task_id="task-1", goal_id=None,
+        delegation_id="delegation-1", barrier_id="barrier-1", parent_logical_turn_id="parent-1",
         branch="feature/durable", worktree="/tmp/worktree",
     )
 
@@ -329,6 +330,9 @@ def test_canonical_session_event_facade_keeps_background_completion_distinct_fro
     assert len(turns) == 2
     assert turns[1]["payload"]["event_type"] == "background-complete"
     assert turns[1]["task_id"] == "task-1"
+    assert turns[1]["payload"]["delegation_id"] == "delegation-1"
+    assert turns[1]["payload"]["barrier_id"] == "barrier-1"
+    assert turns[1]["payload"]["parent_logical_turn_id"] == "parent-1"
 
 
 def test_session_event_diagnostics_reports_durable_running_without_local_owner(tmp_path):
@@ -372,6 +376,9 @@ def test_rehydrated_durable_event_preserves_identity_and_correlation(tmp_path):
             "internal": True,
             "session_event_id": "goal-1",
             "session_event_type": "goal-continuation",
+            "delegation_id": "delegation-1",
+            "barrier_id": "barrier-1",
+            "parent_logical_turn_id": "parent-1",
             "source": source.to_dict(),
         },
         task_id="task-1",
@@ -388,6 +395,9 @@ def test_rehydrated_durable_event_preserves_identity_and_correlation(tmp_path):
     assert event.session_event_id == "goal-1"
     assert event.session_event_type == "goal-continuation"
     assert (event.task_id, event.goal_id) == ("task-1", "goal-1")
+    assert (event.delegation_id, event.barrier_id, event.parent_logical_turn_id) == (
+        "delegation-1", "barrier-1", "parent-1",
+    )
     assert (event.branch, event.worktree) == ("feature/durable", "/tmp/worktree")
 
 

@@ -9065,6 +9065,9 @@ class GatewayRunner:
                 "session_event_id": event_id,
                 "session_event_type": event_type,
                 "source": source.to_dict() if hasattr(source, "to_dict") else {},
+                "delegation_id": getattr(event, "delegation_id", None),
+                "barrier_id": getattr(event, "barrier_id", None),
+                "parent_logical_turn_id": getattr(event, "parent_logical_turn_id", None),
             },
             task_id=getattr(event, "task_id", None),
             goal_id=getattr(event, "goal_id", None),
@@ -9201,6 +9204,9 @@ class GatewayRunner:
             session_event_type=payload.get("session_event_type") or payload.get("event_type"),
             task_id=turn.get("task_id"),
             goal_id=turn.get("goal_id"),
+            delegation_id=payload.get("delegation_id"),
+            barrier_id=payload.get("barrier_id"),
+            parent_logical_turn_id=payload.get("parent_logical_turn_id"),
             branch=turn.get("branch"),
             worktree=turn.get("worktree"),
         )
@@ -16456,7 +16462,31 @@ class GatewayRunner:
                                 session_event_id=f"process:{session_id}:complete",
                                 session_event_type="background-complete",
                                 task_id=watcher.get("task_id"),
+                                goal_id=watcher.get("goal_id"),
+                                delegation_id=watcher.get("delegation_id"),
+                                barrier_id=watcher.get("barrier_id"),
+                                parent_logical_turn_id=watcher.get("parent_logical_turn_id"),
+                                branch=watcher.get("branch"),
+                                worktree=watcher.get("worktree"),
                             )
+                            # Completion is a new logical turn.  Persist it before
+                            # entering the adapter: the adapter guard is only a
+                            # local scheduling hint and may disappear on restart.
+                            # claim=False deliberately avoids self-waiting behind
+                            # the parent turn; normal ingress claims this exact row.
+                            try:
+                                session_entry = self.session_store.get_or_create_session(source)
+                                self.admit_session_event(synth_event, session_entry, claim=False)
+                            except Exception:
+                                # Compatibility-only adapter/session stubs used
+                                # by extensions may not be a real SessionEntry.
+                                # Production SessionStore admission is required;
+                                # preserve the historical adapter callback when
+                                # an integration cannot expose durable state.
+                                logger.warning(
+                                    "background completion durable admission failed",
+                                    exc_info=True,
+                                )
                             logger.info(
                                 "Process %s finished — injecting agent notification for session %s chat=%s thread=%s",
                                 session_id,
