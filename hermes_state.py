@@ -1288,6 +1288,25 @@ class SessionDB:
             ).fetchone()
         return self._logical_turn_row(row)
 
+    def list_ready_logical_turns(self, *, limit: int = 100) -> list[Dict[str, Any]]:
+        """Return a bounded startup-drain snapshot of executable turns only."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM logical_turns WHERE state IN ('queued', 'retry') "
+                "ORDER BY created_at LIMIT ?", (max(1, int(limit)),)
+            ).fetchall()
+        return [self._logical_turn_row(row) for row in rows]
+
+    def list_pending_logical_turn_deliveries(self, *, limit: int = 100) -> list[Dict[str, Any]]:
+        """Return completed executions whose response still needs delivery."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM logical_turns WHERE state = 'completed' "
+                "AND delivery_state IN ('pending', 'delivering') "
+                "ORDER BY completed_at LIMIT ?", (max(1, int(limit)),)
+            ).fetchall()
+        return [self._logical_turn_row(row) for row in rows]
+
     def mark_logical_turn_started(self, logical_turn_id: str, attempt_id: str) -> bool:
         now = time.time()
         def _do(conn):
@@ -1382,7 +1401,8 @@ class SessionDB:
             ):
                 return turn
             conn.execute(
-                "UPDATE logical_turns SET delivery_state = 'delivered', delivery_attempts = delivery_attempts + 1, "
+                "UPDATE logical_turns SET delivery_state = 'delivered', "
+                "delivery_attempts = delivery_attempts + CASE WHEN delivery_state = 'pending' THEN 1 ELSE 0 END, "
                 "delivery_updated_at = ?, delivery_error = NULL WHERE logical_turn_id = ?",
                 (now, logical_turn_id),
             )
@@ -1391,6 +1411,63 @@ class SessionDB:
                     "SELECT * FROM logical_turns WHERE logical_turn_id = ?", (logical_turn_id,)
                 ).fetchone()
             )
+
+        return self._execute_write(_do)
+
+    def begin_logical_turn_delivery(
+        self, logical_turn_id: str, attempt_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Record delivery progress without changing execution terminality."""
+        now = time.time()
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM logical_turns WHERE logical_turn_id = ?", (logical_turn_id,)
+            ).fetchone()
+            turn = self._logical_turn_row(row)
+            if (
+                turn is None or turn["state"] != "completed"
+                or turn["current_attempt_id"] != attempt_id
+                or turn["delivery_state"] == "delivered"
+            ):
+                return turn
+            conn.execute(
+                "UPDATE logical_turns SET delivery_state = 'delivering', "
+                "delivery_attempts = delivery_attempts + 1, delivery_updated_at = ?, "
+                "delivery_error = NULL WHERE logical_turn_id = ?",
+                (now, logical_turn_id),
+            )
+            return self._logical_turn_row(conn.execute(
+                "SELECT * FROM logical_turns WHERE logical_turn_id = ?", (logical_turn_id,)
+            ).fetchone())
+
+        return self._execute_write(_do)
+
+    def fail_logical_turn_delivery(
+        self, logical_turn_id: str, attempt_id: str, error: str
+    ) -> Optional[Dict[str, Any]]:
+        """Leave a completed execution replayable for delivery only."""
+        now = time.time()
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM logical_turns WHERE logical_turn_id = ?", (logical_turn_id,)
+            ).fetchone()
+            turn = self._logical_turn_row(row)
+            if (
+                turn is None or turn["state"] != "completed"
+                or turn["current_attempt_id"] != attempt_id
+                or turn["delivery_state"] == "delivered"
+            ):
+                return turn
+            conn.execute(
+                "UPDATE logical_turns SET delivery_state = 'pending', delivery_updated_at = ?, "
+                "delivery_error = ? WHERE logical_turn_id = ?",
+                (now, str(error), logical_turn_id),
+            )
+            return self._logical_turn_row(conn.execute(
+                "SELECT * FROM logical_turns WHERE logical_turn_id = ?", (logical_turn_id,)
+            ).fetchone())
 
         return self._execute_write(_do)
 

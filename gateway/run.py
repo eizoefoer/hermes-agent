@@ -3304,6 +3304,20 @@ class GatewayRunner:
             )
             return True  # handled (silently dropped); do not fall through
 
+        # A process-local active marker is never the queue of record. Persist
+        # ordinary follow-ups before any local wait/merge so restart recovery
+        # can dispatch them without requiring Telegram (or another source) to
+        # resend. Control/approval bypasses are handled above this adapter path
+        # and intentionally retain their dedicated continuation semantics.
+        if not event.get_command():
+            try:
+                entry = self.session_store.get_or_create_session(event.source)
+                admitted = self._admit_gateway_logical_turn(event, entry, claim=False)
+                if admitted and admitted.get("outcome") in {"queued", "duplicate-completed"}:
+                    return True
+            except Exception:
+                logger.warning("durable busy-turn admission failed", exc_info=True)
+
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
             adapter = self.adapters.get(event.source.platform)
@@ -4932,6 +4946,18 @@ class GatewayRunner:
                 )
             finally:
                 _clear_planned_restart_notification()
+
+        # Durable rows are authoritative over adapter pending-memory.  Reclaim
+        # happened during SessionDB construction; now that adapters exist,
+        # dispatch bounded queued work and replay completed delivery obligations
+        # without depending on source resend or transcript heuristics.
+        try:
+            drained = await self._drain_startup_logical_turns(limit=100)
+            delivered = await self._replay_pending_logical_turn_deliveries(limit=100)
+            if drained or delivered:
+                logger.info("Recovered durable turns: dispatched=%d delivery_replays=%d", drained, delivered)
+        except Exception:
+            logger.warning("durable logical-turn startup reconciliation failed", exc_info=True)
 
         # Automatically continue fresh sessions that were interrupted by the
         # previous gateway restart/shutdown.  The resume_pending flag is cleared
@@ -8930,7 +8956,7 @@ class GatewayRunner:
                 pass
         return source
 
-    def _admit_gateway_logical_turn(self, event, session_entry) -> Optional[dict]:
+    def _admit_gateway_logical_turn(self, event, session_entry, *, claim: bool = True) -> Optional[dict]:
         """Durably admit and claim an ordinary inbound turn.
 
         Adapter guards are a local delivery optimisation only.  This is the
@@ -8970,9 +8996,15 @@ class GatewayRunner:
                 "internal": bool(getattr(event, "internal", False)),
                 "source": source.to_dict() if hasattr(source, "to_dict") else {},
             },
+            task_id=getattr(event, "task_id", None),
+            goal_id=getattr(event, "goal_id", None),
+            branch=getattr(event, "branch", None),
+            worktree=getattr(event, "worktree", None),
         )
         if admitted.get("duplicate") and admitted.get("state") == "completed":
             return {"outcome": "duplicate-completed", "turn": admitted}
+        if not claim:
+            return {"outcome": "queued", "turn": admitted}
         claim = state.claim_logical_turn(
             admitted["logical_turn_id"],
             owner=f"gateway:{os.getpid()}",
@@ -8992,9 +9024,18 @@ class GatewayRunner:
         if isinstance(result, dict) and (result.get("failed") or result.get("error")):
             self._session_db.fail_logical_turn(turn_id, attempt_id, str(result.get("error") or "turn failed"), retryable=True)
             return
-        self._session_db.complete_logical_turn(
-            turn_id, attempt_id, {"completed": True, "response_present": bool(result)}
+        response = (
+            result.get("final_response") if isinstance(result, dict) else result
         )
+        delivery_required = bool(str(response or "").strip())
+        self._session_db.complete_logical_turn(
+            turn_id,
+            attempt_id,
+            {"completed": True, "response": response, "response_present": delivery_required},
+            delivery_required=delivery_required,
+        )
+        if delivery_required:
+            setattr(event, "_logical_turn_delivery_callback", self._record_gateway_turn_delivery)
         try:
             task = asyncio.create_task(self._drain_durable_logical_turn(turn_id))
             self._background_tasks.add(task)
@@ -9002,14 +9043,35 @@ class GatewayRunner:
         except Exception:
             logger.debug("failed to schedule durable logical-turn drain", exc_info=True)
 
+    def _record_gateway_turn_delivery(self, event, succeeded: bool, error: Optional[str] = None) -> None:
+        """Persist adapter delivery acknowledgement without rerunning execution."""
+        turn_id = getattr(event, "_logical_turn_id", None)
+        attempt_id = getattr(event, "_logical_attempt_id", None)
+        if not turn_id or not attempt_id or self._session_db is None:
+            return
+        self._session_db.begin_logical_turn_delivery(turn_id, attempt_id)
+        if succeeded:
+            self._session_db.acknowledge_logical_turn_delivery(turn_id, attempt_id)
+        else:
+            self._session_db.fail_logical_turn_delivery(turn_id, attempt_id, error or "delivery failed")
+
     async def _drain_durable_logical_turn(self, completed_turn_id: str) -> None:
-        """Re-inject the next persisted turn after release, never self-wait."""
+        """Re-inject the next persisted turn after local guard release, never self-wait."""
         if self._session_db is None:
             return
         completed = self._session_db.get_logical_turn(completed_turn_id)
         if not completed:
             return
-        await asyncio.sleep(0)  # let the completing adapter task release its local guard
+        # The completion callback runs before the adapter finishes sending and
+        # relinquishes its process-local guard.  It is status only, so wait
+        # boundedly rather than recursively queueing behind ourselves.
+        source_data = (completed.get("payload") or {}).get("source") or {}
+        source = SessionSource.from_dict(source_data) if source_data else None
+        adapter = self.adapters.get(source.platform) if source is not None else None
+        for _ in range(32):
+            if adapter is None or completed["session_key"] not in adapter._active_sessions:
+                break
+            await asyncio.sleep(0)
         next_turn = self._session_db.next_queued_logical_turn(completed["session_id"])
         if not next_turn or self._session_db.get_session_turn_lease(completed["session_id"]):
             return
@@ -9033,6 +9095,72 @@ class GatewayRunner:
             await adapter.handle_message(event)
         except Exception:
             logger.warning("durable logical-turn drain failed", exc_info=True)
+
+    async def _drain_startup_logical_turns(self, *, limit: int = 100) -> int:
+        """Authoritatively dispatch durable queued work after adapters connect."""
+        if self._session_db is None:
+            return 0
+        scheduled = 0
+        for turn in self._session_db.list_ready_logical_turns(limit=limit):
+            payload = turn.get("payload") or {}
+            source_data = payload.get("source") or {}
+            if not source_data:
+                logger.warning("Logical turn %s has no durable source; leaving queued", turn["logical_turn_id"])
+                continue
+            try:
+                source = SessionSource.from_dict(source_data)
+                adapter = self.adapters.get(source.platform)
+                if adapter is None:
+                    continue
+                event = MessageEvent(
+                    text=str(payload.get("text") or ""),
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    message_id=payload.get("message_id"),
+                    platform_update_id=payload.get("platform_update_id"),
+                    internal=bool(payload.get("internal")),
+                )
+                task = asyncio.create_task(adapter.handle_message(event))
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+                scheduled += 1
+            except Exception:
+                logger.warning("startup logical-turn dispatch failed", exc_info=True)
+        return scheduled
+
+    async def _replay_pending_logical_turn_deliveries(self, *, limit: int = 100) -> int:
+        """Replay only completed response obligations; execution is never invoked."""
+        if self._session_db is None:
+            return 0
+        replayed = 0
+        for turn in self._session_db.list_pending_logical_turn_deliveries(limit=limit):
+            payload, result = turn.get("payload") or {}, turn.get("result") or {}
+            source_data, response = payload.get("source") or {}, result.get("response")
+            if not source_data or not str(response or "").strip():
+                continue
+            try:
+                source = SessionSource.from_dict(source_data)
+                adapter = self.adapters.get(source.platform)
+                if adapter is None:
+                    continue
+                self._session_db.begin_logical_turn_delivery(turn["logical_turn_id"], turn["current_attempt_id"])
+                sent = await adapter._send_with_retry(
+                    chat_id=source.chat_id, content=str(response),
+                    reply_to=payload.get("message_id"), metadata=None,
+                )
+                if getattr(sent, "success", False):
+                    self._session_db.acknowledge_logical_turn_delivery(turn["logical_turn_id"], turn["current_attempt_id"])
+                    replayed += 1
+                else:
+                    self._session_db.fail_logical_turn_delivery(
+                        turn["logical_turn_id"], turn["current_attempt_id"],
+                        str(getattr(sent, "error", "delivery failed")),
+                    )
+            except Exception as exc:
+                self._session_db.fail_logical_turn_delivery(
+                    turn["logical_turn_id"], turn["current_attempt_id"], str(exc)
+                )
+        return replayed
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""

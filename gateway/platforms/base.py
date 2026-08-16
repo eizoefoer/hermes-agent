@@ -4118,6 +4118,21 @@ class BasePlatformAdapter(ABC):
                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
             )
 
+            # Gateway execution is already terminal before platform delivery.
+            # Report only an explicit adapter send acknowledgement here; a
+            # missing/failed send remains a durable delivery obligation and
+            # must never cause the model/tools to execute again on recovery.
+            delivery_callback = getattr(event, "_logical_turn_delivery_callback", None)
+            if delivery_callback is not None:
+                try:
+                    delivery_callback(
+                        event,
+                        delivery_succeeded,
+                        None if delivery_succeeded else "no successful delivery acknowledgement",
+                    )
+                except Exception:
+                    logger.warning("[%s] durable logical-turn delivery record failed", self.name, exc_info=True)
+
             # The active drain owns debounce state. If a queue-mode timer has
             # not fired yet, force-flush into _pending_messages here and let
             # this task hand off the follow-up.

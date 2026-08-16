@@ -1,7 +1,13 @@
 """Phase 1.3 durable logical-turn admission contracts."""
 
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
+import pytest
+from gateway.platforms.base import Platform
+from gateway.run import GatewayRunner
+from gateway.session import SessionSource
 from hermes_state import SessionDB
 
 
@@ -169,6 +175,92 @@ def test_completed_execution_retains_a_pending_delivery_obligation(tmp_path):
     assert completed["delivery_state"] == "pending"
     assert state.acknowledge_logical_turn_delivery(turn["logical_turn_id"], claim["attempt_id"])["delivery_state"] == "delivered"
     assert state.get_logical_turn(turn["logical_turn_id"])["state"] == "completed"
+
+
+def test_delivery_recovery_replays_only_completed_obligation(tmp_path):
+    state = _db(tmp_path)
+    turn = state.admit_logical_turn(
+        session_id="session-1", session_key="telegram:7", source_identity="telegram:update:replay",
+        payload={"source": {"platform": "telegram"}, "text": "request"},
+    )
+    claim = state.claim_logical_turn(turn["logical_turn_id"], owner="gateway:a", pid=1)
+    assert state.mark_logical_turn_started(turn["logical_turn_id"], claim["attempt_id"])
+    state.complete_logical_turn(
+        turn["logical_turn_id"], claim["attempt_id"], {"response": "already executed"},
+        delivery_required=True,
+    )
+
+    state.begin_logical_turn_delivery(turn["logical_turn_id"], claim["attempt_id"])
+    state.fail_logical_turn_delivery(turn["logical_turn_id"], claim["attempt_id"], "transport timeout")
+
+    pending = state.list_pending_logical_turn_deliveries()
+    assert [row["logical_turn_id"] for row in pending] == [turn["logical_turn_id"]]
+    assert pending[0]["state"] == "completed"
+    assert pending[0]["result"]["response"] == "already executed"
+    assert state.claim_logical_turn(turn["logical_turn_id"], owner="gateway:b", pid=2)["outcome"] == "terminal"
+
+    state.acknowledge_logical_turn_delivery(turn["logical_turn_id"], claim["attempt_id"])
+    assert state.get_logical_turn(turn["logical_turn_id"])["delivery_attempts"] == 2
+
+
+def test_startup_drain_snapshot_excludes_claimed_completed_and_terminal_turns(tmp_path):
+    state = _db(tmp_path)
+    queued = state.admit_logical_turn(
+        session_id="session-1", session_key="telegram:7", source_identity="queued", payload={}
+    )
+    claimed = state.admit_logical_turn(
+        session_id="session-1", session_key="telegram:7", source_identity="claimed", payload={}
+    )
+    assert state.claim_logical_turn(claimed["logical_turn_id"], owner="gateway:a", pid=1)["outcome"] == "claimed"
+
+    assert [row["logical_turn_id"] for row in state.list_ready_logical_turns()] == [queued["logical_turn_id"]]
+
+
+@pytest.mark.asyncio
+async def test_startup_drain_dispatches_persisted_queue_and_replays_delivery_only(tmp_path):
+    state = _db(tmp_path)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="7", user_id="user-1")
+    queued = state.admit_logical_turn(
+        session_id="session-1", session_key="telegram:7", source_identity="startup:queued",
+        payload={"source": source.to_dict(), "text": "durable queued", "message_id": "11"},
+    )
+    completed = state.admit_logical_turn(
+        session_id="session-1", session_key="telegram:7", source_identity="startup:delivery",
+        payload={"source": source.to_dict(), "text": "already ran", "message_id": "12"},
+    )
+    claim = state.claim_logical_turn(completed["logical_turn_id"], owner="gateway:old", pid=1)
+    assert state.mark_logical_turn_started(completed["logical_turn_id"], claim["attempt_id"])
+    state.complete_logical_turn(
+        completed["logical_turn_id"], claim["attempt_id"], {"response": "deliver me"}, delivery_required=True,
+    )
+
+    class Adapter:
+        def __init__(self):
+            self._active_sessions = {}
+            self.handled = []
+            self.sent = []
+
+        async def handle_message(self, event):
+            self.handled.append(event)
+
+        async def _send_with_retry(self, **kwargs):
+            self.sent.append(kwargs)
+            return SimpleNamespace(success=True, error=None)
+
+    adapter = Adapter()
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._session_db = state
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._background_tasks = set()
+
+    assert await runner._drain_startup_logical_turns() == 1
+    await asyncio.sleep(0)
+    assert [event.text for event in adapter.handled] == ["durable queued"]
+    assert await runner._replay_pending_logical_turn_deliveries() == 1
+    assert [item["content"] for item in adapter.sent] == ["deliver me"]
+    assert state.get_logical_turn(completed["logical_turn_id"])["state"] == "completed"
+    assert state.get_logical_turn(completed["logical_turn_id"])["delivery_state"] == "delivered"
+    assert state.get_logical_turn(queued["logical_turn_id"])["state"] == "queued"
 
 
 def test_terminal_unrecoverable_turn_never_replays(tmp_path):
