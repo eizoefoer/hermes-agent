@@ -1946,6 +1946,9 @@ class GatewayRunner:
         try:
             from hermes_state import SessionDB
             self._session_db = SessionDB()
+            recovered_turns = self._session_db.reconcile_logical_turns()
+            if recovered_turns:
+                logger.info("Requeued %d logical turn(s) missing durable lease", recovered_turns)
         except Exception as e:
             # WARNING (not DEBUG) so the failure appears in errors.log — matches
             # cli.py's handling of the same init path.  Users hitting NFS-mounted
@@ -4235,6 +4238,11 @@ class GatewayRunner:
                     "approval continuation no longer matches the active session"
                 )
 
+        # Continuations share ordinary logical-turn admission.  Only a real
+        # durable lease is contention; a loaded session/cache is not.
+        if self._session_db.get_session_turn_lease(session_id) is not None:
+            raise ContinuationUnavailable("gateway session turn is busy")
+
         existing = store.get_turn_binding(continuation.id)
         if existing is not None:
             if existing.state == "completed":
@@ -4254,31 +4262,6 @@ class GatewayRunner:
                 raise UnrecoverableContinuation(error)
 
         turn_id = existing.turn_id if existing else uuid.uuid4().hex
-        holder = f"gateway:{os.getpid()}:{continuation.id}"
-        if not self._session_db.try_acquire_session_turn_lease(
-            session_id, holder, turn_id, ttl_seconds=300
-        ):
-            raise ContinuationUnavailable("gateway session turn is busy")
-
-        renew_stop = asyncio.Event()
-
-        async def _renew_turn_lease() -> None:
-            while True:
-                try:
-                    await asyncio.wait_for(renew_stop.wait(), timeout=100)
-                    return
-                except asyncio.TimeoutError:
-                    owned = await asyncio.to_thread(
-                        self._session_db.renew_session_turn_lease,
-                        session_id,
-                        holder,
-                        turn_id,
-                        300,
-                    )
-                    if not owned:
-                        return
-
-        renew_task = asyncio.create_task(_renew_turn_lease())
         temporary_approval_keys: list[str] = []
         try:
             adapter = self.adapters.get(entry.origin.platform)
@@ -4388,13 +4371,6 @@ class GatewayRunner:
                 from tools.approval import revoke_session_approvals
 
                 revoke_session_approvals(session_key, temporary_approval_keys)
-            renew_stop.set()
-            renew_task.cancel()
-            try:
-                await renew_task
-            except asyncio.CancelledError:
-                pass
-            self._session_db.release_session_turn_lease(session_id, holder, turn_id)
 
     def _consume_hermes_session_continuation(self, continuation):
         """Thread-side registry callback bridged onto the gateway loop."""
@@ -8628,6 +8604,7 @@ class GatewayRunner:
 
         try:
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            self._complete_gateway_logical_turn(event, _agent_result)
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
             # either mark it done, pause it (budget), or enqueue a
@@ -8657,6 +8634,9 @@ class GatewayRunner:
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
             return _agent_result
+        except Exception as exc:
+            self._complete_gateway_logical_turn(event, {"failed": True, "error": str(exc)})
+            raise
         finally:
             # If _run_agent replaced the sentinel with a real agent and
             # then cleaned it up, this is a no-op.  If we exited early
@@ -8950,6 +8930,110 @@ class GatewayRunner:
                 pass
         return source
 
+    def _admit_gateway_logical_turn(self, event, session_entry) -> Optional[dict]:
+        """Durably admit and claim an ordinary inbound turn.
+
+        Adapter guards are a local delivery optimisation only.  This is the
+        ownership gate: a fresh gateway process must never infer contention
+        merely because it loaded a SessionEntry or cached an AIAgent.
+        """
+        state = self._session_db
+        if state is None:
+            return {"outcome": "unmanaged"}
+        source = event.source
+        platform = getattr(getattr(source, "platform", None), "value", "unknown")
+        update_id = getattr(event, "platform_update_id", None)
+        message_id = getattr(event, "message_id", None)
+        if update_id is not None:
+            source_identity = f"{platform}:update:{source.chat_id}:{update_id}"
+        elif message_id:
+            source_identity = f"{platform}:message:{source.chat_id}:{message_id}"
+        else:
+            # Internal emitters must supply a stable message_id.  The fallback
+            # keeps ordinary CLI-like adapters functional while making the
+            # weaker identity explicit in the durable audit trail.
+            source_identity = f"{platform}:synthetic:{session_entry.session_id}:{event.text}"
+        if not state.get_session(session_entry.session_id):
+            state.create_session(
+                session_entry.session_id,
+                platform,
+                user_id=getattr(source, "user_id", None),
+            )
+        admitted = state.admit_logical_turn(
+            session_id=session_entry.session_id,
+            session_key=session_entry.session_key,
+            source_identity=source_identity,
+            payload={
+                "text": event.text,
+                "message_id": message_id,
+                "platform_update_id": update_id,
+                "internal": bool(getattr(event, "internal", False)),
+                "source": source.to_dict() if hasattr(source, "to_dict") else {},
+            },
+        )
+        if admitted.get("duplicate") and admitted.get("state") == "completed":
+            return {"outcome": "duplicate-completed", "turn": admitted}
+        claim = state.claim_logical_turn(
+            admitted["logical_turn_id"],
+            owner=f"gateway:{os.getpid()}",
+            pid=os.getpid(),
+        )
+        if claim.get("outcome") == "claimed":
+            state.mark_logical_turn_started(admitted["logical_turn_id"], claim["attempt_id"])
+            setattr(event, "_logical_turn_id", admitted["logical_turn_id"])
+            setattr(event, "_logical_attempt_id", claim["attempt_id"])
+        return claim
+
+    def _complete_gateway_logical_turn(self, event, result) -> None:
+        turn_id = getattr(event, "_logical_turn_id", None)
+        attempt_id = getattr(event, "_logical_attempt_id", None)
+        if not turn_id or not attempt_id or self._session_db is None:
+            return
+        if isinstance(result, dict) and (result.get("failed") or result.get("error")):
+            self._session_db.fail_logical_turn(turn_id, attempt_id, str(result.get("error") or "turn failed"), retryable=True)
+            return
+        self._session_db.complete_logical_turn(
+            turn_id, attempt_id, {"completed": True, "response_present": bool(result)}
+        )
+        try:
+            task = asyncio.create_task(self._drain_durable_logical_turn(turn_id))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        except Exception:
+            logger.debug("failed to schedule durable logical-turn drain", exc_info=True)
+
+    async def _drain_durable_logical_turn(self, completed_turn_id: str) -> None:
+        """Re-inject the next persisted turn after release, never self-wait."""
+        if self._session_db is None:
+            return
+        completed = self._session_db.get_logical_turn(completed_turn_id)
+        if not completed:
+            return
+        await asyncio.sleep(0)  # let the completing adapter task release its local guard
+        next_turn = self._session_db.next_queued_logical_turn(completed["session_id"])
+        if not next_turn or self._session_db.get_session_turn_lease(completed["session_id"]):
+            return
+        payload = next_turn.get("payload") or {}
+        source_data = payload.get("source") or {}
+        if not source_data:
+            return
+        try:
+            source = SessionSource.from_dict(source_data)
+            adapter = self.adapters.get(source.platform)
+            if adapter is None:
+                return
+            event = MessageEvent(
+                text=str(payload.get("text") or ""),
+                message_type=MessageType.TEXT,
+                source=source,
+                message_id=payload.get("message_id"),
+                platform_update_id=payload.get("platform_update_id"),
+                internal=bool(payload.get("internal")),
+            )
+            await adapter.handle_message(event)
+        except Exception:
+            logger.warning("durable logical-turn drain failed", exc_info=True)
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -8980,6 +9064,18 @@ class GatewayRunner:
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
         self._cache_session_source(session_key, source)
+        admission = self._admit_gateway_logical_turn(event, session_entry)
+        if admission and admission.get("outcome") != "claimed":
+            # A real durable lease produces ``busy`` and leaves this logical
+            # turn queued.  A loaded/cached session with no lease produces a
+            # claim, so it cannot falsely look like another process.
+            if admission.get("outcome") == "busy":
+                logger.info(
+                    "logical turn queued behind durable owner session=%s holder=%s",
+                    session_entry.session_id,
+                    (admission.get("lease") or {}).get("holder"),
+                )
+            return None
         if self._is_telegram_topic_lane(source):
             try:
                 binding = self._session_db.get_telegram_topic_binding(
