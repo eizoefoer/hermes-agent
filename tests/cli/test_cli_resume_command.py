@@ -20,6 +20,28 @@ def _make_cli():
 
 
 class TestCliResumeCommand:
+    def test_resumed_session_without_durable_owner_admits_a_normal_cli_turn(self):
+        cli_obj = _make_cli()
+        cli_obj.session_id = "resumed_session"
+        cli_obj._resumed = True
+        cli_obj._session_db.get_session_turn_lease.return_value = None
+        cli_obj._session_db.admit_logical_turn.return_value = {
+            "logical_turn_id": "logical-1", "state": "queued", "duplicate": False,
+        }
+        cli_obj._session_db.claim_logical_turn.return_value = {
+            "outcome": "claimed", "attempt_id": "attempt-1",
+        }
+
+        claim = cli_obj._admit_cli_logical_turn("continue the historical session")
+
+        assert claim["outcome"] == "claimed"
+        cli_obj._session_db.admit_logical_turn.assert_called_once()
+        cli_obj._session_db.claim_logical_turn.assert_called_once_with(
+            "logical-1", owner=cli_obj._session_db.claim_logical_turn.call_args.kwargs["owner"],
+            pid=cli_obj._session_db.claim_logical_turn.call_args.kwargs["pid"],
+        )
+        cli_obj._session_db.mark_logical_turn_started.assert_called_once_with("logical-1", "attempt-1")
+
     def test_show_recent_sessions_includes_indexes_and_resume_hint(self, capsys):
         cli_obj = _make_cli()
         cli_obj._list_recent_sessions = MagicMock(return_value=[

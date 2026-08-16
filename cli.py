@@ -11883,6 +11883,62 @@ class HermesCLI:
             except Exception:
                 pass
 
+    def _admit_cli_logical_turn(self, message: Any) -> Optional[Dict[str, Any]]:
+        """Claim one CLI turn from durable state, including ``--resume`` turns.
+
+        A historical transcript is evidence of context, not ownership.  Only a
+        current durable lease can produce contention, so a fresh CLI process
+        always has a safe claim path when no lease exists.
+        """
+        state = self._session_db
+        if state is None:
+            return {"outcome": "unmanaged"}
+        if not state.get_session(self.session_id):
+            state.create_session(self.session_id, "cli")
+        try:
+            import subprocess
+
+            branch = subprocess.run(
+                ["git", "branch", "--show-current"],
+                cwd=os.getcwd(),
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=2,
+            ).stdout.strip() or None
+        except Exception:
+            branch = None
+        admitted = state.admit_logical_turn(
+            session_id=self.session_id,
+            session_key=f"cli:{self.session_id}",
+            # A CLI input has no platform update id.  Its random id is persisted
+            # before execution and remains stable across attempts/recovery.
+            source_identity=f"cli:input:{uuid.uuid4().hex}",
+            payload={"text": str(message), "source": "cli"},
+            task_id=self.session_id,
+            branch=branch,
+            worktree=os.getcwd(),
+        )
+        claim = state.claim_logical_turn(
+            admitted["logical_turn_id"], owner=f"cli:{os.getpid()}", pid=os.getpid()
+        )
+        if claim.get("outcome") == "claimed":
+            state.mark_logical_turn_started(admitted["logical_turn_id"], claim["attempt_id"])
+            claim["logical_turn_id"] = admitted["logical_turn_id"]
+        return claim
+
+    def _finish_cli_logical_turn(self, claim: Optional[Dict[str, Any]], result: Optional[Dict[str, Any]]) -> None:
+        if not claim or claim.get("outcome") != "claimed" or self._session_db is None:
+            return
+        turn_id = claim.get("logical_turn_id")
+        attempt_id = claim.get("attempt_id")
+        if not turn_id or not attempt_id:
+            return
+        if result and (result.get("failed") or result.get("error")):
+            self._session_db.fail_logical_turn(turn_id, attempt_id, str(result.get("error") or "CLI turn failed"), retryable=True)
+        else:
+            self._session_db.complete_logical_turn(turn_id, attempt_id, {"response_present": bool(result)})
+
     def chat(self, message, images: list = None) -> Optional[str]:
         """
         Send a message to the agent and get a response.
@@ -11930,6 +11986,11 @@ class HermesCLI:
         ):
             return None
         
+        logical_turn_claim = self._admit_cli_logical_turn(message)
+        if logical_turn_claim and logical_turn_claim.get("outcome") == "busy":
+            _cprint("  Session is busy in another durable Hermes turn; input was queued safely.")
+            return None
+
         # Route image attachments based on the active model's vision capability.
         # "native" → pass pixels as OpenAI-style content parts (adapters
         #            translate for Anthropic/Gemini/Bedrock).
@@ -12491,9 +12552,14 @@ class HermesCLI:
                 print(f"\n⏩ Delivering leftover /steer as next turn: '{preview}'")
                 self._pending_input.put(_leftover_steer)
 
+            self._finish_cli_logical_turn(logical_turn_claim, result)
             return response
             
         except Exception as e:
+            self._finish_cli_logical_turn(
+                logical_turn_claim,
+                {"failed": True, "error": str(e)},
+            )
             print(f"Error: {e}")
             return None
         finally:

@@ -333,6 +333,10 @@ CREATE TABLE IF NOT EXISTS logical_turns (
     failed_at REAL,
     result_json TEXT,
     error TEXT,
+    delivery_state TEXT NOT NULL DEFAULT 'not_required',
+    delivery_attempts INTEGER NOT NULL DEFAULT 0,
+    delivery_updated_at REAL,
+    delivery_error TEXT,
     task_id TEXT,
     goal_id TEXT,
     branch TEXT,
@@ -1319,8 +1323,20 @@ class SessionDB:
             return True
         return bool(self._execute_write(_do))
 
-    def complete_logical_turn(self, logical_turn_id: str, attempt_id: str,
-                              result: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    def complete_logical_turn(
+        self,
+        logical_turn_id: str,
+        attempt_id: str,
+        result: Optional[Dict[str, Any]] = None,
+        *,
+        delivery_required: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Complete execution without assuming that response delivery succeeded.
+
+        Execution is terminal once the agent has produced its result.  Platform
+        acknowledgement is a separate obligation so a restart can reconcile a
+        missing send without replaying tools or model work.
+        """
         now = time.time()
         def _do(conn):
             row = conn.execute("SELECT * FROM logical_turns WHERE logical_turn_id = ?", (logical_turn_id,)).fetchone()
@@ -1329,11 +1345,53 @@ class SessionDB:
                 return turn
             if turn["state"] == "completed":
                 return turn
-            conn.execute("UPDATE logical_turns SET state = 'completed', completed_at = ?, updated_at = ?, result_json = ? "
-                         "WHERE logical_turn_id = ?", (now, now, json.dumps(result or {}, sort_keys=True, default=str), logical_turn_id))
+            delivery_state = "pending" if delivery_required else "not_required"
+            conn.execute(
+                "UPDATE logical_turns SET state = 'completed', completed_at = ?, updated_at = ?, "
+                "result_json = ?, delivery_state = ?, delivery_updated_at = ?, delivery_error = NULL "
+                "WHERE logical_turn_id = ?",
+                (
+                    now,
+                    now,
+                    json.dumps(result or {}, sort_keys=True, default=str),
+                    delivery_state,
+                    now,
+                    logical_turn_id,
+                ),
+            )
             conn.execute("DELETE FROM session_turn_leases WHERE session_id = ? AND holder = ? AND turn_id = ?",
                          (turn["session_id"], turn["lease_holder"], attempt_id))
             return self._logical_turn_row(conn.execute("SELECT * FROM logical_turns WHERE logical_turn_id = ?", (logical_turn_id,)).fetchone())
+        return self._execute_write(_do)
+
+    def acknowledge_logical_turn_delivery(
+        self, logical_turn_id: str, attempt_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Acknowledge delivery for an already-completed execution attempt."""
+        now = time.time()
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM logical_turns WHERE logical_turn_id = ?", (logical_turn_id,)
+            ).fetchone()
+            turn = self._logical_turn_row(row)
+            if (
+                turn is None
+                or turn["state"] != "completed"
+                or turn["current_attempt_id"] != attempt_id
+            ):
+                return turn
+            conn.execute(
+                "UPDATE logical_turns SET delivery_state = 'delivered', delivery_attempts = delivery_attempts + 1, "
+                "delivery_updated_at = ?, delivery_error = NULL WHERE logical_turn_id = ?",
+                (now, logical_turn_id),
+            )
+            return self._logical_turn_row(
+                conn.execute(
+                    "SELECT * FROM logical_turns WHERE logical_turn_id = ?", (logical_turn_id,)
+                ).fetchone()
+            )
+
         return self._execute_write(_do)
 
     def fail_logical_turn(self, logical_turn_id: str, attempt_id: str, error: str, *, retryable: bool) -> Optional[Dict[str, Any]]:
