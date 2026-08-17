@@ -358,73 +358,66 @@ def _get_db():
     return _db
 
 
-def _admit_tui_turn(
-    sid: str,
-    session: dict,
-    text: Any,
-    *,
-    event_type: str,
-    source_identity: str,
-    task_id: str | None = None,
-    goal_id: str | None = None,
-) -> dict:
-    """Durably admit and claim one stateful TUI turn before execution.
+def _explicit_tui_ephemeral_mode() -> bool:
+    """Only tests may deliberately opt out of durable admission."""
+    return os.environ.get("HERMES_TUI_EPHEMERAL_TEST_MODE") == "1" and bool(os.environ.get("PYTEST_CURRENT_TEST"))
 
-    ``session['running']`` is only a local UI scheduling hint.  Durable
-    ownership is the logical-turn claim and SessionDB lease, which protects a
-    resumed dashboard/TUI session from another gateway process as well.
-    """
+
+def _tui_prompt_source_identity(session: dict, params: dict, rid: Any) -> str:
+    return f"tui:prompt:{session.get('session_key') or ''}:{params.get('message_id') or params.get('request_id') or rid}"
+
+
+def _tui_goal_source_identity(goal_id: str, continuation_id: str) -> str:
+    return f"tui:goal:{goal_id}:{continuation_id}"
+
+
+def _admit_tui_turn(
+    sid: str, session: dict, text: Any, *, event_type: str, source_identity: str,
+    task_id: str | None = None, goal_id: str | None = None,
+    branch: str | None = None, worktree: str | None = None,
+) -> dict:
+    """Persist then atomically claim a TUI logical turn; local state is not ownership."""
     db = _get_db()
-    # Keep narrow unit doubles that predate durable turns usable.  Production
-    # SessionDB always exposes these methods; a missing method is not durable
-    # ownership evidence and therefore falls back to the legacy local UI path.
     if db is None or not callable(getattr(db, "admit_session_event", None)):
-        return {"outcome": "unmanaged"}
-    # JSON-RPC request ids are connection-scoped.  Retain a TUI-process epoch
-    # so a newly attached/resumed TUI using request id "1" is not confused with
-    # an old browser connection, while retrying the same request in this TUI
-    # instance remains exactly-once.
-    session.setdefault("_turn_admission_epoch", uuid.uuid4().hex)
+        return {"outcome": "unmanaged"} if _explicit_tui_ephemeral_mode() else {"outcome": "unavailable"}
     session_key = str(session.get("session_key") or sid)
     if not db.get_session(session_key):
         db.create_session(session_key, "tui")
     admitted = db.admit_session_event(
-        session_id=session_key,
-        session_key=f"tui:{session_key}",
-        source_identity=source_identity,
-        event_type=event_type,
-        payload={"text": str(text), "tui_session_id": sid},
-        task_id=task_id or session_key,
-        goal_id=goal_id,
-        worktree=_session_cwd(session),
+        session_id=session_key, session_key=f"tui:{session_key}", source_identity=source_identity,
+        event_type=event_type, payload={"text": str(text), "tui_session_id": sid, "event_type": event_type},
+        task_id=task_id, goal_id=goal_id, branch=branch or _git_branch_for_cwd(_session_cwd(session)),
+        worktree=worktree or _session_cwd(session),
     )
-    claim = db.claim_logical_turn(
-        admitted["logical_turn_id"], owner=f"tui:{os.getpid()}", pid=os.getpid()
-    )
+    claim = db.claim_logical_turn(admitted["logical_turn_id"], owner=f"tui:{os.getpid()}", pid=os.getpid())
+    claim["logical_turn_id"] = admitted["logical_turn_id"]
     if claim.get("outcome") == "claimed":
         db.mark_logical_turn_started(admitted["logical_turn_id"], claim["attempt_id"])
-        claim["logical_turn_id"] = admitted["logical_turn_id"]
     return claim
 
 
-def _finish_tui_turn(claim: dict | None, result: Any = None, error: Exception | None = None) -> None:
-    """Terminally record an admitted TUI turn and release its exact lease."""
+def _finish_tui_turn(claim: dict | None, result: Any = None, error: Exception | None = None,
+                     delivery_succeeded: bool | None = None) -> dict | None:
+    """Persist the actual execution result, then record only available delivery evidence."""
     if not claim or claim.get("outcome") != "claimed":
-        return
+        return None
     db = _get_db()
-    if db is None:
-        return
     turn_id, attempt_id = claim.get("logical_turn_id"), claim.get("attempt_id")
-    if not turn_id or not attempt_id:
-        return
+    if db is None or not turn_id or not attempt_id:
+        return None
     if error is not None:
-        db.fail_logical_turn(turn_id, attempt_id, str(error), retryable=True)
-    elif isinstance(result, dict) and (result.get("failed") or result.get("error")):
-        db.fail_logical_turn(
-            turn_id, attempt_id, str(result.get("error") or "TUI turn failed"), retryable=True
-        )
-    else:
-        db.complete_logical_turn(turn_id, attempt_id, {"response_present": bool(result)})
+        return db.fail_logical_turn(turn_id, attempt_id, str(error), retryable=True)
+    if isinstance(result, dict) and (result.get("failed") or result.get("error")):
+        return db.fail_logical_turn(turn_id, attempt_id, str(result.get("error") or "TUI turn failed"), retryable=True)
+    response = result.get("final_response") if isinstance(result, dict) else result
+    completed = db.complete_logical_turn(
+        turn_id, attempt_id, {"completed": True, "response": response, "response_present": bool(str(response or "").strip())},
+        delivery_required=bool(str(response or "").strip()),
+    )
+    if completed and completed.get("delivery_state") == "pending" and delivery_succeeded is not None:
+        db.begin_logical_turn_delivery(turn_id, attempt_id)
+        completed = db.acknowledge_logical_turn_delivery(turn_id, attempt_id) if delivery_succeeded else db.fail_logical_turn_delivery(turn_id, attempt_id, "TUI transport did not accept completion frame")
+    return completed
 
 
 def _tui_turn_is_runnable(claim: dict) -> bool:
@@ -443,6 +436,32 @@ def _tui_completion_source_identity(event: dict) -> str:
         exit_code=event.get("exit_code", ""),
         command=event.get("command", ""),
     )
+
+
+def _dispatch_admitted_tui_turn(sid: str, session: dict, claim: dict) -> None:
+    """Run only a turn already claimed by canonical durable admission."""
+    payload = (claim.get("turn") or {}).get("payload") or {}
+    text = payload.get("text", "")
+    session["running"] = True  # UI/status cache only; lease is ownership.
+    _start_inflight_turn(session, text)
+    _run_prompt_submit(f"__durable__{claim['logical_turn_id']}", sid, session, text, claim=claim)
+
+
+def _rehydrate_tui_session_turns(sid: str, session: dict) -> int:
+    """Reclaim stale attempts then drain one persisted turn for this attached session."""
+    db = _get_db()
+    if db is None or not callable(getattr(db, "claim_next_logical_turn", None)):
+        return 0
+    db.reconcile_logical_turns()
+    key = str(session.get("session_key") or sid)
+    claim = db.claim_next_logical_turn(key, owner=f"tui:{os.getpid()}", pid=os.getpid())
+    if claim.get("outcome") != "claimed":
+        return 0
+    turn_id = claim["turn"]["logical_turn_id"]
+    db.mark_logical_turn_started(turn_id, claim["attempt_id"])
+    claim["logical_turn_id"] = turn_id
+    _dispatch_admitted_tui_turn(sid, session, claim)
+    return 1
 
 
 def _db_unavailable_error(rid, *, code: int):
@@ -471,11 +490,12 @@ def write_json(obj: dict) -> bool:
     return (current_transport() or _stdio_transport).write(obj)
 
 
-def _emit(event: str, sid: str, payload: dict | None = None):
+def _emit(event: str, sid: str, payload: dict | None = None) -> bool:
     params = {"type": event, "session_id": sid}
     if payload is not None:
         params["payload"] = payload
-    write_json({"jsonrpc": "2.0", "method": "event", "params": params})
+    # TUI has no client delivery ACK: this only proves transport acceptance.
+    return write_json({"jsonrpc": "2.0", "method": "event", "params": params})
 
 
 def _status_update(sid: str, kind: str, text: str | None = None):
@@ -3905,8 +3925,6 @@ def _(rid, params: dict) -> dict:
     if (t := current_transport()) is not None:
         session["transport"] = t
     with session["history_lock"]:
-        if session.get("running"):
-            return _err(rid, 4009, "session busy")
         if truncate_user_ordinal is not None:
             try:
                 ordinal = int(truncate_user_ordinal)
@@ -3927,12 +3945,14 @@ def _(rid, params: dict) -> dict:
         claim = _admit_tui_turn(
             sid, session, text,
             event_type="tui.prompt",
-            source_identity=(
-                f"tui:prompt:{sid}:{session.setdefault('_turn_admission_epoch', uuid.uuid4().hex)}:{rid}"
-            ),
+            source_identity=_tui_prompt_source_identity(session, params, rid),
+            task_id=params.get("task_id"), goal_id=params.get("goal_id"),
+            branch=params.get("branch"), worktree=params.get("worktree"),
         )
+        if claim.get("outcome") == "unavailable":
+            return _db_unavailable_error(rid, code=5037)
         if not _tui_turn_is_runnable(claim):
-            return _err(rid, 4009, "session busy (durable turn ownership)")
+            return _ok(rid, {"status": "queued", "logical_turn_id": claim.get("logical_turn_id")})
         session["running"] = True
         session["last_active"] = time.time()
         _start_inflight_turn(session, text)
@@ -4096,6 +4116,7 @@ def _run_prompt_submit(
         goal_followup = None  # set by the post-turn goal hook below
         result = None
         turn_error = None
+        delivery_succeeded = None
         try:
             from tools.approval import (
                 reset_current_session_key,
@@ -4291,7 +4312,7 @@ def _run_prompt_submit(
                 payload["rendered"] = rendered
             with session["history_lock"]:
                 _clear_inflight_turn(session)
-            _emit("message.complete", sid, payload)
+            delivery_succeeded = _emit("message.complete", sid, payload)
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
@@ -4421,7 +4442,10 @@ def _run_prompt_submit(
             )
             _emit("error", sid, {"message": str(e)})
         finally:
-            _finish_tui_turn(claim, result=result, error=turn_error)
+            _finish_tui_turn(
+                claim, result=result, error=turn_error,
+                delivery_succeeded=delivery_succeeded,
+            )
             try:
                 if approval_token is not None:
                     reset_current_session_key(approval_token)
@@ -4433,6 +4457,12 @@ def _run_prompt_submit(
                 session["last_active"] = time.time()
                 _clear_inflight_turn(session)
             _emit("session.info", sid, _session_info(agent, session))
+            # Release is durable in _finish_tui_turn; the next persisted turn
+            # is now eligible. Never self-wait on the completed execution.
+            try:
+                _rehydrate_tui_session_turns(sid, session)
+            except Exception:
+                logger.debug("TUI durable turn drain failed", exc_info=True)
 
         # Chain a goal-continuation turn if the judge said so. We do
         # this AFTER the finally releases session["running"], so the
@@ -4449,8 +4479,10 @@ def _run_prompt_submit(
                 goal_claim = _admit_tui_turn(
                     sid, session, goal_followup,
                     event_type="tui.goal.continuation",
-                    source_identity=f"tui:goal:{sid}:{uuid.uuid4().hex}",
-                    goal_id=session.get("session_key"),
+                    source_identity=_tui_goal_source_identity(
+                        str(session.get("session_key") or sid), str(goal_followup),
+                    ),
+                    goal_id=str(session.get("session_key") or sid),
                 )
                 if not _tui_turn_is_runnable(goal_claim):
                     return
