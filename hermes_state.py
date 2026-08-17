@@ -1333,13 +1333,29 @@ class SessionDB:
             ).fetchall()
         return [self._logical_turn_row(row) for row in rows]
 
-    def list_pending_logical_turn_deliveries(self, *, limit: int = 100) -> list[Dict[str, Any]]:
+    def list_pending_logical_turn_deliveries(
+        self,
+        *,
+        limit: int = 100,
+        include_transport_accepted: bool = False,
+        session_id: Optional[str] = None,
+    ) -> list[Dict[str, Any]]:
         """Return completed executions whose response still needs delivery."""
+        states = "'pending', 'delivering'"
+        if include_transport_accepted:
+            states += ", 'transport_accepted'"
+        where_session = " AND session_id = ?" if session_id else ""
+        params: tuple[Any, ...] = (
+            (session_id, max(1, int(limit)))
+            if session_id
+            else (max(1, int(limit)),)
+        )
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM logical_turns WHERE state = 'completed' "
-                "AND delivery_state IN ('pending', 'delivering') "
-                "ORDER BY completed_at LIMIT ?", (max(1, int(limit)),)
+                f"AND delivery_state IN ({states}){where_session} "
+                "ORDER BY completed_at LIMIT ?",
+                params,
             ).fetchall()
         return [self._logical_turn_row(row) for row in rows]
 
@@ -1445,6 +1461,46 @@ class SessionDB:
             return self._logical_turn_row(
                 conn.execute(
                     "SELECT * FROM logical_turns WHERE logical_turn_id = ?", (logical_turn_id,)
+                ).fetchone()
+            )
+
+        return self._execute_write(_do)
+
+    def record_logical_turn_transport_accepted(
+        self, logical_turn_id: str, attempt_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Record frame acceptance when a transport has no end-client ACK.
+
+        This is deliberately weaker than ``delivered``. Callers can replay the
+        saved result after restart without reopening model/tool execution.
+        """
+        now = time.time()
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM logical_turns WHERE logical_turn_id = ?",
+                (logical_turn_id,),
+            ).fetchone()
+            turn = self._logical_turn_row(row)
+            if (
+                turn is None
+                or turn["state"] != "completed"
+                or turn["current_attempt_id"] != attempt_id
+                or turn["delivery_state"] == "delivered"
+            ):
+                return turn
+            conn.execute(
+                "UPDATE logical_turns SET delivery_state = 'transport_accepted', "
+                "delivery_attempts = delivery_attempts + CASE "
+                "WHEN delivery_state IN ('pending', 'delivering') THEN 1 ELSE 0 END, "
+                "delivery_updated_at = ?, delivery_error = NULL "
+                "WHERE logical_turn_id = ?",
+                (now, logical_turn_id),
+            )
+            return self._logical_turn_row(
+                conn.execute(
+                    "SELECT * FROM logical_turns WHERE logical_turn_id = ?",
+                    (logical_turn_id,),
                 ).fetchone()
             )
 
