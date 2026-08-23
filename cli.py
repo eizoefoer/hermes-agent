@@ -56,6 +56,21 @@ def _cli_query_source_identity(session_id: str, history_message_id: int, message
     return f"cli:query:{session_id}:history:{int(history_message_id)}:{digest}"
 
 
+def _cli_fresh_source_identity(session_id: str, event_type: str) -> str:
+    """Mint a new CLI ingress identity, with an opt-in recovery override.
+
+    CLI has no transport update id.  A transcript watermark is therefore not a
+    source event identity: it changes after model work and cannot recover a
+    crash between admission and transcript persistence.  Automation that owns
+    a retry may pass ``HERMES_CLI_SOURCE_ID``; ordinary invocations get a fresh
+    event and identical completed queries remain distinct.
+    """
+    supplied = os.environ.get("HERMES_CLI_SOURCE_ID", "").strip()
+    if supplied:
+        return supplied
+    return f"cli:{event_type}:{session_id}:{uuid.uuid4().hex}"
+
+
 def _cli_kanban_turn_source_identity(task_id: str, goal_id: Optional[str], iteration: int) -> str:
     """Stable identity for a specific persisted Kanban goal iteration."""
     return f"cli:kanban:task:{task_id}:goal:{goal_id or 'none'}:iteration:{int(iteration)}"
@@ -87,6 +102,74 @@ def _next_kanban_iteration(state, session_id: str, task_id: str) -> int:
 def _cli_background_source_identity(parent_session_id: str, child_session_id: str, task_id: str) -> str:
     """Stable identity for one independent CLI background child invocation."""
     return f"cli:background:parent:{parent_session_id}:child:{child_session_id}:task:{task_id}"
+
+
+def recover_cli_background_children(state, execute, *, limit: int = 32) -> list[str]:
+    """Explicit, bounded recovery executor for durable CLI background work.
+
+    This is intentionally explicit rather than a startup auto-drain: replaying
+    a background prompt may invoke tools, so an embedding CLI/session owner
+    must provide the execution callback.  It repairs a parent crash before
+    child admission, then claims and executes queued/stale child turns using
+    their persisted payload and logical-turn identity.  It never creates a
+    second queue or replays completed rows.
+    """
+    state.reconcile_logical_turns()
+    recovered: list[str] = []
+    ready = state.list_ready_logical_turns(limit=max(1, int(limit)))
+    for parent in ready:
+        payload = parent.get("payload") or {}
+        if payload.get("event_type") != "cli-background-command":
+            continue
+        task_id = str(payload.get("background_task_id") or "")
+        child_session_id = str(payload.get("child_session_id") or task_id)
+        prompt = str(payload.get("text") or "")
+        if not task_id or not child_session_id or not prompt:
+            continue
+        parent_claim = state.claim_logical_turn(parent["logical_turn_id"], owner=f"cli-recovery:{os.getpid()}", pid=os.getpid())
+        if parent_claim.get("outcome") != "claimed":
+            continue
+        if not state.get_session(child_session_id):
+            state.create_session(child_session_id, "cli-background")
+        child = state.admit_session_event(
+            session_id=child_session_id,
+            session_key=f"cli:{child_session_id}",
+            source_identity=_cli_background_source_identity(parent["session_id"], child_session_id, task_id),
+            event_type="cli-background",
+            payload={"text": prompt, "parent_session_id": parent["session_id"],
+                     "child_session_id": child_session_id, "background_task_id": task_id},
+            task_id=task_id,
+        )
+        state.complete_logical_turn(
+            parent["logical_turn_id"], parent_claim["attempt_id"],
+            {"response": "background started", "task_id": task_id},
+        )
+        recovered.append(child["logical_turn_id"])
+
+    for turn in state.list_ready_logical_turns(limit=max(1, int(limit))):
+        payload = turn.get("payload") or {}
+        if payload.get("event_type") != "cli-background":
+            continue
+        claim = state.claim_logical_turn(turn["logical_turn_id"], owner=f"cli-recovery:{os.getpid()}", pid=os.getpid())
+        if claim.get("outcome") != "claimed":
+            continue
+        state.mark_logical_turn_started(turn["logical_turn_id"], claim["attempt_id"])
+        try:
+            result = execute(claim.get("turn") or turn)
+        except Exception as exc:
+            state.fail_logical_turn(turn["logical_turn_id"], claim["attempt_id"], str(exc), retryable=True)
+            continue
+        if isinstance(result, dict) and (result.get("failed") or result.get("error") or result.get("interrupted")):
+            state.fail_logical_turn(
+                turn["logical_turn_id"], claim["attempt_id"],
+                str(result.get("error") or "background recovery interrupted"),
+                retryable=bool(result.get("interrupted")),
+            )
+        else:
+            response = result.get("final_response") if isinstance(result, dict) else result
+            state.complete_logical_turn(turn["logical_turn_id"], claim["attempt_id"], {"response": response})
+            recovered.append(turn["logical_turn_id"])
+    return recovered
 
 # Suppress startup messages for clean CLI experience
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
@@ -9124,8 +9207,45 @@ class HermesCLI:
             parent_session_id, child_session_id, task_id
         )
 
+        # The parent acknowledgement is not allowed to get ahead of durable
+        # child identity/admission.  This deliberately creates and claims the
+        # child before credentials, console output, or thread start so either
+        # crash boundary is represented in SessionDB.  Reconciliation can then
+        # reclaim the same child turn instead of minting a replacement task.
+        child_cli = None
+        child_claim = None
+        if self._session_db is not None:
+            if not self._session_db.get_session(child_session_id):
+                self._session_db.create_session(child_session_id, "cli-background")
+            child_cli = HermesCLI.__new__(HermesCLI)
+            child_cli._session_db = self._session_db
+            child_cli.session_id = child_session_id
+            child_claim = child_cli._admit_cli_logical_turn(
+                prompt,
+                event_type="cli-background",
+                source_identity=background_source_identity,
+                task_id=task_id,
+                payload={
+                    "parent_session_id": parent_session_id,
+                    "child_session_id": child_session_id,
+                    "background_task_id": task_id,
+                },
+            )
+            if child_claim.get("outcome") != "claimed":
+                self._session_db.fail_logical_turn(
+                    parent_claim["logical_turn_id"], parent_claim["attempt_id"],
+                    f"background child is {child_claim.get('outcome')}", retryable=True,
+                )
+                _cprint("  Cannot start background task: child turn is already owned.")
+                return
+
         # Make sure we have valid credentials
         if not self._ensure_runtime_credentials():
+            if child_claim is not None:
+                self._session_db.fail_logical_turn(
+                    child_claim["logical_turn_id"], child_claim["attempt_id"],
+                    "runtime credentials unavailable", retryable=True,
+                )
             self._finish_cli_logical_turn(parent_claim, {"failed": True, "error": "runtime credentials unavailable"})
             _cprint("  (>_<) Cannot start background task: no valid credentials.")
             return
@@ -9147,27 +9267,7 @@ class HermesCLI:
                 # This is an independent child execution. Local background
                 # registries remain UI hints; the child session's durable
                 # logical turn and lease decide whether it may run.
-                if self._session_db and not self._session_db.get_session(child_session_id):
-                    self._session_db.create_session(child_session_id, "cli-background")
-                child_cli = HermesCLI.__new__(HermesCLI)
-                child_cli._session_db = self._session_db
-                child_cli.session_id = child_session_id
-                logical_turn_claim = None
-                if self._session_db is not None:
-                    logical_turn_claim = child_cli._admit_cli_logical_turn(
-                        prompt,
-                        event_type="cli-background",
-                        source_identity=background_source_identity,
-                        task_id=task_id,
-                        payload={
-                            "parent_session_id": parent_session_id,
-                            "child_session_id": child_session_id,
-                            "background_task_id": task_id,
-                        },
-                    )
-                if logical_turn_claim and logical_turn_claim.get("outcome") not in {"claimed", "unmanaged"}:
-                    logger.info("CLI background child %s not runnable: %s", task_id, logical_turn_claim.get("outcome"))
-                    return
+                logical_turn_claim = child_claim
                 bg_agent = AIAgent(
                     model=turn_route["model"],
                     api_key=turn_route["runtime"].get("api_key"),
@@ -15843,6 +15943,35 @@ def main(
             # Quiet mode: suppress banner, spinner, tool previews.
             # Only print the final response and parseable session info.
             cli.tool_progress_mode = "off"
+            # Accept the source event before credentials, image preprocessing,
+            # agent construction, transcript writes, or any model call.  A
+            # quiet invocation has no transport message id, so ordinary runs
+            # mint a fresh identity; a supervisor retry supplies the original
+            # HERMES_CLI_SOURCE_ID and recovers the persisted logical turn.
+            query_event_type = "cli-query"
+            query_task_id = None
+            query_goal_id = None
+            query_payload = None
+            query_source_identity = _cli_fresh_source_identity(cli.session_id, "query")
+            if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1" and _kanban_task_id:
+                query_event_type = "kanban-goal-turn"
+                query_task_id = _kanban_task_id
+                iteration = _next_kanban_iteration(cli._session_db, cli.session_id, query_task_id)
+                query_source_identity = _cli_kanban_turn_source_identity(
+                    query_task_id, query_goal_id, iteration
+                )
+                query_payload = {"iteration": iteration, "evaluation_identity": iteration}
+            logical_turn_claim = cli._admit_cli_logical_turn(
+                query,
+                event_type=query_event_type,
+                source_identity=query_source_identity,
+                task_id=query_task_id,
+                goal_id=query_goal_id,
+                payload=query_payload,
+            )
+            if logical_turn_claim and logical_turn_claim.get("outcome") != "claimed":
+                print("Error: session turn is already owned or has completed", file=sys.stderr)
+                sys.exit(1)
             if cli._ensure_runtime_credentials():
                 effective_query: Any = query
                 if single_query_images or single_query_image_urls:
@@ -15914,41 +16043,6 @@ def main(
                     # status lines).  The response is printed once below.
                     cli.agent.stream_delta_callback = None
                     cli.agent.tool_gen_callback = None
-                    query_source_identity = _cli_query_source_identity(
-                        cli.session_id,
-                        cli._session_db.get_last_message_id(cli.session_id) if cli._session_db else 0,
-                        effective_query,
-                    )
-                    query_event_type = "cli-query"
-                    query_task_id = None
-                    query_goal_id = None
-                    query_payload = None
-                    if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1" and _kanban_task_id:
-                        query_event_type = "kanban-goal-turn"
-                        query_task_id = _kanban_task_id
-                        # A Kanban card id is a task, not a GoalManager id.
-                        query_goal_id = None
-                        iteration = _next_kanban_iteration(
-                            cli._session_db, cli.session_id, query_task_id
-                        )
-                        query_source_identity = _cli_kanban_turn_source_identity(
-                            query_task_id, query_goal_id, iteration
-                        )
-                        query_payload = {
-                            "iteration": iteration,
-                            "evaluation_identity": iteration,
-                        }
-                    logical_turn_claim = cli._admit_cli_logical_turn(
-                        effective_query,
-                        event_type=query_event_type,
-                        source_identity=query_source_identity,
-                        task_id=query_task_id,
-                        goal_id=query_goal_id,
-                        payload=query_payload,
-                    )
-                    if logical_turn_claim and logical_turn_claim.get("outcome") != "claimed":
-                        print("Error: session turn is already owned or has completed", file=sys.stderr)
-                        sys.exit(1)
                     try:
                         result = cli.agent.run_conversation(
                             user_message=effective_query,
@@ -16003,6 +16097,10 @@ def main(
                     # Ensure proper exit code for automation wrappers
                     sys.exit(1 if isinstance(result, dict) and result.get("failed") else 0)
             
+            cli._finish_cli_logical_turn(
+                logical_turn_claim,
+                {"failed": True, "error": "runtime credentials or agent initialization failed"},
+            )
             # Exit with error code if credentials or agent init fails
             sys.exit(1)
         else:
