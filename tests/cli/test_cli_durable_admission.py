@@ -7,10 +7,12 @@ from pathlib import Path
 import pytest
 
 from cli import (
+    DurableAdmissionUnavailable,
     HermesCLI,
     _cli_background_source_identity,
     _cli_kanban_turn_source_identity,
     _cli_query_source_identity,
+    _next_kanban_iteration,
 )
 from hermes_state import SessionDB
 
@@ -119,6 +121,42 @@ def test_kanban_iterations_are_distinct_but_iteration_replay_is_idempotent(state
     assert [(turn["task_id"], turn["goal_id"], turn["payload"]["iteration"]) for turn in turns] == [
         ("task-7", "goal-9", 1), ("task-7", "goal-9", 2),
     ]
+
+
+def test_kanban_cursor_reconstructs_restart_and_replays_unfinished_iteration(state):
+    state.create_session("worker-restart", "cli")
+    cli = _cli(state, "worker-restart")
+    for iteration in (1, 2):
+        claim = cli._admit_cli_logical_turn(
+            "identical continuation", event_type="kanban-goal-turn",
+            source_identity=_cli_kanban_turn_source_identity("task-r", None, iteration),
+            task_id="task-r", goal_id=None, payload={"iteration": iteration},
+        )
+        cli._finish_cli_logical_turn(claim, {"final_response": f"turn {iteration}"})
+    assert _next_kanban_iteration(state, "worker-restart", "task-r") == 3
+
+    third = cli._admit_cli_logical_turn(
+        "identical continuation", event_type="kanban-goal-turn",
+        source_identity=_cli_kanban_turn_source_identity("task-r", None, 3),
+        task_id="task-r", goal_id=None, payload={"iteration": 3},
+    )
+    assert _next_kanban_iteration(state, "worker-restart", "task-r") == 3
+    state.fail_logical_turn(third["logical_turn_id"], third["attempt_id"], "crashed", retryable=True)
+    replay = cli._admit_cli_logical_turn(
+        "identical continuation", event_type="kanban-goal-turn",
+        source_identity=_cli_kanban_turn_source_identity("task-r", None, 3),
+        task_id="task-r", goal_id=None, payload={"iteration": 3},
+    )
+    assert replay["logical_turn_id"] == third["logical_turn_id"]
+    assert replay["turn"]["goal_id"] is None
+
+
+def test_cli_refuses_unmanaged_turns():
+    cli = HermesCLI.__new__(HermesCLI)
+    cli._session_db = None
+    cli.session_id = "missing-db"
+    with pytest.raises(DurableAdmissionUnavailable):
+        cli._admit_cli_logical_turn("must not run")
 
 
 def test_background_jobs_have_independent_child_sessions_and_parent_correlation(state):
