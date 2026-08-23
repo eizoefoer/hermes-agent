@@ -24,6 +24,7 @@ except ModuleNotFoundError:
     pass
 
 import logging
+import hashlib
 import os
 import shutil
 import sys
@@ -45,6 +46,24 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _cli_query_source_identity(session_id: str, history_message_id: int, message: Any) -> str:
+    """Stable identity for one direct CLI query at one persisted history point."""
+    digest = hashlib.sha256(
+        json.dumps(message, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:20]
+    return f"cli:query:{session_id}:history:{int(history_message_id)}:{digest}"
+
+
+def _cli_kanban_turn_source_identity(task_id: str, goal_id: str, iteration: int) -> str:
+    """Stable identity for a specific persisted Kanban goal iteration."""
+    return f"cli:kanban:task:{task_id}:goal:{goal_id}:iteration:{int(iteration)}"
+
+
+def _cli_background_source_identity(parent_session_id: str, child_session_id: str, task_id: str) -> str:
+    """Stable identity for one independent CLI background child invocation."""
+    return f"cli:background:parent:{parent_session_id}:child:{child_session_id}:task:{task_id}"
 
 # Suppress startup messages for clean CLI experience
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
@@ -9039,6 +9058,13 @@ class HermesCLI:
         self._background_task_counter += 1
         task_num = self._background_task_counter
         task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        # ``__new__``-constructed UI tests and legacy embedding callers may
+        # not have a parent session yet; real CLI instances always do.
+        parent_session_id = getattr(self, "session_id", "") or "cli-parent-unknown"
+        child_session_id = task_id
+        background_source_identity = _cli_background_source_identity(
+            parent_session_id, child_session_id, task_id
+        )
 
         # Make sure we have valid credentials
         if not self._ensure_runtime_credentials():
@@ -9059,6 +9085,28 @@ class HermesCLI:
             except Exception:
                 pass
             try:
+                # This is an independent child execution. Local background
+                # registries remain UI hints; the child session's durable
+                # logical turn and lease decide whether it may run.
+                if self._session_db and not self._session_db.get_session(child_session_id):
+                    self._session_db.create_session(child_session_id, "cli-background")
+                child_cli = HermesCLI.__new__(HermesCLI)
+                child_cli._session_db = self._session_db
+                child_cli.session_id = child_session_id
+                logical_turn_claim = child_cli._admit_cli_logical_turn(
+                    prompt,
+                    event_type="cli-background",
+                    source_identity=background_source_identity,
+                    task_id=task_id,
+                    payload={
+                        "parent_session_id": parent_session_id,
+                        "child_session_id": child_session_id,
+                        "background_task_id": task_id,
+                    },
+                )
+                if logical_turn_claim and logical_turn_claim.get("outcome") not in {"claimed", "unmanaged"}:
+                    logger.info("CLI background child %s not runnable: %s", task_id, logical_turn_claim.get("outcome"))
+                    return
                 bg_agent = AIAgent(
                     model=turn_route["model"],
                     api_key=turn_route["runtime"].get("api_key"),
@@ -9102,6 +9150,7 @@ class HermesCLI:
                     user_message=prompt,
                     task_id=task_id,
                 )
+                child_cli._finish_cli_logical_turn(logical_turn_claim, result)
 
                 response = result.get("final_response", "") if result else ""
                 if not response and result and result.get("error"):
@@ -9150,6 +9199,13 @@ class HermesCLI:
                     sys.stdout.flush()
 
             except Exception as e:
+                try:
+                    child_cli._finish_cli_logical_turn(
+                        logical_turn_claim,
+                        {"failed": True, "error": str(e)},
+                    )
+                except Exception:
+                    pass
                 # Same TUI refresh pattern as success path (#2718)
                 if self._app:
                     self._app.invalidate()
@@ -11883,7 +11939,16 @@ class HermesCLI:
             except Exception:
                 pass
 
-    def _admit_cli_logical_turn(self, message: Any) -> Optional[Dict[str, Any]]:
+    def _admit_cli_logical_turn(
+        self,
+        message: Any,
+        *,
+        event_type: str = "cli-input",
+        source_identity: Optional[str] = None,
+        task_id: Optional[str] = None,
+        goal_id: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Claim one CLI turn from durable state, including ``--resume`` turns.
 
         A historical transcript is evidence of context, not ownership.  Only a
@@ -11908,15 +11973,20 @@ class HermesCLI:
             ).stdout.strip() or None
         except Exception:
             branch = None
+        history_message_id = state.get_last_message_id(self.session_id)
         admitted = state.admit_session_event(
             session_id=self.session_id,
             session_key=f"cli:{self.session_id}",
-            # A CLI input has no platform update id.  Its random id is persisted
-            # before execution and remains stable across attempts/recovery.
-            source_identity=f"cli:input:{uuid.uuid4().hex}",
-            event_type="cli-input",
-            payload={"text": str(message), "source": "cli"},
-            task_id=self.session_id,
+            # The transcript watermark makes duplicate process deliveries of a
+            # direct query idempotent without suppressing an intentional later
+            # repetition after the prior turn committed history.
+            source_identity=source_identity or _cli_query_source_identity(
+                self.session_id, history_message_id, message
+            ),
+            event_type=event_type,
+            payload={"text": str(message), "source": "cli", **(payload or {})},
+            task_id=task_id,
+            goal_id=goal_id,
             branch=branch,
             worktree=os.getcwd(),
         )
@@ -11935,10 +12005,20 @@ class HermesCLI:
         attempt_id = claim.get("attempt_id")
         if not turn_id or not attempt_id:
             return
-        if result and (result.get("failed") or result.get("error")):
-            self._session_db.fail_logical_turn(turn_id, attempt_id, str(result.get("error") or "CLI turn failed"), retryable=True)
+        if result and (result.get("failed") or result.get("error") or result.get("interrupted")):
+            self._session_db.fail_logical_turn(
+                turn_id,
+                attempt_id,
+                str(result.get("error") or "CLI turn interrupted" if result.get("interrupted") else "CLI turn failed"),
+                retryable=True,
+            )
         else:
-            self._session_db.complete_logical_turn(turn_id, attempt_id, {"response_present": bool(result)})
+            response = result.get("final_response") if result else None
+            self._session_db.complete_logical_turn(
+                turn_id,
+                attempt_id,
+                {"response": response, "response_present": bool(str(response or "").strip())},
+            )
 
     def chat(self, message, images: list = None) -> Optional[str]:
         """
@@ -15308,12 +15388,39 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         return
 
     max_turns = task.goal_max_turns or _DEF_TURNS
+    # The Kanban card id is the authoritative persisted task and goal scope.
+    # Every model
+    # turn is numbered independently of prompt text so a replay of iteration
+    # two cannot silently become iteration four.
+    goal_scope = task_id
+    iteration = 1
 
     def _run_turn(prompt: str) -> str:
-        result = cli.agent.run_conversation(
-            user_message=prompt,
-            conversation_history=cli.conversation_history,
+        nonlocal iteration
+        iteration += 1
+        source_identity = _cli_kanban_turn_source_identity(task_id, goal_scope, iteration)
+        claim = cli._admit_cli_logical_turn(
+            prompt,
+            event_type="kanban-goal-turn",
+            source_identity=source_identity,
+            task_id=task_id,
+            goal_id=goal_scope,
+            payload={"iteration": iteration, "evaluation_identity": iteration},
         )
+        if claim and claim.get("outcome") == "terminal":
+            prior = (claim.get("turn") or {}).get("result") or {}
+            return str(prior.get("response") or "")
+        if claim and claim.get("outcome") != "claimed":
+            raise RuntimeError(f"kanban iteration {iteration} is {claim.get('outcome')}")
+        try:
+            result = cli.agent.run_conversation(
+                user_message=prompt,
+                conversation_history=cli.conversation_history,
+            )
+        except Exception as exc:
+            cli._finish_cli_logical_turn(claim, {"failed": True, "error": str(exc)})
+            raise
+        cli._finish_cli_logical_turn(claim, result)
         # Keep session_id in sync if mid-run compression rotated it.
         if (
             getattr(cli.agent, "session_id", None)
@@ -15728,10 +15835,45 @@ def main(
                     # status lines).  The response is printed once below.
                     cli.agent.stream_delta_callback = None
                     cli.agent.tool_gen_callback = None
-                    result = cli.agent.run_conversation(
-                        user_message=effective_query,
-                        conversation_history=cli.conversation_history,
+                    query_source_identity = _cli_query_source_identity(
+                        cli.session_id,
+                        cli._session_db.get_last_message_id(cli.session_id) if cli._session_db else 0,
+                        effective_query,
                     )
+                    query_event_type = "cli-query"
+                    query_task_id = None
+                    query_goal_id = None
+                    query_payload = None
+                    if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1" and _kanban_task_id:
+                        query_event_type = "kanban-goal-turn"
+                        query_task_id = _kanban_task_id
+                        query_goal_id = query_task_id
+                        query_source_identity = _cli_kanban_turn_source_identity(
+                            query_task_id, query_goal_id, 1
+                        )
+                        query_payload = {"iteration": 1, "evaluation_identity": 1}
+                    logical_turn_claim = cli._admit_cli_logical_turn(
+                        effective_query,
+                        event_type=query_event_type,
+                        source_identity=query_source_identity,
+                        task_id=query_task_id,
+                        goal_id=query_goal_id,
+                        payload=query_payload,
+                    )
+                    if logical_turn_claim and logical_turn_claim.get("outcome") != "claimed":
+                        print("Error: session turn is already owned or has completed", file=sys.stderr)
+                        sys.exit(1)
+                    try:
+                        result = cli.agent.run_conversation(
+                            user_message=effective_query,
+                            conversation_history=cli.conversation_history,
+                        )
+                    except Exception as exc:
+                        cli._finish_cli_logical_turn(
+                            logical_turn_claim, {"failed": True, "error": str(exc)}
+                        )
+                        raise
+                    cli._finish_cli_logical_turn(logical_turn_claim, result)
                     # Sync session_id if mid-run compression created a
                     # continuation session. The exit line below reports
                     # session_id to stderr for automation wrappers; without

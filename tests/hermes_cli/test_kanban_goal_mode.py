@@ -206,6 +206,24 @@ def test_loop_stops_when_worker_already_completed(monkeypatch):
     assert turns == []  # no extra turns
 
 
+@pytest.mark.parametrize("terminal_status", ["paused", "waiting"])
+def test_loop_does_not_start_another_turn_for_non_runnable_task_status(monkeypatch, terminal_status):
+    _patch_judge(monkeypatch, ["continue"])  # must never be consulted
+    turns = []
+
+    res = goals.run_kanban_goal_loop(
+        task_id="terminal-status",
+        goal_text="do not run after terminal status",
+        run_turn=lambda prompt: turns.append(prompt) or "unexpected",
+        task_status_fn=lambda: terminal_status,
+        block_fn=lambda reason: pytest.fail("should not block"),
+        first_response="initial response",
+    )
+
+    assert res["outcome"] == "stopped"
+    assert turns == []
+
+
 def test_loop_continues_then_worker_completes(monkeypatch):
     _patch_judge(monkeypatch, ["continue", "continue"])
     statuses = iter(["running", "running", "done"])
