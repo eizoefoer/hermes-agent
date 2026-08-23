@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import multiprocessing
 from pathlib import Path
 
 import pytest
@@ -15,9 +16,39 @@ from cli import (
     _cli_kanban_turn_source_identity,
     _cli_query_source_identity,
     _next_kanban_iteration,
+    _resolve_kanban_iteration,
     recover_cli_background_children,
 )
 from hermes_state import SessionDB
+
+
+def _replacement_admit_then_interrupt(db_path: str, source_identity: str, result_queue) -> None:
+    """A separate interpreter process accepts a quiet event then exits."""
+    state = SessionDB(db_path=Path(db_path))
+    state.create_session("quiet-process", "cli")
+    cli = HermesCLI.__new__(HermesCLI)
+    cli._session_db = state
+    cli.session_id = "quiet-process"
+    claim = cli._admit_cli_logical_turn(
+        "same quiet query", event_type="cli-query", source_identity=source_identity
+    )
+    state.fail_logical_turn(
+        claim["logical_turn_id"], claim["attempt_id"], "process interrupted", retryable=True
+    )
+    result_queue.put(claim["logical_turn_id"])
+
+
+def _replacement_reclaim(db_path: str, source_identity: str, result_queue) -> None:
+    """A fresh interpreter must reclaim the persisted quiet event, not mint one."""
+    state = SessionDB(db_path=Path(db_path))
+    cli = HermesCLI.__new__(HermesCLI)
+    cli._session_db = state
+    cli.session_id = "quiet-process"
+    claim = cli._admit_cli_logical_turn(
+        "same quiet query", event_type="cli-query", source_identity=source_identity
+    )
+    cli._finish_cli_logical_turn(claim, {"final_response": "recovered"})
+    result_queue.put((claim["logical_turn_id"], claim["outcome"]))
 
 
 @pytest.fixture
@@ -93,6 +124,42 @@ def test_quiet_source_event_is_fresh_but_explicit_crash_recovery_reuses_it(state
     assert _cli_fresh_source_identity("quiet", "query") != _cli_fresh_source_identity("quiet", "query")
 
 
+def test_quiet_process_replacement_reclaims_persisted_source_not_prompt_text(state):
+    """A real new process reuses only the supplied accepted-event identity."""
+    context = multiprocessing.get_context("spawn")
+    queue = context.Queue()
+    source_identity = "quiet-process-event-1"
+    first = context.Process(
+        target=_replacement_admit_then_interrupt,
+        args=(str(state.db_path), source_identity, queue),
+    )
+    first.start()
+    first.join(timeout=10)
+    assert first.exitcode == 0
+    turn_id = queue.get(timeout=2)
+
+    replacement = context.Process(
+        target=_replacement_reclaim,
+        args=(str(state.db_path), source_identity, queue),
+    )
+    replacement.start()
+    replacement.join(timeout=10)
+    assert replacement.exitcode == 0
+    assert queue.get(timeout=2) == (turn_id, "claimed")
+
+    replacement_state = SessionDB(db_path=state.db_path)
+    assert replacement_state.get_logical_turn(turn_id)["state"] == "completed"
+
+
+def test_default_cli_admission_does_not_dedupe_identical_prompt_text(state):
+    state.create_session("same-text", "cli")
+    cli = _cli(state, "same-text")
+    first = cli._admit_cli_logical_turn("identical")
+    cli._finish_cli_logical_turn(first, {"final_response": "one"})
+    second = cli._admit_cli_logical_turn("identical")
+    assert second["logical_turn_id"] != first["logical_turn_id"]
+
+
 def test_background_recovery_executor_repairs_parent_then_runs_same_child(state):
     state.create_session("parent-recover", "cli")
     parent = state.admit_session_event(
@@ -114,6 +181,34 @@ def test_background_recovery_executor_repairs_parent_then_runs_same_child(state)
     assert executed == [child_turns[0]["logical_turn_id"]]
     assert child_turns[0]["state"] == "completed"
     assert state.get_logical_turn(parent["logical_turn_id"])["state"] == "completed"
+
+
+def test_background_recovery_after_child_admission_reuses_the_original_child(state):
+    state.create_session("parent-after-child", "cli")
+    parent = state.admit_session_event(
+        session_id="parent-after-child", session_key="cli:parent-after-child",
+        source_identity="background-parent-event", event_type="cli-background-command",
+        payload={"text": "recover admitted child", "background_task_id": "bg-after", "child_session_id": "child-after"},
+    )
+    parent_claim = state.claim_logical_turn(parent["logical_turn_id"], owner="dead")
+    state.create_session("child-after", "cli-background")
+    child = state.admit_session_event(
+        session_id="child-after", session_key="cli:child-after",
+        source_identity=_cli_background_source_identity("parent-after-child", "child-after", "bg-after"),
+        event_type="cli-background", task_id="bg-after",
+        payload={"text": "recover admitted child", "parent_session_id": "parent-after-child", "child_session_id": "child-after", "background_task_id": "bg-after"},
+    )
+    child_claim = state.claim_logical_turn(child["logical_turn_id"], owner="dead")
+    state.fail_logical_turn(parent["logical_turn_id"], parent_claim["attempt_id"], "crashed", retryable=True)
+    state.fail_logical_turn(child["logical_turn_id"], child_claim["attempt_id"], "crashed", retryable=True)
+
+    executed = []
+    recovered = recover_cli_background_children(
+        state, lambda turn: executed.append(turn["logical_turn_id"]) or {"final_response": "ok"}, limit=4
+    )
+    assert recovered == [child["logical_turn_id"]]
+    assert executed == [child["logical_turn_id"]]
+    assert len(state.list_session_logical_turns("child-after")) == 1
 
 
 def test_background_handler_persists_child_before_parent_success(state, monkeypatch):
@@ -151,16 +246,34 @@ def test_background_handler_persists_child_before_parent_success(state, monkeypa
     monkeypatch.setattr(cli_module, "AIAgent", Agent)
     monkeypatch.setattr(cli_module, "_cprint", lambda *_: None)
     cli._handle_background_command("/background durable child")
+    cli._handle_background_command("/background durable child")
     for thread in list(cli._background_tasks.values()):
         thread.join(timeout=2)
 
     parent_turns = state.list_session_logical_turns("background-parent")
-    assert len(parent_turns) == 1 and parent_turns[0]["state"] == "completed"
-    task_id = parent_turns[0]["payload"]["background_task_id"]
-    child_turns = state.list_session_logical_turns(task_id)
-    assert len(child_turns) == 1
-    assert child_turns[0]["state"] == "completed"
-    assert child_turns[0]["payload"]["parent_session_id"] == "background-parent"
+    assert len(parent_turns) == 2 and all(turn["state"] == "completed" for turn in parent_turns)
+    task_ids = {turn["payload"]["background_task_id"] for turn in parent_turns}
+    assert len(task_ids) == 2
+    child_turns = [turn for task_id in task_ids for turn in state.list_session_logical_turns(task_id)]
+    assert len(child_turns) == 2
+    assert all(turn["state"] == "completed" for turn in child_turns)
+    assert all(turn["payload"]["parent_session_id"] == "background-parent" for turn in child_turns)
+
+
+def test_background_parent_replay_retains_its_persisted_child_identity(state):
+    state.create_session("parent-replay", "cli")
+    cli = _cli(state, "parent-replay")
+    first = cli._admit_cli_logical_turn(
+        "same background command", event_type="cli-background-command", source_identity="parent-event-1",
+        payload={"background_task_id": "child-id-1", "child_session_id": "child-id-1"},
+    )
+    state.fail_logical_turn(first["logical_turn_id"], first["attempt_id"], "crashed", retryable=True)
+    replay = cli._admit_cli_logical_turn(
+        "same background command", event_type="cli-background-command", source_identity="parent-event-1",
+        payload={"background_task_id": "new-child-must-not-win", "child_session_id": "new-child-must-not-win"},
+    )
+    assert replay["logical_turn_id"] == first["logical_turn_id"]
+    assert replay["turn"]["payload"]["background_task_id"] == "child-id-1"
 
 
 def test_interrupted_cli_attempt_is_retryable_for_recovery(state):
@@ -257,6 +370,21 @@ def test_completed_kanban_iteration_two_replay_resolves_iteration_two_not_four(s
     assert replay["outcome"] == "terminal"
     assert replay["turn"]["payload"]["iteration"] == 2
     assert _next_kanban_iteration(state, "worker-completed-replay", "task-complete") == 3
+
+
+def test_explicit_completed_kanban_iteration_two_replay_resolves_two_not_four(state, monkeypatch):
+    state.create_session("worker-exact-replay", "cli")
+    cli = _cli(state, "worker-exact-replay")
+    for iteration in (1, 2, 3):
+        claim = cli._admit_cli_logical_turn(
+            "identical continuation", event_type="kanban-goal-turn",
+            source_identity=_cli_kanban_turn_source_identity("task-exact", None, iteration),
+            task_id="task-exact", payload={"iteration": iteration},
+        )
+        cli._finish_cli_logical_turn(claim, {"final_response": f"turn {iteration}"})
+    iteration_two = _cli_kanban_turn_source_identity("task-exact", None, 2)
+    monkeypatch.setenv("HERMES_CLI_SOURCE_ID", iteration_two)
+    assert _resolve_kanban_iteration(state, "worker-exact-replay", "task-exact") == 2
 
 
 def test_cli_refuses_unmanaged_turns():

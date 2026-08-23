@@ -99,6 +99,27 @@ def _next_kanban_iteration(state, session_id: str, task_id: str) -> int:
     return max([int((turn.get("payload") or {}).get("iteration") or 0) for turn in relevant] or [0]) + 1
 
 
+def _resolve_kanban_iteration(state, session_id: str, task_id: str) -> int:
+    """Reuse an explicitly replayed Kanban iteration, else allocate the next.
+
+    Goal workers have a durable iteration identity, unlike ordinary CLI input.
+    A supervisor that replaces a process can pass that exact identity back in
+    ``HERMES_CLI_SOURCE_ID``.  This is deliberately an exact persisted-row
+    lookup; prompt text and transcript position are never occurrence ids.
+    """
+    source_identity = os.environ.get("HERMES_CLI_SOURCE_ID", "").strip()
+    if source_identity:
+        for turn in state.list_session_logical_turns(session_id):
+            payload = turn.get("payload") or {}
+            if (
+                turn.get("source_identity") == source_identity
+                and turn.get("task_id") == task_id
+                and payload.get("event_type") == "kanban-goal-turn"
+            ):
+                return int(payload.get("iteration") or 1)
+    return _next_kanban_iteration(state, session_id, task_id)
+
+
 def _cli_background_source_identity(parent_session_id: str, child_session_id: str, task_id: str) -> str:
     """Stable identity for one independent CLI background child invocation."""
     return f"cli:background:parent:{parent_session_id}:child:{child_session_id}:task:{task_id}"
@@ -144,7 +165,8 @@ def recover_cli_background_children(state, execute, *, limit: int = 32) -> list[
             parent["logical_turn_id"], parent_claim["attempt_id"],
             {"response": "background started", "task_id": task_id},
         )
-        recovered.append(child["logical_turn_id"])
+        if child["logical_turn_id"] not in recovered:
+            recovered.append(child["logical_turn_id"])
 
     for turn in state.list_ready_logical_turns(limit=max(1, int(limit))):
         payload = turn.get("payload") or {}
@@ -168,7 +190,8 @@ def recover_cli_background_children(state, execute, *, limit: int = 32) -> list[
         else:
             response = result.get("final_response") if isinstance(result, dict) else result
             state.complete_logical_turn(turn["logical_turn_id"], claim["attempt_id"], {"response": response})
-            recovered.append(turn["logical_turn_id"])
+            if turn["logical_turn_id"] not in recovered:
+                recovered.append(turn["logical_turn_id"])
     return recovered
 
 # Suppress startup messages for clean CLI experience
@@ -9179,11 +9202,9 @@ class HermesCLI:
         task_id = f"bg_{uuid.uuid4().hex}"
         child_session_id = task_id
         if self._session_db is not None:
-            parent_identity = _cli_query_source_identity(
-                parent_session_id,
-                self._session_db.get_last_message_id(parent_session_id),
-                {"command": "background", "prompt": prompt},
-            ).replace("cli:query:", "cli:background-command:")
+            parent_identity = _cli_fresh_source_identity(
+                parent_session_id, "background-command"
+            )
             parent_claim = self._admit_cli_logical_turn(
                 prompt,
                 event_type="cli-background-command",
@@ -12139,15 +12160,14 @@ class HermesCLI:
             ).stdout.strip() or None
         except Exception:
             branch = None
-        history_message_id = state.get_last_message_id(self.session_id)
         admitted = state.admit_session_event(
             session_id=self.session_id,
             session_key=f"cli:{self.session_id}",
-            # The transcript watermark makes duplicate process deliveries of a
-            # direct query idempotent without suppressing an intentional later
-            # repetition after the prior turn committed history.
-            source_identity=source_identity or _cli_query_source_identity(
-                self.session_id, history_message_id, message
+            # CLI has no transport update id.  Never infer one from prompt
+            # text or the transcript watermark: ordinary repeated input is a
+            # new event.  A crash/replay owner supplies its persisted identity.
+            source_identity=source_identity or _cli_fresh_source_identity(
+                self.session_id, event_type
             ),
             event_type=event_type,
             payload={"text": str(message), "source": "cli", **(payload or {})},
@@ -15576,7 +15596,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
 
     max_turns = task.goal_max_turns or _DEF_TURNS
     def _run_turn(prompt: str) -> str:
-        iteration = _next_kanban_iteration(cli._session_db, cli.session_id, task_id)
+        iteration = _resolve_kanban_iteration(cli._session_db, cli.session_id, task_id)
         source_identity = _cli_kanban_turn_source_identity(task_id, None, iteration)
         claim = cli._admit_cli_logical_turn(
             prompt,
@@ -15956,7 +15976,9 @@ def main(
             if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1" and _kanban_task_id:
                 query_event_type = "kanban-goal-turn"
                 query_task_id = _kanban_task_id
-                iteration = _next_kanban_iteration(cli._session_db, cli.session_id, query_task_id)
+                iteration = _resolve_kanban_iteration(
+                    cli._session_db, cli.session_id, query_task_id
+                )
                 query_source_identity = _cli_kanban_turn_source_identity(
                     query_task_id, query_goal_id, iteration
                 )
