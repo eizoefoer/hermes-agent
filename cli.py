@@ -71,6 +71,52 @@ def _cli_fresh_source_identity(session_id: str, event_type: str) -> str:
     return f"cli:{event_type}:{session_id}:{uuid.uuid4().hex}"
 
 
+def _cli_request_digest(message: Any) -> str:
+    """Return immutable request metadata suitable for narrow crash recovery."""
+    return hashlib.sha256(
+        json.dumps(message, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+class DurableRecoveryAmbiguous(RuntimeError):
+    """More than one unfinished durable request matches a recovery attempt."""
+
+
+def _resolve_cli_query_source_identity(state, session_id: str, message: Any) -> str:
+    """Resolve an exact override, one unfinished query, or a fresh occurrence.
+
+    Terminal turns never participate.  Matching uses immutable acceptance
+    metadata, not the mutable transcript watermark.  Ambiguity is fail-closed
+    because choosing an arbitrary row could replay the wrong tool execution.
+    """
+    supplied = os.environ.get("HERMES_CLI_SOURCE_ID", "").strip()
+    if supplied:
+        return supplied
+
+    state.reconcile_logical_turns()
+    request_digest = _cli_request_digest(message)
+    candidates = []
+    for turn in state.list_session_logical_turns(session_id):
+        payload = turn.get("payload") or {}
+        if payload.get("event_type") != "cli-query":
+            continue
+        if turn.get("state") in {"completed", "failed", "unrecoverable"}:
+            continue
+        persisted_digest = payload.get("request_digest")
+        if not persisted_digest and "text" in payload:
+            persisted_digest = _cli_request_digest(payload.get("text"))
+        if persisted_digest == request_digest:
+            candidates.append(turn)
+
+    if len(candidates) > 1:
+        raise DurableRecoveryAmbiguous(
+            f"multiple unfinished cli-query turns match session {session_id}"
+        )
+    if candidates:
+        return str(candidates[0]["source_identity"])
+    return _cli_fresh_source_identity(session_id, "query")
+
+
 def _cli_kanban_turn_source_identity(task_id: str, goal_id: Optional[str], iteration: int) -> str:
     """Stable identity for a specific persisted Kanban goal iteration."""
     return f"cli:kanban:task:{task_id}:goal:{goal_id or 'none'}:iteration:{int(iteration)}"
@@ -3460,6 +3506,64 @@ class HermesCLI:
         # Background task tracking: {task_id: threading.Thread}
         self._background_tasks: Dict[str, threading.Thread] = {}
         self._background_task_counter = 0
+        self._background_recovery_thread: Optional[threading.Thread] = None
+        self._start_background_recovery_pass()
+
+    def _execute_recovered_background_turn(self, turn: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute one already-admitted background child during startup recovery."""
+        payload = turn.get("payload") or {}
+        prompt = str(payload.get("text") or "")
+        task_id = str(payload.get("background_task_id") or turn.get("task_id") or "")
+        if not prompt or not task_id:
+            return {"failed": True, "error": "invalid persisted background payload"}
+        if not self._ensure_runtime_credentials():
+            return {"failed": True, "error": "runtime credentials unavailable"}
+        turn_route = self._resolve_turn_agent_config(prompt)
+        agent = AIAgent(
+            model=turn_route["model"],
+            api_key=turn_route["runtime"].get("api_key"),
+            base_url=turn_route["runtime"].get("base_url"),
+            provider=turn_route["runtime"].get("provider"),
+            api_mode=turn_route["runtime"].get("api_mode"),
+            acp_command=turn_route["runtime"].get("command"),
+            acp_args=turn_route["runtime"].get("args"),
+            max_iterations=self.max_turns,
+            enabled_toolsets=self.enabled_toolsets,
+            quiet_mode=True,
+            verbose_logging=False,
+            session_id=str(turn.get("session_id") or task_id),
+            platform="cli",
+            session_db=self._session_db,
+            reasoning_config=self.reasoning_config,
+            service_tier=self.service_tier,
+            request_overrides=turn_route.get("request_overrides"),
+            fallback_model=self._fallback_model,
+        )
+        agent._print_fn = lambda *_a, **_kw: None
+        return agent.run_conversation(user_message=prompt, task_id=task_id)
+
+    def _start_background_recovery_pass(self, *, limit: int = 8) -> None:
+        """Run one bounded durable background recovery pass without blocking startup."""
+        if self._session_db is None:
+            return
+
+        def _recover() -> None:
+            try:
+                recover_cli_background_children(
+                    self._session_db,
+                    self._execute_recovered_background_turn,
+                    limit=limit,
+                )
+            except Exception as exc:
+                logger.warning("CLI background startup recovery failed: %s", exc)
+
+        thread = threading.Thread(
+            target=_recover,
+            daemon=True,
+            name="cli-background-recovery",
+        )
+        self._background_recovery_thread = thread
+        thread.start()
 
     def _invalidate(self, min_interval: float = 0.25) -> None:
         """Throttled UI repaint — prevents terminal blinking on slow/SSH connections."""
@@ -15965,14 +16069,16 @@ def main(
             cli.tool_progress_mode = "off"
             # Accept the source event before credentials, image preprocessing,
             # agent construction, transcript writes, or any model call.  A
-            # quiet invocation has no transport message id, so ordinary runs
-            # mint a fresh identity; a supervisor retry supplies the original
-            # HERMES_CLI_SOURCE_ID and recovers the persisted logical turn.
+            # quiet invocation has no transport message id. Exact supervisor
+            # identity wins; otherwise one compatible unfinished durable query
+            # is recovered, and only the no-match case mints a fresh occurrence.
             query_event_type = "cli-query"
             query_task_id = None
             query_goal_id = None
-            query_payload = None
-            query_source_identity = _cli_fresh_source_identity(cli.session_id, "query")
+            query_payload = {"request_digest": _cli_request_digest(query)}
+            query_source_identity = _resolve_cli_query_source_identity(
+                cli._session_db, cli.session_id, query
+            )
             if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1" and _kanban_task_id:
                 query_event_type = "kanban-goal-turn"
                 query_task_id = _kanban_task_id

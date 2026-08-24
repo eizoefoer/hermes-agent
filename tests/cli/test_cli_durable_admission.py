@@ -10,42 +10,52 @@ import cli as cli_module
 
 from cli import (
     DurableAdmissionUnavailable,
+    DurableRecoveryAmbiguous,
     HermesCLI,
     _cli_background_source_identity,
     _cli_fresh_source_identity,
     _cli_kanban_turn_source_identity,
     _cli_query_source_identity,
+    _cli_request_digest,
     _next_kanban_iteration,
+    _resolve_cli_query_source_identity,
     _resolve_kanban_iteration,
     recover_cli_background_children,
 )
 from hermes_state import SessionDB
 
 
-def _replacement_admit_then_interrupt(db_path: str, source_identity: str, result_queue) -> None:
+def _replacement_admit_then_interrupt(db_path: str, result_queue) -> None:
     """A separate interpreter process accepts a quiet event then exits."""
     state = SessionDB(db_path=Path(db_path))
     state.create_session("quiet-process", "cli")
     cli = HermesCLI.__new__(HermesCLI)
     cli._session_db = state
     cli.session_id = "quiet-process"
+    prompt = "same quiet query"
+    source_identity = _resolve_cli_query_source_identity(state, "quiet-process", prompt)
     claim = cli._admit_cli_logical_turn(
-        "same quiet query", event_type="cli-query", source_identity=source_identity
+        prompt, event_type="cli-query", source_identity=source_identity,
+        payload={"request_digest": _cli_request_digest(prompt)},
     )
+    state.append_message("quiet-process", "user", "transcript changed before crash")
     state.fail_logical_turn(
         claim["logical_turn_id"], claim["attempt_id"], "process interrupted", retryable=True
     )
     result_queue.put(claim["logical_turn_id"])
 
 
-def _replacement_reclaim(db_path: str, source_identity: str, result_queue) -> None:
+def _replacement_reclaim(db_path: str, result_queue) -> None:
     """A fresh interpreter must reclaim the persisted quiet event, not mint one."""
     state = SessionDB(db_path=Path(db_path))
     cli = HermesCLI.__new__(HermesCLI)
     cli._session_db = state
     cli.session_id = "quiet-process"
+    prompt = "same quiet query"
+    source_identity = _resolve_cli_query_source_identity(state, "quiet-process", prompt)
     claim = cli._admit_cli_logical_turn(
-        "same quiet query", event_type="cli-query", source_identity=source_identity
+        prompt, event_type="cli-query", source_identity=source_identity,
+        payload={"request_digest": _cli_request_digest(prompt)},
     )
     cli._finish_cli_logical_turn(claim, {"final_response": "recovered"})
     result_queue.put((claim["logical_turn_id"], claim["outcome"]))
@@ -124,14 +134,14 @@ def test_quiet_source_event_is_fresh_but_explicit_crash_recovery_reuses_it(state
     assert _cli_fresh_source_identity("quiet", "query") != _cli_fresh_source_identity("quiet", "query")
 
 
-def test_quiet_process_replacement_reclaims_persisted_source_not_prompt_text(state):
-    """A real new process reuses only the supplied accepted-event identity."""
+def test_quiet_process_replacement_recovers_without_source_override(state, monkeypatch):
+    """A new process finds the unfinished accepted event after transcript mutation."""
+    monkeypatch.delenv("HERMES_CLI_SOURCE_ID", raising=False)
     context = multiprocessing.get_context("spawn")
     queue = context.Queue()
-    source_identity = "quiet-process-event-1"
     first = context.Process(
         target=_replacement_admit_then_interrupt,
-        args=(str(state.db_path), source_identity, queue),
+        args=(str(state.db_path), queue),
     )
     first.start()
     first.join(timeout=10)
@@ -140,7 +150,7 @@ def test_quiet_process_replacement_reclaims_persisted_source_not_prompt_text(sta
 
     replacement = context.Process(
         target=_replacement_reclaim,
-        args=(str(state.db_path), source_identity, queue),
+        args=(str(state.db_path), queue),
     )
     replacement.start()
     replacement.join(timeout=10)
@@ -149,6 +159,31 @@ def test_quiet_process_replacement_reclaims_persisted_source_not_prompt_text(sta
 
     replacement_state = SessionDB(db_path=state.db_path)
     assert replacement_state.get_logical_turn(turn_id)["state"] == "completed"
+    prompt = "same quiet query"
+    fresh_identity = _resolve_cli_query_source_identity(
+        replacement_state, "quiet-process", prompt
+    )
+    fresh_cli = _cli(replacement_state, "quiet-process")
+    second = fresh_cli._admit_cli_logical_turn(
+        prompt, event_type="cli-query", source_identity=fresh_identity,
+        payload={"request_digest": _cli_request_digest(prompt)},
+    )
+    assert second["logical_turn_id"] != turn_id
+
+
+def test_quiet_recovery_refuses_ambiguous_unfinished_matches(state, monkeypatch):
+    monkeypatch.delenv("HERMES_CLI_SOURCE_ID", raising=False)
+    state.create_session("quiet-ambiguous", "cli")
+    prompt = "same unfinished request"
+    digest = _cli_request_digest(prompt)
+    for source in ("quiet-event-a", "quiet-event-b"):
+        state.admit_session_event(
+            session_id="quiet-ambiguous", session_key="cli:quiet-ambiguous",
+            source_identity=source, event_type="cli-query",
+            payload={"text": prompt, "request_digest": digest},
+        )
+    with pytest.raises(DurableRecoveryAmbiguous):
+        _resolve_cli_query_source_identity(state, "quiet-ambiguous", prompt)
 
 
 def test_default_cli_admission_does_not_dedupe_identical_prompt_text(state):
@@ -209,6 +244,85 @@ def test_background_recovery_after_child_admission_reuses_the_original_child(sta
     assert recovered == [child["logical_turn_id"]]
     assert executed == [child["logical_turn_id"]]
     assert len(state.list_session_logical_turns("child-after")) == 1
+
+
+def test_cli_startup_repairs_parent_before_child_without_manual_recovery(state, monkeypatch):
+    monkeypatch.setattr("hermes_state.DEFAULT_DB_PATH", state.db_path)
+    state.create_session("startup-parent", "cli")
+    parent = state.admit_session_event(
+        session_id="startup-parent", session_key="cli:startup-parent",
+        source_identity="startup-parent-event", event_type="cli-background-command",
+        payload={"text": "resume on startup", "background_task_id": "startup-child",
+                 "child_session_id": "startup-child"},
+    )
+    executed = []
+    monkeypatch.setattr(
+        HermesCLI, "_execute_recovered_background_turn",
+        lambda self, turn: executed.append(turn["logical_turn_id"]) or {"final_response": "ok"},
+    )
+
+    replacement = HermesCLI()
+    replacement._background_recovery_thread.join(timeout=5)
+
+    children = state.list_session_logical_turns("startup-child")
+    assert len(children) == 1
+    assert executed == [children[0]["logical_turn_id"]]
+    assert children[0]["state"] == "completed"
+    assert state.get_logical_turn(parent["logical_turn_id"])["state"] == "completed"
+
+
+def test_cli_startup_recovers_same_previously_admitted_child(state, monkeypatch):
+    monkeypatch.setattr("hermes_state.DEFAULT_DB_PATH", state.db_path)
+    state.create_session("startup-parent-existing", "cli")
+    state.create_session("startup-child-existing", "cli-background")
+    child = state.admit_session_event(
+        session_id="startup-child-existing", session_key="cli:startup-child-existing",
+        source_identity="startup-existing-child-event", event_type="cli-background",
+        task_id="startup-job-existing",
+        payload={"text": "execute accepted child", "parent_session_id": "startup-parent-existing",
+                 "child_session_id": "startup-child-existing",
+                 "background_task_id": "startup-job-existing"},
+    )
+    executed = []
+    monkeypatch.setattr(
+        HermesCLI, "_execute_recovered_background_turn",
+        lambda self, turn: executed.append(turn["logical_turn_id"]) or {"final_response": "ok"},
+    )
+
+    replacement = HermesCLI()
+    replacement._background_recovery_thread.join(timeout=5)
+
+    assert executed == [child["logical_turn_id"]]
+    assert len(state.list_session_logical_turns("startup-child-existing")) == 1
+    assert state.get_logical_turn(child["logical_turn_id"])["state"] == "completed"
+
+
+def test_cli_startup_background_failure_does_not_block_next_child(state, monkeypatch):
+    monkeypatch.setattr("hermes_state.DEFAULT_DB_PATH", state.db_path)
+    child_ids = []
+    for suffix in ("bad", "good"):
+        session_id = f"startup-child-{suffix}"
+        state.create_session(session_id, "cli-background")
+        child = state.admit_session_event(
+            session_id=session_id, session_key=f"cli:{session_id}",
+            source_identity=f"startup-{suffix}-event", event_type="cli-background",
+            task_id=f"startup-{suffix}",
+            payload={"text": suffix, "parent_session_id": "old-parent",
+                     "child_session_id": session_id, "background_task_id": f"startup-{suffix}"},
+        )
+        child_ids.append(child["logical_turn_id"])
+
+    def _execute(self, turn):
+        if (turn.get("payload") or {}).get("text") == "bad":
+            raise RuntimeError("isolated failure")
+        return {"final_response": "good"}
+
+    monkeypatch.setattr(HermesCLI, "_execute_recovered_background_turn", _execute)
+    replacement = HermesCLI()
+    replacement._background_recovery_thread.join(timeout=5)
+
+    assert state.get_logical_turn(child_ids[0])["state"] == "queued"
+    assert state.get_logical_turn(child_ids[1])["state"] == "completed"
 
 
 def test_background_handler_persists_child_before_parent_success(state, monkeypatch):
