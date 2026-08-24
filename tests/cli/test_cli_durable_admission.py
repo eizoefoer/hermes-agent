@@ -39,9 +39,6 @@ def _replacement_admit_then_interrupt(db_path: str, result_queue) -> None:
         payload={"request_digest": _cli_request_digest(prompt)},
     )
     state.append_message("quiet-process", "user", "transcript changed before crash")
-    state.fail_logical_turn(
-        claim["logical_turn_id"], claim["attempt_id"], "process interrupted", retryable=True
-    )
     result_queue.put(claim["logical_turn_id"])
 
 
@@ -163,6 +160,7 @@ def test_quiet_process_replacement_recovers_without_source_override(state, monke
     fresh_identity = _resolve_cli_query_source_identity(
         replacement_state, "quiet-process", prompt
     )
+    assert fresh_identity != replacement_state.get_logical_turn(turn_id)["source_identity"]
     fresh_cli = _cli(replacement_state, "quiet-process")
     second = fresh_cli._admit_cli_logical_turn(
         prompt, event_type="cli-query", source_identity=fresh_identity,
@@ -283,6 +281,10 @@ def test_cli_startup_recovers_same_previously_admitted_child(state, monkeypatch)
                  "child_session_id": "startup-child-existing",
                  "background_task_id": "startup-job-existing"},
     )
+    dead_claim = state.claim_logical_turn(
+        child["logical_turn_id"], owner="cli:2147483647", pid=2147483647
+    )
+    state.mark_logical_turn_started(child["logical_turn_id"], dead_claim["attempt_id"])
     executed = []
     monkeypatch.setattr(
         HermesCLI, "_execute_recovered_background_turn",

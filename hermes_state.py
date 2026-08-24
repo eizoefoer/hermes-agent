@@ -1333,6 +1333,15 @@ class SessionDB:
             ).fetchall()
         return [self._logical_turn_row(row) for row in rows]
 
+    def list_active_logical_turns(self, *, limit: int = 100) -> list[Dict[str, Any]]:
+        """Return bounded claimed/executing rows for owner-liveness recovery."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM logical_turns WHERE state IN ('claimed', 'executing') "
+                "ORDER BY updated_at LIMIT ?", (max(1, int(limit)),)
+            ).fetchall()
+        return [self._logical_turn_row(row) for row in rows]
+
     def list_pending_logical_turn_deliveries(
         self,
         *,

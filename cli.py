@@ -82,6 +82,43 @@ class DurableRecoveryAmbiguous(RuntimeError):
     """More than one unfinished durable request matches a recovery attempt."""
 
 
+def _pid_is_alive(pid: Any) -> bool:
+    try:
+        value = int(pid or 0)
+    except (TypeError, ValueError):
+        return False
+    if value <= 0:
+        return False
+    try:
+        os.kill(value, 0)
+        return True
+    except PermissionError:
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return False
+
+
+def _requeue_dead_cli_turn(state, turn: Dict[str, Any]) -> bool:
+    """Release one active CLI attempt whose recorded local owner no longer exists."""
+    if turn.get("state") not in {"claimed", "executing"}:
+        return False
+    owner = str(turn.get("owner") or "")
+    if not owner.startswith(("cli:", "cli-recovery:", "cli-oneshot:")):
+        return False
+    if _pid_is_alive(turn.get("owner_pid")):
+        return False
+    attempt_id = turn.get("current_attempt_id")
+    if not attempt_id:
+        return False
+    state.fail_logical_turn(
+        turn["logical_turn_id"], attempt_id,
+        "recovered after CLI owner process exited", retryable=True,
+    )
+    return True
+
+
 def _resolve_cli_query_source_identity(state, session_id: str, message: Any) -> str:
     """Resolve an exact override, one unfinished query, or a fresh occurrence.
 
@@ -94,6 +131,10 @@ def _resolve_cli_query_source_identity(state, session_id: str, message: Any) -> 
         return supplied
 
     state.reconcile_logical_turns()
+    for active in state.list_session_logical_turns(session_id):
+        payload = active.get("payload") or {}
+        if payload.get("event_type") == "cli-query":
+            _requeue_dead_cli_turn(state, active)
     request_digest = _cli_request_digest(message)
     candidates = []
     for turn in state.list_session_logical_turns(session_id):
@@ -172,16 +213,19 @@ def _cli_background_source_identity(parent_session_id: str, child_session_id: st
 
 
 def recover_cli_background_children(state, execute, *, limit: int = 32) -> list[str]:
-    """Explicit, bounded recovery executor for durable CLI background work.
+    """Bounded recovery executor for durable CLI background work.
 
-    This is intentionally explicit rather than a startup auto-drain: replaying
-    a background prompt may invoke tools, so an embedding CLI/session owner
-    must provide the execution callback.  It repairs a parent crash before
-    child admission, then claims and executes queued/stale child turns using
-    their persisted payload and logical-turn identity.  It never creates a
-    second queue or replays completed rows.
+    CLI startup supplies the execution callback and runs this once in a daemon
+    thread.  It repairs a parent crash before child admission, then claims and
+    executes queued/stale child turns using their persisted payload and
+    logical-turn identity.  It never creates a second queue or replays
+    completed rows.
     """
     state.reconcile_logical_turns()
+    for active in state.list_active_logical_turns(limit=max(1, int(limit))):
+        payload = active.get("payload") or {}
+        if payload.get("event_type") in {"cli-background-command", "cli-background"}:
+            _requeue_dead_cli_turn(state, active)
     recovered: list[str] = []
     ready = state.list_ready_logical_turns(limit=max(1, int(limit)))
     for parent in ready:
