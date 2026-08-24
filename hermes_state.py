@@ -26,7 +26,7 @@ from pathlib import Path
 
 from agent.memory_manager import sanitize_context
 from hermes_constants import get_hermes_home
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -1324,21 +1324,60 @@ class SessionDB:
             ).fetchone()
         return self._logical_turn_row(row)
 
-    def list_ready_logical_turns(self, *, limit: int = 100) -> list[Dict[str, Any]]:
-        """Return a bounded startup-drain snapshot of executable turns only."""
+    def list_ready_logical_turns(
+        self,
+        *,
+        limit: int = 100,
+        event_types: Optional[Iterable[str]] = None,
+    ) -> list[Dict[str, Any]]:
+        """Return a bounded startup-drain snapshot of executable turns only.
+
+        When event types are supplied, filtering happens in SQLite before the
+        limit so unrelated producers cannot consume a caller's recovery
+        budget.
+        """
+        selected_types = tuple(dict.fromkeys(str(item) for item in (event_types or ())))
+        event_filter = ""
+        params: list[Any] = []
+        if selected_types:
+            placeholders = ", ".join("?" for _ in selected_types)
+            event_filter = (
+                "AND json_extract(payload_json, '$.event_type') "
+                f"IN ({placeholders}) "
+            )
+            params.extend(selected_types)
+        params.append(max(1, int(limit)))
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM logical_turns WHERE state IN ('queued', 'retry') "
-                "ORDER BY created_at LIMIT ?", (max(1, int(limit)),)
+                f"{event_filter}ORDER BY created_at LIMIT ?",
+                tuple(params),
             ).fetchall()
         return [self._logical_turn_row(row) for row in rows]
 
-    def list_active_logical_turns(self, *, limit: int = 100) -> list[Dict[str, Any]]:
-        """Return bounded claimed/executing rows for owner-liveness recovery."""
+    def list_active_logical_turns(
+        self,
+        *,
+        limit: int = 100,
+        event_types: Optional[Iterable[str]] = None,
+    ) -> list[Dict[str, Any]]:
+        """Return bounded claimed/executing rows for owner diagnostics."""
+        selected_types = tuple(dict.fromkeys(str(item) for item in (event_types or ())))
+        event_filter = ""
+        params: list[Any] = []
+        if selected_types:
+            placeholders = ", ".join("?" for _ in selected_types)
+            event_filter = (
+                "AND json_extract(payload_json, '$.event_type') "
+                f"IN ({placeholders}) "
+            )
+            params.extend(selected_types)
+        params.append(max(1, int(limit)))
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM logical_turns WHERE state IN ('claimed', 'executing') "
-                "ORDER BY updated_at LIMIT ?", (max(1, int(limit)),)
+                f"{event_filter}ORDER BY updated_at LIMIT ?",
+                tuple(params),
             ).fetchall()
         return [self._logical_turn_row(row) for row in rows]
 

@@ -132,7 +132,7 @@ def test_quiet_source_event_is_fresh_but_explicit_crash_recovery_reuses_it(state
 
 
 def test_quiet_process_replacement_recovers_without_source_override(state, monkeypatch):
-    """A new process finds the unfinished accepted event after transcript mutation."""
+    """A dead same-host PID waits for lease expiry before replacement."""
     monkeypatch.delenv("HERMES_CLI_SOURCE_ID", raising=False)
     context = multiprocessing.get_context("spawn")
     queue = context.Queue()
@@ -145,6 +145,30 @@ def test_quiet_process_replacement_recovers_without_source_override(state, monke
     assert first.exitcode == 0
     turn_id = queue.get(timeout=2)
 
+    # A local PID probe cannot prove ownership: preserve the attempt and its
+    # unexpired lease even though the process that created it has exited.
+    first_turn = state.get_logical_turn(turn_id)
+    first_lease = state.get_session_turn_lease("quiet-process")
+    source_identity = _resolve_cli_query_source_identity(
+        state, "quiet-process", "same quiet query"
+    )
+    busy = _cli(state, "quiet-process")._admit_cli_logical_turn(
+        "same quiet query",
+        event_type="cli-query",
+        source_identity=source_identity,
+        payload={"request_digest": _cli_request_digest("same quiet query")},
+    )
+    assert busy["outcome"] == "busy"
+    assert state.get_logical_turn(turn_id)["current_attempt_id"] == first_turn["current_attempt_id"]
+    assert state.get_session_turn_lease("quiet-process") == first_lease
+
+    # Canonical recovery begins only after the durable lease expires.
+    assert state.renew_session_turn_lease(
+        "quiet-process",
+        first_turn["lease_holder"],
+        first_turn["current_attempt_id"],
+        ttl_seconds=-1,
+    )
     replacement = context.Process(
         target=_replacement_reclaim,
         args=(str(state.db_path), queue),
@@ -285,6 +309,12 @@ def test_cli_startup_recovers_same_previously_admitted_child(state, monkeypatch)
         child["logical_turn_id"], owner="cli:2147483647", pid=2147483647
     )
     state.mark_logical_turn_started(child["logical_turn_id"], dead_claim["attempt_id"])
+    assert state.renew_session_turn_lease(
+        "startup-child-existing",
+        dead_claim["turn"]["lease_holder"],
+        dead_claim["attempt_id"],
+        ttl_seconds=-1,
+    )
     executed = []
     monkeypatch.setattr(
         HermesCLI, "_execute_recovered_background_turn",
@@ -297,6 +327,237 @@ def test_cli_startup_recovers_same_previously_admitted_child(state, monkeypatch)
     assert executed == [child["logical_turn_id"]]
     assert len(state.list_session_logical_turns("startup-child-existing")) == 1
     assert state.get_logical_turn(child["logical_turn_id"])["state"] == "completed"
+
+
+def test_cross_host_missing_pid_preserves_unexpired_lease_then_recovers_after_expiry(
+    state, monkeypatch
+):
+    """Host B cannot steal Host A's lease using Host B's local PID table."""
+    state.create_session("cross-host-child", "cli-background")
+    child = state.admit_session_event(
+        session_id="cross-host-child",
+        session_key="cli:cross-host-child",
+        source_identity="cross-host-child-event",
+        event_type="cli-background",
+        task_id="cross-host-task",
+        payload={
+            "text": "owned on host A",
+            "parent_session_id": "host-a-parent",
+            "child_session_id": "cross-host-child",
+            "background_task_id": "cross-host-task",
+        },
+    )
+    host_a = state.claim_logical_turn(
+        child["logical_turn_id"], owner="cli:424242", pid=424242
+    )
+    state.mark_logical_turn_started(child["logical_turn_id"], host_a["attempt_id"])
+    original_turn = state.get_logical_turn(child["logical_turn_id"])
+    original_lease = state.get_session_turn_lease("cross-host-child")
+    monkeypatch.setattr(cli_module, "_pid_is_alive", lambda _pid: False)
+
+    executed = []
+    assert recover_cli_background_children(
+        state,
+        lambda turn: executed.append(turn["logical_turn_id"]),
+        limit=8,
+    ) == []
+    preserved = state.get_logical_turn(child["logical_turn_id"])
+    assert executed == []
+    assert preserved["state"] == "executing"
+    assert preserved["current_attempt_id"] == original_turn["current_attempt_id"]
+    assert preserved["attempt_count"] == 1
+    assert state.get_session_turn_lease("cross-host-child") == original_lease
+
+    assert state.renew_session_turn_lease(
+        "cross-host-child",
+        original_turn["lease_holder"],
+        original_turn["current_attempt_id"],
+        ttl_seconds=-1,
+    )
+    recovered = recover_cli_background_children(
+        state,
+        lambda turn: executed.append(turn["logical_turn_id"])
+        or {"final_response": "safely recovered"},
+        limit=8,
+    )
+    final = state.get_logical_turn(child["logical_turn_id"])
+    assert recovered == [child["logical_turn_id"]]
+    assert executed == [child["logical_turn_id"]]
+    assert final["state"] == "completed"
+    assert final["attempt_count"] == 2
+    assert final["current_attempt_id"] != original_turn["current_attempt_id"]
+    assert state.get_session_turn_lease("cross-host-child") is None
+
+
+def test_background_recovery_terminal_turns_are_never_reopened(state, monkeypatch):
+    monkeypatch.setattr(cli_module, "_pid_is_alive", lambda _pid: False)
+    terminal_ids = []
+    for suffix, retryable in (("completed", None), ("unrecoverable", False)):
+        session_id = f"terminal-{suffix}"
+        state.create_session(session_id, "cli-background")
+        turn = state.admit_session_event(
+            session_id=session_id,
+            session_key=f"cli:{session_id}",
+            source_identity=f"terminal-{suffix}-event",
+            event_type="cli-background",
+            task_id=f"terminal-{suffix}-task",
+            payload={
+                "text": suffix,
+                "parent_session_id": "terminal-parent",
+                "child_session_id": session_id,
+                "background_task_id": f"terminal-{suffix}-task",
+            },
+        )
+        claim = state.claim_logical_turn(
+            turn["logical_turn_id"], owner="cli:999999", pid=999999
+        )
+        if retryable is None:
+            state.complete_logical_turn(
+                turn["logical_turn_id"], claim["attempt_id"], {"response": "done"}
+            )
+        else:
+            state.fail_logical_turn(
+                turn["logical_turn_id"], claim["attempt_id"], "terminal failure",
+                retryable=retryable,
+            )
+        terminal_ids.append(turn["logical_turn_id"])
+
+    executed = []
+    recover_cli_background_children(
+        state, lambda turn: executed.append(turn["logical_turn_id"]), limit=8
+    )
+    assert executed == []
+    assert [state.get_logical_turn(turn_id)["state"] for turn_id in terminal_ids] == [
+        "completed", "unrecoverable"
+    ]
+
+
+def test_unrelated_ready_rows_do_not_consume_background_recovery_budget(state):
+    for index in range(8):
+        session_id = f"unrelated-{index}"
+        state.create_session(session_id, "gateway")
+        state.admit_session_event(
+            session_id=session_id,
+            session_key=f"gateway:{session_id}",
+            source_identity=f"unrelated-event-{index}",
+            event_type="gateway-message",
+            payload={"text": "unrelated"},
+        )
+
+    background_ids = []
+    for index in range(3):
+        session_id = f"eligible-child-{index}"
+        state.create_session(session_id, "cli-background")
+        child = state.admit_session_event(
+            session_id=session_id,
+            session_key=f"cli:{session_id}",
+            source_identity=f"eligible-child-event-{index}",
+            event_type="cli-background",
+            task_id=f"eligible-task-{index}",
+            payload={
+                "text": f"background {index}",
+                "parent_session_id": "eligible-parent",
+                "child_session_id": session_id,
+                "background_task_id": f"eligible-task-{index}",
+            },
+        )
+        background_ids.append(child["logical_turn_id"])
+
+    executed = []
+    recover_cli_background_children(
+        state,
+        lambda turn: executed.append(turn["logical_turn_id"])
+        or {"final_response": "done"},
+        limit=8,
+    )
+    assert executed == background_ids
+    assert all(state.get_logical_turn(turn_id)["state"] == "completed" for turn_id in background_ids)
+    assert sum(
+        turn["state"] == "queued"
+        for index in range(8)
+        for turn in state.list_session_logical_turns(f"unrelated-{index}")
+    ) == 8
+
+
+def test_background_recovery_uses_one_exact_budget_across_parents_and_children(state):
+    parent_ids = []
+    for index in range(5):
+        session_id = f"budget-parent-{index}"
+        state.create_session(session_id, "cli")
+        parent = state.admit_session_event(
+            session_id=session_id,
+            session_key=f"cli:{session_id}",
+            source_identity=f"budget-parent-event-{index}",
+            event_type="cli-background-command",
+            payload={
+                "text": f"repair parent {index}",
+                "background_task_id": f"budget-created-child-{index}",
+                "child_session_id": f"budget-created-child-{index}",
+            },
+        )
+        parent_ids.append(parent["logical_turn_id"])
+
+    existing_child_ids = []
+    for index in range(5):
+        session_id = f"budget-existing-child-{index}"
+        state.create_session(session_id, "cli-background")
+        child = state.admit_session_event(
+            session_id=session_id,
+            session_key=f"cli:{session_id}",
+            source_identity=f"budget-existing-child-event-{index}",
+            event_type="cli-background",
+            task_id=f"budget-existing-task-{index}",
+            payload={
+                "text": f"execute child {index}",
+                "parent_session_id": "budget-old-parent",
+                "child_session_id": session_id,
+                "background_task_id": f"budget-existing-task-{index}",
+            },
+        )
+        existing_child_ids.append(child["logical_turn_id"])
+
+    executed = []
+    recover_cli_background_children(
+        state,
+        lambda turn: executed.append(turn["logical_turn_id"])
+        or {"final_response": "done"},
+        limit=8,
+    )
+
+    all_turns = [
+        turn
+        for session_id in (
+            [f"budget-parent-{index}" for index in range(5)]
+            + [f"budget-existing-child-{index}" for index in range(5)]
+            + [f"budget-created-child-{index}" for index in range(5)]
+        )
+        for turn in state.list_session_logical_turns(session_id)
+    ]
+    assert all(state.get_logical_turn(turn_id)["state"] == "completed" for turn_id in parent_ids)
+    assert len(executed) == 3
+    assert sum(turn["attempt_count"] for turn in all_turns) == 8
+    remaining = [turn for turn in all_turns if turn["state"] in {"queued", "retry"}]
+    assert len(remaining) == 7
+
+    first_pass_executed = set(executed)
+    recover_cli_background_children(
+        state,
+        lambda turn: executed.append(turn["logical_turn_id"])
+        or {"final_response": "done"},
+        limit=8,
+    )
+    assert len(executed) == 10
+    assert first_pass_executed <= set(executed)
+    final_turns = [
+        turn
+        for session_id in (
+            [f"budget-parent-{index}" for index in range(5)]
+            + [f"budget-existing-child-{index}" for index in range(5)]
+            + [f"budget-created-child-{index}" for index in range(5)]
+        )
+        for turn in state.list_session_logical_turns(session_id)
+    ]
+    assert all(turn["state"] == "completed" for turn in final_turns)
 
 
 def test_cli_startup_background_failure_does_not_block_next_child(state, monkeypatch):

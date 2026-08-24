@@ -82,6 +82,14 @@ class DurableRecoveryAmbiguous(RuntimeError):
     """More than one unfinished durable request matches a recovery attempt."""
 
 
+CLI_BACKGROUND_PARENT_EVENT = "cli-background-command"
+CLI_BACKGROUND_CHILD_EVENT = "cli-background"
+CLI_BACKGROUND_RECOVERY_EVENT_TYPES = (
+    CLI_BACKGROUND_PARENT_EVENT,
+    CLI_BACKGROUND_CHILD_EVENT,
+)
+
+
 def _pid_is_alive(pid: Any) -> bool:
     try:
         value = int(pid or 0)
@@ -100,23 +108,28 @@ def _pid_is_alive(pid: Any) -> bool:
         return False
 
 
-def _requeue_dead_cli_turn(state, turn: Dict[str, Any]) -> bool:
-    """Release one active CLI attempt whose recorded local owner no longer exists."""
+def _observe_cli_owner_liveness(turn: Dict[str, Any]) -> None:
+    """Log local owner liveness without changing durable ownership.
+
+    A PID is meaningful only on the host that reported it.  An active
+    SessionDB lease is therefore authoritative even when this process cannot
+    find that PID locally.  Crash recovery deliberately waits for lease
+    expiry and canonical reconciliation instead of risking cross-host double
+    execution.
+    """
     if turn.get("state") not in {"claimed", "executing"}:
-        return False
+        return
     owner = str(turn.get("owner") or "")
     if not owner.startswith(("cli:", "cli-recovery:", "cli-oneshot:")):
-        return False
+        return
     if _pid_is_alive(turn.get("owner_pid")):
-        return False
-    attempt_id = turn.get("current_attempt_id")
-    if not attempt_id:
-        return False
-    state.fail_logical_turn(
-        turn["logical_turn_id"], attempt_id,
-        "recovered after CLI owner process exited", retryable=True,
+        return
+    logger.info(
+        "CLI owner PID %s is not visible locally for logical turn %s; "
+        "preserving durable lease until expiry",
+        turn.get("owner_pid"),
+        turn.get("logical_turn_id"),
     )
-    return True
 
 
 def _resolve_cli_query_source_identity(state, session_id: str, message: Any) -> str:
@@ -134,7 +147,7 @@ def _resolve_cli_query_source_identity(state, session_id: str, message: Any) -> 
     for active in state.list_session_logical_turns(session_id):
         payload = active.get("payload") or {}
         if payload.get("event_type") == "cli-query":
-            _requeue_dead_cli_turn(state, active)
+            _observe_cli_owner_liveness(active)
     request_digest = _cli_request_digest(message)
     candidates = []
     for turn in state.list_session_logical_turns(session_id):
@@ -218,53 +231,89 @@ def recover_cli_background_children(state, execute, *, limit: int = 32) -> list[
     CLI startup supplies the execution callback and runs this once in a daemon
     thread.  It repairs a parent crash before child admission, then claims and
     executes queued/stale child turns using their persisted payload and
-    logical-turn identity.  It never creates a second queue or replays
-    completed rows.
+    logical-turn identity.  One pass claims at most ``limit`` parent and child
+    items total.  It never creates a second queue or replays completed rows.
     """
+    budget = max(0, int(limit))
+    if budget == 0:
+        return []
     state.reconcile_logical_turns()
-    for active in state.list_active_logical_turns(limit=max(1, int(limit))):
-        payload = active.get("payload") or {}
-        if payload.get("event_type") in {"cli-background-command", "cli-background"}:
-            _requeue_dead_cli_turn(state, active)
+    for active in state.list_active_logical_turns(
+        limit=budget,
+        event_types=CLI_BACKGROUND_RECOVERY_EVENT_TYPES,
+    ):
+        _observe_cli_owner_liveness(active)
     recovered: list[str] = []
-    ready = state.list_ready_logical_turns(limit=max(1, int(limit)))
-    for parent in ready:
+    processed = 0
+    parents = state.list_ready_logical_turns(
+        limit=budget,
+        event_types=(CLI_BACKGROUND_PARENT_EVENT,),
+    )
+    for parent in parents:
+        if processed >= budget:
+            break
         payload = parent.get("payload") or {}
-        if payload.get("event_type") != "cli-background-command":
+        parent_claim = state.claim_logical_turn(
+            parent["logical_turn_id"],
+            owner=f"cli-recovery:{os.getpid()}",
+            pid=os.getpid(),
+        )
+        if parent_claim.get("outcome") != "claimed":
             continue
+        processed += 1
         task_id = str(payload.get("background_task_id") or "")
         child_session_id = str(payload.get("child_session_id") or task_id)
         prompt = str(payload.get("text") or "")
         if not task_id or not child_session_id or not prompt:
+            state.fail_logical_turn(
+                parent["logical_turn_id"],
+                parent_claim["attempt_id"],
+                "invalid persisted background parent payload",
+                retryable=False,
+            )
             continue
-        parent_claim = state.claim_logical_turn(parent["logical_turn_id"], owner=f"cli-recovery:{os.getpid()}", pid=os.getpid())
-        if parent_claim.get("outcome") != "claimed":
+        try:
+            if not state.get_session(child_session_id):
+                state.create_session(child_session_id, CLI_BACKGROUND_CHILD_EVENT)
+            child = state.admit_session_event(
+                session_id=child_session_id,
+                session_key=f"cli:{child_session_id}",
+                source_identity=_cli_background_source_identity(
+                    parent["session_id"], child_session_id, task_id
+                ),
+                event_type=CLI_BACKGROUND_CHILD_EVENT,
+                payload={"text": prompt, "parent_session_id": parent["session_id"],
+                         "child_session_id": child_session_id, "background_task_id": task_id},
+                task_id=task_id,
+            )
+            state.complete_logical_turn(
+                parent["logical_turn_id"], parent_claim["attempt_id"],
+                {"response": "background started", "task_id": task_id},
+            )
+        except Exception as exc:
+            state.fail_logical_turn(
+                parent["logical_turn_id"],
+                parent_claim["attempt_id"],
+                str(exc),
+                retryable=True,
+            )
             continue
-        if not state.get_session(child_session_id):
-            state.create_session(child_session_id, "cli-background")
-        child = state.admit_session_event(
-            session_id=child_session_id,
-            session_key=f"cli:{child_session_id}",
-            source_identity=_cli_background_source_identity(parent["session_id"], child_session_id, task_id),
-            event_type="cli-background",
-            payload={"text": prompt, "parent_session_id": parent["session_id"],
-                     "child_session_id": child_session_id, "background_task_id": task_id},
-            task_id=task_id,
-        )
-        state.complete_logical_turn(
-            parent["logical_turn_id"], parent_claim["attempt_id"],
-            {"response": "background started", "task_id": task_id},
-        )
         if child["logical_turn_id"] not in recovered:
             recovered.append(child["logical_turn_id"])
 
-    for turn in state.list_ready_logical_turns(limit=max(1, int(limit))):
-        payload = turn.get("payload") or {}
-        if payload.get("event_type") != "cli-background":
-            continue
-        claim = state.claim_logical_turn(turn["logical_turn_id"], owner=f"cli-recovery:{os.getpid()}", pid=os.getpid())
+    children = state.list_ready_logical_turns(
+        limit=budget - processed,
+        event_types=(CLI_BACKGROUND_CHILD_EVENT,),
+    ) if processed < budget else []
+    for turn in children:
+        claim = state.claim_logical_turn(
+            turn["logical_turn_id"],
+            owner=f"cli-recovery:{os.getpid()}",
+            pid=os.getpid(),
+        )
         if claim.get("outcome") != "claimed":
             continue
+        processed += 1
         state.mark_logical_turn_started(turn["logical_turn_id"], claim["attempt_id"])
         try:
             result = execute(claim.get("turn") or turn)
@@ -9355,7 +9404,7 @@ class HermesCLI:
             )
             parent_claim = self._admit_cli_logical_turn(
                 prompt,
-                event_type="cli-background-command",
+                event_type=CLI_BACKGROUND_PARENT_EVENT,
                 source_identity=parent_identity,
                 payload={"background_task_id": task_id, "child_session_id": child_session_id},
             )
@@ -9385,13 +9434,13 @@ class HermesCLI:
         child_claim = None
         if self._session_db is not None:
             if not self._session_db.get_session(child_session_id):
-                self._session_db.create_session(child_session_id, "cli-background")
+                self._session_db.create_session(child_session_id, CLI_BACKGROUND_CHILD_EVENT)
             child_cli = HermesCLI.__new__(HermesCLI)
             child_cli._session_db = self._session_db
             child_cli.session_id = child_session_id
             child_claim = child_cli._admit_cli_logical_turn(
                 prompt,
-                event_type="cli-background",
+                event_type=CLI_BACKGROUND_CHILD_EVENT,
                 source_identity=background_source_identity,
                 task_id=task_id,
                 payload={
