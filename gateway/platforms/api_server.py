@@ -635,6 +635,19 @@ def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
     return sha256(repr(subset).encode("utf-8")).hexdigest()
 
 
+def _api_request_source_identity(request: Any, endpoint: str, session_id: str) -> str:
+    """Identify one accepted API occurrence without inventing a task id.
+
+    Idempotency-Key is the API's authoritative replay key.  Without it the
+    server records a fresh acceptance occurrence; a later transport retry
+    cannot be reconstructed as the same request by contract.
+    """
+    key = str(request.headers.get("Idempotency-Key") or "").strip()
+    if key:
+        return f"api:{endpoint}:{session_id}:idempotency:{key}"
+    return f"api:{endpoint}:{session_id}:occurrence:{uuid.uuid4().hex}"
+
+
 def _derive_chat_session_id(
     system_prompt: Optional[str],
     first_user_message: str,
@@ -1505,12 +1518,15 @@ class APIServerAdapter(BasePlatformAdapter):
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
         history = self._conversation_history_for_session(session_id)
+        source_identity = _api_request_source_identity(request, "session-chat", session_id)
         result, usage = await self._run_agent(
             user_message=user_message,
             conversation_history=history,
             ephemeral_system_prompt=system_prompt,
             session_id=session_id,
             gateway_session_key=gateway_session_key,
+            source_identity=source_identity,
+            source_event_type="api-session-chat",
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = result.get("final_response", "") if isinstance(result, dict) else ""
@@ -1553,6 +1569,7 @@ class APIServerAdapter(BasePlatformAdapter):
         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
         message_id = f"msg_{uuid.uuid4().hex}"
         run_id = f"run_{uuid.uuid4().hex}"
+        source_identity = _api_request_source_identity(request, "session-chat-stream", session_id)
         seq = 0
 
         def _event_payload(name: str, payload: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
@@ -1602,6 +1619,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress,
                     gateway_session_key=gateway_session_key,
+                    source_identity=source_identity,
+                    source_event_type="api-session-chat-stream",
                 )
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
@@ -1783,6 +1802,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # history already set from request body above
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+        source_identity = _api_request_source_identity(request, "chat-completions", session_id)
         model_name = body.get("model", self._model_name)
         created = int(time.time())
 
@@ -1868,6 +1888,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                source_identity=source_identity,
+                source_event_type="api-chat-completions",
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -1887,6 +1909,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                source_identity=source_identity,
+                source_event_type="api-chat-completions",
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -2846,6 +2870,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Reuse session from previous_response_id chain so the dashboard
         # groups the entire conversation under one session entry.
         session_id = stored_session_id or str(uuid.uuid4())
+        source_identity = _api_request_source_identity(request, "responses", session_id)
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
         if stream:
@@ -2900,6 +2925,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                source_identity=source_identity,
+                source_event_type="api-responses",
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -2933,6 +2960,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                source_identity=source_identity,
+                source_event_type="api-responses",
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -3435,6 +3464,11 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
+        source_identity: Optional[str] = None,
+        source_event_type: str = "api-request",
+        logical_turn_id: Optional[str] = None,
+        attempt_id: Optional[str] = None,
+        task_id: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -3448,6 +3482,54 @@ class APIServerAdapter(BasePlatformAdapter):
         another thread to stop in-progress LLM calls.
         """
         loop = asyncio.get_running_loop()
+        db = self._ensure_session_db()
+        if db is None or not session_id:
+            raise RuntimeError("persistent API execution requires SessionDB and session_id")
+
+        if logical_turn_id is None:
+            if not db.get_session(session_id):
+                db.create_session(session_id, "api_server")
+            source_identity = source_identity or f"api:occurrence:{uuid.uuid4().hex}"
+            turn = db.admit_session_event(
+                session_id=session_id,
+                session_key=f"api:{session_id}",
+                source_identity=source_identity,
+                event_type=source_event_type,
+                payload={
+                    "user_message": user_message,
+                    "conversation_history": conversation_history,
+                    "ephemeral_system_prompt": ephemeral_system_prompt,
+                    "gateway_session_key": gateway_session_key,
+                    "task_id": task_id,
+                },
+            )
+            logical_turn_id = turn["logical_turn_id"]
+            if turn.get("state") == "completed":
+                stored = turn.get("result") or {}
+                return stored.get("result") or {}, stored.get("usage") or {}
+            if turn.get("state") in {"failed", "unrecoverable"}:
+                raise RuntimeError(turn.get("error") or "API logical turn failed")
+
+        # A queued synchronous request waits for canonical ownership.  It does
+        # not race another HTTP worker, and if this process disappears the
+        # admitted row remains discoverable by startup reconciliation.
+        claim = None
+        while claim is None or claim.get("outcome") == "busy":
+            claim = db.claim_logical_turn(
+                logical_turn_id,
+                owner=f"api-server:{os.getpid()}",
+                pid=os.getpid(),
+            )
+            if claim.get("outcome") == "busy":
+                await asyncio.sleep(0.05)
+        if claim.get("outcome") == "terminal":
+            stored_turn = db.get_logical_turn(logical_turn_id) or {}
+            stored = stored_turn.get("result") or {}
+            return stored.get("result") or {}, stored.get("usage") or {}
+        if claim.get("outcome") != "claimed":
+            raise RuntimeError(f"API logical turn could not be claimed: {claim.get('outcome')}")
+        attempt_id = claim["attempt_id"]
+        db.mark_logical_turn_started(logical_turn_id, attempt_id)
 
         def _run():
             agent = self._create_agent(
@@ -3461,11 +3543,10 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
-            effective_task_id = session_id or str(uuid.uuid4())
             result = agent.run_conversation(
                 user_message=user_message,
                 conversation_history=conversation_history,
-                task_id=effective_task_id,
+                task_id=task_id,
             )
             usage = {
                 "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
@@ -3480,7 +3561,33 @@ class APIServerAdapter(BasePlatformAdapter):
                 result["session_id"] = _eff_sid
             return result, usage
 
-        return await loop.run_in_executor(None, _run)
+        try:
+            result, usage = await loop.run_in_executor(None, _run)
+            if isinstance(result, dict) and (result.get("failed") or result.get("error")):
+                db.fail_logical_turn(
+                    logical_turn_id,
+                    attempt_id,
+                    str(result.get("error") or "API agent execution failed"),
+                    retryable=bool(result.get("interrupted")),
+                )
+            else:
+                db.complete_logical_turn(
+                    logical_turn_id,
+                    attempt_id,
+                    {"result": result, "usage": usage},
+                    delivery_required=False,
+                )
+            return result, usage
+        except BaseException as exc:
+            current = db.get_logical_turn(logical_turn_id) or {}
+            if current.get("state") not in {"completed", "failed", "unrecoverable"}:
+                db.fail_logical_turn(
+                    logical_turn_id,
+                    attempt_id,
+                    str(exc),
+                    retryable=isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)),
+                )
+            raise
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
@@ -3629,8 +3736,51 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
-        run_id = f"run_{uuid.uuid4().hex}"
-        session_id = body.get("session_id") or stored_session_id or run_id
+        requested_session_id = body.get("session_id") or stored_session_id
+        occurrence_seed = _api_request_source_identity(
+            request, "runs", str(requested_session_id or "new")
+        )
+        if request.headers.get("Idempotency-Key"):
+            run_id = f"run_{uuid.uuid5(uuid.NAMESPACE_URL, occurrence_seed).hex}"
+        else:
+            run_id = f"run_{uuid.uuid4().hex}"
+        session_id = requested_session_id or run_id
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(_openai_error("SessionDB unavailable"), status=503)
+        if not db.get_session(session_id):
+            db.create_session(session_id, "api_server")
+        turn = db.admit_session_event(
+            session_id=session_id,
+            session_key=f"api:{session_id}",
+            source_identity=occurrence_seed,
+            event_type="api-run",
+            payload={
+                "user_message": user_message,
+                "conversation_history": conversation_history,
+                "ephemeral_system_prompt": instructions,
+                "gateway_session_key": gateway_session_key,
+                "run_id": run_id,
+            },
+            task_id=run_id,
+        )
+        if turn.get("state") in {"completed", "failed", "unrecoverable"}:
+            stored = turn.get("result") or {}
+            return web.json_response(
+                stored.get("status") or {"id": run_id, "status": turn.get("state")},
+                status=200,
+            )
+        claim = db.claim_logical_turn(
+            turn["logical_turn_id"], owner=f"api-run:{os.getpid()}", pid=os.getpid()
+        )
+        if claim.get("outcome") != "claimed":
+            return web.json_response(
+                {"id": run_id, "object": "hermes.run", "status": "queued", "session_id": session_id},
+                status=202,
+            )
+        db.mark_logical_turn_started(turn["logical_turn_id"], claim["attempt_id"])
+        logical_turn_id = turn["logical_turn_id"]
+        attempt_id = claim["attempt_id"]
         approval_session_key = gateway_session_key or session_id or run_id
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
@@ -3703,7 +3853,6 @@ class APIServerAdapter(BasePlatformAdapter):
                         unregister_gateway_notify,
                     )
 
-                    effective_task_id = session_id or run_id
                     approval_token = None
                     session_tokens = []
                     try:
@@ -3719,7 +3868,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         r = agent.run_conversation(
                             user_message=user_message,
                             conversation_history=conversation_history,
-                            task_id=effective_task_id,
+                            task_id=run_id,
                         )
                     finally:
                         try:
@@ -3760,6 +3909,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         error=error_msg,
                         last_event="run.failed",
                     )
+                    db.fail_logical_turn(
+                        logical_turn_id,
+                        attempt_id,
+                        error_msg,
+                        retryable=bool(result.get("interrupted")),
+                    )
                 else:
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                     q.put_nowait({
@@ -3776,6 +3931,16 @@ class APIServerAdapter(BasePlatformAdapter):
                         usage=usage,
                         last_event="run.completed",
                     )
+                    db.complete_logical_turn(
+                        logical_turn_id,
+                        attempt_id,
+                        {
+                            "result": result,
+                            "usage": usage,
+                            "status": dict(self._run_statuses.get(run_id) or {}),
+                        },
+                        delivery_required=False,
+                    )
             except asyncio.CancelledError:
                 self._set_run_status(
                     run_id,
@@ -3790,6 +3955,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     })
                 except Exception:
                     pass
+                current = db.get_logical_turn(logical_turn_id) or {}
+                if current.get("state") not in {"completed", "failed", "unrecoverable"}:
+                    db.fail_logical_turn(
+                        logical_turn_id, attempt_id, "API run cancelled", retryable=True
+                    )
                 raise
             except Exception as exc:
                 logger.exception("[api_server] run %s failed", run_id)
@@ -3808,6 +3978,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     })
                 except Exception:
                     pass
+                current = db.get_logical_turn(logical_turn_id) or {}
+                if current.get("state") not in {"completed", "failed", "unrecoverable"}:
+                    db.fail_logical_turn(
+                        logical_turn_id, attempt_id, str(exc), retryable=True
+                    )
             finally:
                 # If the asyncio wrapper is cancelled (for example via
                 # /stop), the executor thread can still be blocked waiting
@@ -4079,6 +4254,35 @@ class APIServerAdapter(BasePlatformAdapter):
     # BasePlatformAdapter interface
     # ------------------------------------------------------------------
 
+    async def _recover_api_logical_turns(self) -> int:
+        """Resume admitted API work after lease reconciliation on startup."""
+        db = self._ensure_session_db()
+        if db is None:
+            return 0
+        db.reconcile_logical_turns()
+        scheduled = 0
+        for turn in db.list_ready_logical_turns(limit=100):
+            payload = turn.get("payload") or {}
+            event_type = str(payload.get("event_type") or "")
+            if not event_type.startswith("api-"):
+                continue
+            task = asyncio.create_task(
+                self._run_agent(
+                    user_message=payload.get("user_message", ""),
+                    conversation_history=payload.get("conversation_history") or [],
+                    ephemeral_system_prompt=payload.get("ephemeral_system_prompt"),
+                    session_id=turn["session_id"],
+                    gateway_session_key=payload.get("gateway_session_key"),
+                    source_event_type=event_type,
+                    logical_turn_id=turn["logical_turn_id"],
+                    task_id=turn.get("task_id") or payload.get("task_id"),
+                )
+            )
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+            scheduled += 1
+        return scheduled
+
     async def connect(self) -> bool:
         """Start the aiohttp web server."""
         if not AIOHTTP_AVAILABLE:
@@ -4184,6 +4388,7 @@ class APIServerAdapter(BasePlatformAdapter):
             await self._site.start()
 
             self._mark_connected()
+            await self._recover_api_logical_turns()
             logger.info(
                 "[%s] API server listening on http://%s:%d (model: %s)",
                 self.name, self._host, self._port, self._model_name,

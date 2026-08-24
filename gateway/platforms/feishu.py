@@ -1675,6 +1675,11 @@ class FeishuAdapter(BasePlatformAdapter):
             self._loop = asyncio.get_running_loop()
             await self._connect_with_retry()
             self._mark_connected()
+            from gateway.platforms.feishu_comment import recover_pending_comment_turns
+
+            await recover_pending_comment_turns(
+                self._client, self_open_id=self._bot_open_id
+            )
             logger.info("[Feishu] Connected in %s mode (%s)", self._connection_mode, self._domain_name)
             return True
         except Exception as exc:

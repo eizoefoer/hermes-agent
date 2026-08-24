@@ -11,6 +11,7 @@ runs at a time if multiple processes overlap.
 import asyncio
 import concurrent.futures
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -147,7 +148,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.jobs import get_due_jobs, get_job, mark_job_run, save_job_output, advance_next_run
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -1208,6 +1209,35 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         return _run_job_impl(job)
 
 
+def _admit_cron_occurrence(job: dict) -> dict:
+    """Persist one scheduled reasoning occurrence before execution/advance."""
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    occurrence = str(
+        job.get("_cron_occurrence_id")
+        or job.get("next_run_at")
+        or _hermes_now().isoformat()
+    )
+    source_identity = f"cron:{job['id']}:occurrence:{occurrence}"
+    session_id = f"cron_{job['id']}_{hashlib.sha256(source_identity.encode()).hexdigest()[:20]}"
+    if not db.get_session(session_id):
+        db.create_session(session_id, "cron")
+    turn = db.admit_session_event(
+        session_id=session_id,
+        session_key=f"cron:{job['id']}:{occurrence}",
+        source_identity=source_identity,
+        event_type="cron-job",
+        payload={"job": {k: v for k, v in job.items() if not str(k).startswith("_cron_")}},
+        task_id=str(job["id"]),
+    )
+    job["_cron_occurrence_id"] = occurrence
+    job["_cron_session_id"] = session_id
+    job["_cron_logical_turn_id"] = turn["logical_turn_id"]
+    db.close()
+    return turn
+
+
 def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -1389,7 +1419,26 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
     origin = _resolve_origin(job)
-    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    if not job.get("_cron_logical_turn_id"):
+        _admit_cron_occurrence(job)
+    _cron_session_id = job["_cron_session_id"]
+    _cron_logical_turn_id = job["_cron_logical_turn_id"]
+    _cron_attempt_id = None
+    if _session_db is None:
+        return False, "", "", "SessionDB unavailable for persistent cron execution"
+    _claim = _session_db.claim_logical_turn(
+        _cron_logical_turn_id,
+        owner=f"cron:{os.getpid()}",
+        pid=os.getpid(),
+    )
+    if _claim.get("outcome") == "terminal":
+        _stored = (_session_db.get_logical_turn(_cron_logical_turn_id) or {}).get("result") or {}
+        return tuple(_stored.get("run_result") or (True, "", SILENT_MARKER, None))
+    if _claim.get("outcome") != "claimed":
+        logger.info("Cron occurrence %s remains owned/queued", _cron_logical_turn_id)
+        return True, "", SILENT_MARKER, None
+    _cron_attempt_id = _claim["attempt_id"]
+    _session_db.mark_logical_turn_started(_cron_logical_turn_id, _cron_attempt_id)
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
@@ -1788,7 +1837,14 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
 """
         
         logger.info("Job '%s' completed successfully", job_name)
-        return True, output, final_response, None
+        run_result = (True, output, final_response, None)
+        _session_db.complete_logical_turn(
+            _cron_logical_turn_id,
+            _cron_attempt_id,
+            {"run_result": run_result},
+            delivery_required=bool(final_response.strip() and SILENT_MARKER not in final_response.strip().upper()),
+        )
+        return run_result
         
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
@@ -1810,6 +1866,10 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
 {error_msg}
 ```
 """
+        if _session_db and _cron_attempt_id:
+            _session_db.fail_logical_turn(
+                _cron_logical_turn_id, _cron_attempt_id, error_msg, retryable=True
+            )
         return False, output, "", error_msg
 
     finally:
@@ -1827,7 +1887,9 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             _VAR_MAP[_var_name].set("")
         if _session_db:
             try:
-                _session_db.end_session(_cron_session_id, "cron_complete")
+                _turn_state = (_session_db.get_logical_turn(_cron_logical_turn_id) or {}).get("state")
+                if _turn_state == "completed":
+                    _session_db.end_session(_cron_session_id, "cron_complete")
             except (Exception, KeyboardInterrupt) as e:
                 logger.debug("Job '%s': failed to end session: %s", job_id, e)
             try:
@@ -1889,6 +1951,42 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
     try:
         due_jobs = get_due_jobs()
 
+        # Recover accepted scheduled reasoning work before considering new
+        # due occurrences.  Script-only jobs are E helpers and never enter
+        # this durable reasoning inventory.
+        try:
+            from hermes_state import SessionDB
+
+            recovery_db = SessionDB()
+            recovery_db.reconcile_logical_turns()
+            known_turns = set()
+            for turn in recovery_db.list_ready_logical_turns(
+                limit=100, event_types=("cron-job",)
+            ):
+                recovered_job = dict((turn.get("payload") or {}).get("job") or {})
+                if not recovered_job:
+                    continue
+                # Ignore orphaned rows whose scheduled job was removed.  This
+                # also prevents stale state from an older installation/test
+                # home from becoming a new production occurrence.
+                try:
+                    if get_job(recovered_job.get("id")) is None:
+                        continue
+                except Exception:
+                    continue
+                recovered_job["_cron_session_id"] = turn["session_id"]
+                recovered_job["_cron_logical_turn_id"] = turn["logical_turn_id"]
+                recovered_job["_cron_recovered"] = True
+                due_jobs.insert(0, recovered_job)
+                known_turns.add(turn["logical_turn_id"])
+            recovery_db.close()
+        except Exception:
+            logger.warning("Cron durable recovery scan failed", exc_info=True)
+
+        for job in due_jobs:
+            if not job.get("no_agent") and not job.get("_cron_logical_turn_id"):
+                _admit_cron_occurrence(job)
+
         if verbose and not due_jobs:
             logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
             return 0
@@ -1899,7 +1997,8 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
         # Advance next_run_at for all recurring jobs FIRST, under the file lock,
         # before any execution begins.  This preserves at-most-once semantics.
         for job in due_jobs:
-            advance_next_run(job["id"])
+            if not job.get("_cron_recovered"):
+                advance_next_run(job["id"])
 
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
@@ -1952,7 +2051,27 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 delivery_error = None
                 if should_deliver:
                     try:
+                        if job.get("_cron_logical_turn_id"):
+                            from hermes_state import SessionDB
+
+                            delivery_db = SessionDB()
+                            delivery_turn = delivery_db.get_logical_turn(job["_cron_logical_turn_id"]) or {}
+                            delivery_attempt = delivery_turn.get("current_attempt_id")
+                            if delivery_attempt and delivery_turn.get("state") == "completed":
+                                delivery_db.begin_logical_turn_delivery(
+                                    job["_cron_logical_turn_id"], delivery_attempt
+                                )
                         delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                        if job.get("_cron_logical_turn_id") and delivery_attempt:
+                            if delivery_error:
+                                delivery_db.fail_logical_turn_delivery(
+                                    job["_cron_logical_turn_id"], delivery_attempt, str(delivery_error), retryable=True
+                                )
+                            else:
+                                delivery_db.acknowledge_logical_turn_delivery(
+                                    job["_cron_logical_turn_id"], delivery_attempt
+                                )
+                            delivery_db.close()
                     except Exception as de:
                         delivery_error = str(de)
                         logger.error("Delivery failed for job %s: %s", job["id"], de)

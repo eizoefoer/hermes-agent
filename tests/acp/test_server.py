@@ -1118,8 +1118,8 @@ class TestPrompt:
 
         def mock_run(user_message, conversation_history=None, task_id=None, **kwargs):
             # Inside the agent loop the env var must reflect the active
-            # ACP session id. ``task_id`` is also the session id at this
-            # boundary; assert both for symmetry.
+            # ACP session id. Ordinary ACP chat has no real task resource,
+            # so task_id must remain absent.
             captured["env"] = os.environ.get("HERMES_SESSION_ID")
             captured["task_id"] = task_id
             return {"final_response": "ok", "messages": []}
@@ -1137,7 +1137,7 @@ class TestPrompt:
             "HERMES_SESSION_ID must be set to the originating ACP session id "
             "while the agent loop is running"
         )
-        assert captured["task_id"] == new_resp.session_id
+        assert captured["task_id"] is None
         # Post-condition: must be restored to the prior value (None here).
         assert os.environ.get("HERMES_SESSION_ID") is None, (
             "HERMES_SESSION_ID must be restored after the agent call so "
