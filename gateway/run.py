@@ -9246,6 +9246,16 @@ class GatewayRunner:
             return 0
         scheduled = 0
         for turn in self._session_db.list_ready_logical_turns(limit=limit):
+            if (turn.get("payload") or {}).get("event_type") == "gateway-background":
+                try:
+                    if await self._recover_gateway_background_turn(turn):
+                        scheduled += 1
+                except Exception:
+                    logger.warning(
+                        "gateway background startup recovery failed",
+                        exc_info=True,
+                    )
+                continue
             event = self._message_event_from_logical_turn(turn)
             if event is None:
                 logger.warning("Logical turn %s has no durable source; leaving queued", turn["logical_turn_id"])
@@ -13018,16 +13028,20 @@ class GatewayRunner:
     async def _handle_background_command(self, event: MessageEvent) -> str:
         """Handle /background <prompt> — run a prompt in a separate background session.
 
-        Spawns a new AIAgent in a background thread with its own session.
-        When it completes, sends the result back to the same chat without
-        modifying the active session's conversation history.
+        The command event deterministically identifies an independent durable
+        child session.  Admission and lease claim happen before the user sees
+        "started"; replaying the same platform event therefore reuses the same
+        child while separate message/update ids remain separate occurrences.
         """
         prompt = event.get_command_args().strip()
         if not prompt:
             return t("gateway.background.usage")
 
         source = event.source
-        task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
+        admission = self._admit_gateway_background_turn(event, prompt)
+        if admission is None:
+            return "❌ Background task could not start: SessionDB is unavailable."
+        task_id = admission["task_id"]
 
         event_message_id = self._reply_anchor_for_event(event)
 
@@ -13035,22 +13049,104 @@ class GatewayRunner:
         media_urls = list(event.media_urls) if event.media_urls else []
         media_types = list(event.media_types) if event.media_types else []
 
-        # Fire-and-forget the background task
-        _task = asyncio.create_task(
-            self._run_background_task(
-                prompt,
-                source,
-                task_id,
-                event_message_id=event_message_id,
-                media_urls=media_urls,
-                media_types=media_types,
+        claim = admission.get("claim") or {}
+        if claim.get("outcome") == "claimed":
+            # Fire-and-forget only after the independent persistent child owns
+            # its canonical SessionDB attempt/lease.
+            _task = asyncio.create_task(
+                self._run_background_task(
+                    prompt,
+                    source,
+                    task_id,
+                    event_message_id=event_message_id,
+                    media_urls=media_urls,
+                    media_types=media_types,
+                    logical_turn_id=admission["logical_turn_id"],
+                    attempt_id=claim["attempt_id"],
+                )
             )
-        )
-        self._background_tasks.add(_task)
-        _task.add_done_callback(self._background_tasks.discard)
+            self._background_tasks.add(_task)
+            _task.add_done_callback(self._background_tasks.discard)
 
         preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
         return t("gateway.background.started", preview=preview, task_id=task_id)
+
+    def _gateway_event_source_identity(self, event: MessageEvent) -> tuple[str, bool]:
+        """Return one gateway ingress identity and whether it is authoritative."""
+        source = event.source
+        platform = getattr(getattr(source, "platform", None), "value", "unknown")
+        event_type = str(getattr(event, "session_event_type", None) or "inbound")
+        event_id = getattr(event, "session_event_id", None)
+        update_id = getattr(event, "platform_update_id", None)
+        message_id = getattr(event, "message_id", None)
+        if event_id:
+            return f"{platform}:event:{event_type}:{event_id}", True
+        if update_id is not None:
+            return f"{platform}:update:{source.chat_id}:{update_id}", True
+        if message_id:
+            return f"{platform}:message:{source.chat_id}:{message_id}", True
+        # The gateway transport supplied no replay key. Mint an occurrence at
+        # acceptance so identical commands remain distinct; transport retries
+        # without an authoritative id cannot be reconstructed idempotently.
+        return f"{platform}:occurrence:{uuid.uuid4().hex}", False
+
+    def _admit_gateway_background_turn(
+        self, event: MessageEvent, prompt: str
+    ) -> Optional[Dict[str, Any]]:
+        """Admit/claim one independent persistent gateway background child."""
+        state = self._session_db
+        if state is None:
+            return None
+        source = event.source
+        parent_identity, authoritative = self._gateway_event_source_identity(event)
+        source_identity = f"gateway-background:{parent_identity}"
+        task_id = f"bg_{uuid.uuid5(uuid.NAMESPACE_URL, source_identity).hex[:24]}"
+        parent_entry = self.session_store.get_or_create_session(source)
+        if not state.get_session(task_id):
+            state.create_session(
+                task_id,
+                "gateway-background",
+                user_id=getattr(source, "user_id", None),
+                parent_session_id=parent_entry.session_id,
+            )
+        admitted = state.admit_session_event(
+            session_id=task_id,
+            session_key=f"gateway-background:{task_id}",
+            source_identity=source_identity,
+            event_type="gateway-background",
+            payload={
+                "text": prompt,
+                "source": source.to_dict() if hasattr(source, "to_dict") else {},
+                "message_id": getattr(event, "message_id", None),
+                "platform_update_id": getattr(event, "platform_update_id", None),
+                "session_event_id": getattr(event, "session_event_id", None),
+                "source_identity_authoritative": authoritative,
+                "event_message_id": self._reply_anchor_for_event(event),
+                "media_urls": list(event.media_urls or []),
+                "media_types": list(event.media_types or []),
+                "background_task_id": task_id,
+                "parent_session_id": parent_entry.session_id,
+            },
+            task_id=task_id,
+        )
+        if admitted.get("state") in {"completed", "failed", "unrecoverable"}:
+            claim = {"outcome": "terminal", "turn": admitted}
+        else:
+            claim = state.claim_logical_turn(
+                admitted["logical_turn_id"],
+                owner=f"gateway-background:{os.getpid()}",
+                pid=os.getpid(),
+            )
+            if claim.get("outcome") == "claimed":
+                state.mark_logical_turn_started(
+                    admitted["logical_turn_id"], claim["attempt_id"]
+                )
+        return {
+            "task_id": task_id,
+            "logical_turn_id": admitted["logical_turn_id"],
+            "claim": claim,
+            "duplicate": bool(admitted.get("duplicate")),
+        }
 
     async def _run_background_task(
         self,
@@ -13060,9 +13156,17 @@ class GatewayRunner:
         event_message_id: Optional[str] = None,
         media_urls: Optional[List[str]] = None,
         media_types: Optional[List[str]] = None,
+        logical_turn_id: Optional[str] = None,
+        attempt_id: Optional[str] = None,
     ) -> None:
-        """Execute a background agent task and deliver the result to the chat."""
+        """Execute one already-owned durable background child and deliver it."""
         from run_agent import AIAgent
+
+        if self._session_db is None or not logical_turn_id or not attempt_id:
+            logger.error(
+                "Refusing unmanaged gateway background execution task=%s", task_id
+            )
+            return
 
         media_urls = media_urls or []
         media_types = media_types or []
@@ -13070,6 +13174,12 @@ class GatewayRunner:
         adapter = self.adapters.get(source.platform)
         if not adapter:
             logger.warning("No adapter for platform %s in background task %s", source.platform, task_id)
+            self._session_db.fail_logical_turn(
+                logical_turn_id,
+                attempt_id,
+                f"no adapter for platform {source.platform}",
+                retryable=True,
+            )
             return
 
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
@@ -13081,6 +13191,12 @@ class GatewayRunner:
                 user_config=user_config,
             )
             if not runtime_kwargs.get("api_key"):
+                self._session_db.fail_logical_turn(
+                    logical_turn_id,
+                    attempt_id,
+                    "no provider credentials configured",
+                    retryable=True,
+                )
                 await adapter.send(
                     source.chat_id,
                     f"❌ Background task {task_id} failed: no provider credentials configured.",
@@ -13159,9 +13275,35 @@ class GatewayRunner:
 
             result = await self._run_in_executor_with_context(run_sync)
 
+            if isinstance(result, dict) and (
+                result.get("failed") or result.get("error") or result.get("interrupted")
+            ):
+                self._session_db.fail_logical_turn(
+                    logical_turn_id,
+                    attempt_id,
+                    str(result.get("error") or "background execution failed"),
+                    retryable=bool(result.get("interrupted")),
+                )
+                return
+
             response = result.get("final_response", "") if result else ""
             if not response and result and result.get("error"):
                 response = f"Error: {result['error']}"
+
+            preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+            delivery_text = (
+                f'✅ Background task complete\nPrompt: "{preview}"\n\n'
+                + (response or "(No response generated)")
+            )
+            self._session_db.complete_logical_turn(
+                logical_turn_id,
+                attempt_id,
+                {"response": delivery_text, "task_id": task_id},
+                delivery_required=True,
+            )
+            self._session_db.begin_logical_turn_delivery(logical_turn_id, attempt_id)
+            delivery_succeeded = True
+            delivery_error = None
 
             # Extract media files from the response
             if response:
@@ -13170,21 +13312,24 @@ class GatewayRunner:
                 media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
                 images, text_content = adapter.extract_images(response)
 
-                preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
                 header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
 
                 if text_content:
-                    await adapter.send(
+                    sent = await adapter.send(
                         chat_id=source.chat_id,
                         content=header + text_content,
                         metadata=_thread_metadata,
                     )
+                    delivery_succeeded = delivery_succeeded and bool(getattr(sent, "success", True))
+                    delivery_error = getattr(sent, "error", None) or delivery_error
                 elif not images and not media_files:
-                    await adapter.send(
+                    sent = await adapter.send(
                         chat_id=source.chat_id,
                         content=header + "(No response generated)",
                         metadata=_thread_metadata,
                     )
+                    delivery_succeeded = delivery_succeeded and bool(getattr(sent, "success", True))
+                    delivery_error = getattr(sent, "error", None) or delivery_error
 
                 # Send extracted images
                 for image_url, alt_text in (images or []):
@@ -13196,7 +13341,8 @@ class GatewayRunner:
                             metadata=_thread_metadata,
                         )
                     except Exception:
-                        pass
+                        delivery_succeeded = False
+                        delivery_error = "background image delivery failed"
 
                 # Send media files
                 for media_path, _is_voice in (media_files or []):
@@ -13207,17 +13353,35 @@ class GatewayRunner:
                             metadata=_thread_metadata,
                         )
                     except Exception:
-                        pass
+                        delivery_succeeded = False
+                        delivery_error = "background media delivery failed"
             else:
-                preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                await adapter.send(
+                sent = await adapter.send(
                     chat_id=source.chat_id,
-                    content=f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)',
+                    content=delivery_text,
                     metadata=_thread_metadata,
+                )
+                delivery_succeeded = bool(getattr(sent, "success", True))
+                delivery_error = getattr(sent, "error", None)
+
+            if delivery_succeeded:
+                self._session_db.acknowledge_logical_turn_delivery(
+                    logical_turn_id, attempt_id
+                )
+            else:
+                self._session_db.fail_logical_turn_delivery(
+                    logical_turn_id,
+                    attempt_id,
+                    delivery_error or "background delivery failed",
                 )
 
         except Exception as e:
             logger.exception("Background task %s failed", task_id)
+            turn = self._session_db.get_logical_turn(logical_turn_id)
+            if turn and turn.get("state") not in {"completed", "failed", "unrecoverable"}:
+                self._session_db.fail_logical_turn(
+                    logical_turn_id, attempt_id, str(e), retryable=True
+                )
             try:
                 await adapter.send(
                     chat_id=source.chat_id,
@@ -13226,6 +13390,41 @@ class GatewayRunner:
                 )
             except Exception:
                 pass
+
+    async def _recover_gateway_background_turn(self, turn: Dict[str, Any]) -> bool:
+        """Claim and schedule one durable background child after restart."""
+        if self._session_db is None:
+            return False
+        payload = turn.get("payload") or {}
+        source_data = payload.get("source") or {}
+        if not source_data:
+            return False
+        claim = self._session_db.claim_logical_turn(
+            turn["logical_turn_id"],
+            owner=f"gateway-background:{os.getpid()}",
+            pid=os.getpid(),
+        )
+        if claim.get("outcome") != "claimed":
+            return False
+        self._session_db.mark_logical_turn_started(
+            turn["logical_turn_id"], claim["attempt_id"]
+        )
+        source = SessionSource.from_dict(source_data)
+        task = asyncio.create_task(
+            self._run_background_task(
+                str(payload.get("text") or ""),
+                source,
+                str(payload.get("background_task_id") or turn.get("task_id") or ""),
+                event_message_id=payload.get("event_message_id"),
+                media_urls=list(payload.get("media_urls") or []),
+                media_types=list(payload.get("media_types") or []),
+                logical_turn_id=turn["logical_turn_id"],
+                attempt_id=claim["attempt_id"],
+            )
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return True
 
     async def _handle_reasoning_command(self, event: MessageEvent) -> str:
         """Handle /reasoning command — manage reasoning effort and display toggle.
