@@ -17,8 +17,8 @@ current `main` revision is therefore the selected forward-port base.
 
 | Phase 1 invariant | Current-line status | Evidence / gap |
 | --- | --- | --- |
-| Durable logical-turn admission | MISSING | `SessionDB` has no logical-turn/event/attempt ledger or `admit_session_event` API. |
-| Durable lease authority | PARTIAL | Cross-process session-turn leases exist, but upstream reclaimed an unexpired lease from PID liveness. The first forward-port slice removes that early reclaim. |
+| Durable logical-turn admission | PARTIAL (state primitive ported) | The forward-port branch now has a current-line `logical_turns` ledger, `admit_session_event`, attempt lifecycle, scoped ready queries and execution/delivery terminal state. Production producer wiring and startup dispatch remain. |
+| Durable lease authority | PRESENT in state layer | Cross-process session-turn leases exist and the forward-port removes upstream's dead-PID early reclaim. Claims use the current compression-lineage conversation lease and allocate a distinct attempt ID. Producer integration remains. |
 | Truthful task/goal identity | PARTIAL | Current model entry points accept task context, but there is no shared admitted-event record enforcing authoritative/null correlation across producers. |
 | Occurrence identity | MISSING | Current `MessageEvent` has transport message/update fields but no acceptance-time persisted occurrence identity shared by all persistent producers. |
 | Bounded recovery filtering | PARTIAL | Delivery and delegation stores have scoped recovery; no common logical-turn dispatcher exists for accepted model work. |
@@ -27,7 +27,7 @@ current `main` revision is therefore the selected forward-port base.
 | Signed Telegram approval compatibility | MISSING / overlay-only | The required `gateway.telegram_approval` compatibility API and signed `pa:` implementation exist in the preserved production overlay/old branch, not clean upstream. |
 | Startup recovery | PARTIAL | Delivery and async-delegation recovery exist; accepted ordinary/model turns have no durable startup dispatcher. |
 | Persistent background work | PARTIAL | Current gateway/API background agents use persisted sessions and leases, but parent acceptance and child execution lack a common durable logical-turn identity. |
-| Terminal immutability | MISSING for model work | Delivery rows have terminal handling, but model work has no durable terminal logical-turn state. |
+| Terminal immutability | PRESENT in state layer | Completed/unrecoverable/cancelled logical turns cannot be claimed or reopened by reconciliation; producer integration remains. |
 
 ## Current producer inventory (initial)
 
@@ -76,12 +76,29 @@ Read-only inspection of the preserved source snapshots confirms:
 
 * `state.db.raw` has the pre-existing malformed `messages_fts_trigram` index.
 * backup-only `state.db` passes SQLite integrity checking.
-* both contain 1,114 sessions, 29,725 messages and one session-turn lease.
+* both contain 1,114 sessions, 29,725 messages, 180 pre-existing Phase 1
+  logical turns and one session-turn lease.
 * approvals, Kanban and cron snapshots pass SQLite integrity checks and expose
   their expected tables.
+
+The production snapshots carry the old Phase 1 lease shape
+(`conversation_id`, `session_id`, and a required `turn_id`) while current
+upstream writers use only the compression-lineage `conversation_id`. The
+forward-port now performs an idempotent table-shape conversion on writable
+copies, retains the longest-lived authoritative lease for each lineage root,
+and backfills the current lease key on existing logical turns. Tests against
+copies of both snapshots preserved all primary counts and the executing turn's
+lease correlation.
 
 Current `SessionDB` contains a one-shot FTS-only rebuild/fail-open mechanism;
 the malformed index does not prevent opening the database or reading primary
 records. The FTS defect remains separate operational debt, not a Phase 1 schema
-migration. Final compatibility testing will use fresh writable copies and will
-compare primary counts before and after every schema slice.
+migration. FTS5 integrity output is tokenizer/runtime-version dependent for
+these two snapshots: SQLite 3.45.1 reports the raw copy malformed and the
+backup-repaired copy healthy, while the production runtime's SQLite 3.53.1
+reports the inverse. Both open successfully under the production runtime and
+preserve primary records. Deployment preparation must therefore validate FTS
+with the exact deployed SQLite build rather than treating either backup's FTS
+shadow tables as portable primary data. Final compatibility testing will keep
+using fresh writable copies and compare primary counts before and after every
+schema slice.
