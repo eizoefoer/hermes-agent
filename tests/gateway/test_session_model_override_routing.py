@@ -127,7 +127,7 @@ def test_run_agent_prefers_session_override_over_global_runtime(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_background_task_prefers_session_override_over_global_runtime(monkeypatch):
+async def test_background_task_prefers_session_override_over_global_runtime(monkeypatch, tmp_path):
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", _explode_runtime_resolution)
 
@@ -137,6 +137,24 @@ async def test_background_task_prefers_session_override_over_global_runtime(monk
 
     _CapturingAgent.last_init = None
     runner = _make_runner()
+    from hermes_state import SessionDB
+
+    runner._session_db = SessionDB(db_path=tmp_path / "state.db")
+    runner._session_db.create_session("bg_test", "gateway-background")
+    turn = runner._session_db.admit_session_event(
+        session_id="bg_test",
+        session_key="gateway-background:bg_test",
+        source_identity="gateway-background:test:model-override",
+        event_type="gateway-background",
+        payload={"text": "say hello"},
+        task_id="bg_test",
+    )
+    claim = runner._session_db.claim_logical_turn(
+        turn["logical_turn_id"], owner="test-background", pid=1
+    )
+    runner._session_db.mark_logical_turn_started(
+        turn["logical_turn_id"], claim["attempt_id"]
+    )
 
     adapter = AsyncMock()
     adapter.send = AsyncMock()
@@ -154,7 +172,13 @@ async def test_background_task_prefers_session_override_over_global_runtime(monk
     runner._session_model_overrides[session_key] = _codex_override()
     runner._session_reasoning_overrides[session_key] = {"enabled": True, "effort": "high"}
 
-    await runner._run_background_task("say hello", source, "bg_test")
+    await runner._run_background_task(
+        "say hello",
+        source,
+        "bg_test",
+        logical_turn_id=turn["logical_turn_id"],
+        attempt_id=claim["attempt_id"],
+    )
 
     assert _CapturingAgent.last_init is not None
     assert _CapturingAgent.last_init["model"] == "gpt-5.4"
@@ -260,4 +284,3 @@ fallback_providers:
     assert runtime_kwargs["api_key"] == "env-secret"
     assert runtime_kwargs["base_url"] == "https://fallback.example/v1"
     assert runtime_kwargs["model"] == "fallback-model"
-

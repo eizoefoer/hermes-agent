@@ -149,6 +149,28 @@ async def test_goal_verdict_continue_enqueues_continuation(hermes_home):
     assert "Continuing toward goal" in adapter.sends[0]["content"]
     # Continuation prompt enqueued for next turn
     assert adapter._pending_messages, "continuation prompt must be enqueued in pending_messages"
+    pending = next(iter(adapter._pending_messages.values()))
+    assert pending.task_id is None
+    assert pending.goal_id is None
+
+
+@pytest.mark.asyncio
+async def test_goal_continuation_preserves_only_explicit_authoritative_correlation(hermes_home):
+    runner, adapter, session_entry, src = _make_runner_with_adapter()
+    from hermes_cli.goals import GoalManager
+
+    GoalManager(session_entry.session_id).set("finish task-backed work")
+    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "more", False)):
+        await runner._post_turn_goal_continuation(
+            session_entry=session_entry,
+            source=src,
+            final_response="partial",
+            task_id="T1",
+            goal_id="G1",
+        )
+
+    pending = next(iter(adapter._pending_messages.values()))
+    assert (pending.task_id, pending.goal_id) == ("T1", "G1")
 
 
 @pytest.mark.asyncio

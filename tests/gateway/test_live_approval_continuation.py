@@ -43,7 +43,7 @@ class _PersistedSessionMap:
         return None
 
 
-def _seed(store, *, key="restart-key", session_id="session-live"):
+def _seed(store, *, key="restart-key", session_id="session-live", task_id=None, goal_id=None):
     store.create_request(
         request_id=f"approval-{key}",
         session_key="agent:main:telegram:dm:7",
@@ -54,6 +54,8 @@ def _seed(store, *, key="restart-key", session_id="session-live"):
             "description": "test command",
             "pattern_key": "test dangerous pattern",
             "pattern_keys": ["test dangerous pattern"],
+            "task_id": task_id,
+            "goal_id": goal_id,
         },
         idempotency_key=key,
     )
@@ -98,6 +100,7 @@ def _runner(tmp_path):
         runner._observed_approval = is_approved(
             entry.session_key, "test dangerous pattern"
         )
+        runner._observed_correlation = (event.task_id, event.goal_id)
         state.append_message("session-live", "user", event.text)
         state.append_message(
             "session-live", "assistant", "approved work completed"
@@ -185,6 +188,32 @@ async def test_duplicate_binding_returns_ack_without_second_gateway_turn(tmp_pat
 
     assert replay == first
     assert len(state.get_messages("session-live")) == before
+
+
+@pytest.mark.asyncio
+async def test_approval_continuation_does_not_invent_task_or_goal_correlation(tmp_path):
+    runner, _adapter, _state = _runner(tmp_path)
+    store = ApprovalStore(tmp_path / "approvals.db")
+    continuation = _seed(store, key="ordinary-approval")
+    runner._approval_continuation_store = store
+
+    await runner._consume_hermes_session_continuation_async(continuation)
+
+    assert runner._observed_correlation == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_approval_continuation_preserves_authoritative_task_metadata(tmp_path):
+    runner, _adapter, state = _runner(tmp_path)
+    store = ApprovalStore(tmp_path / "approvals.db")
+    continuation = _seed(store, key="task-approval", task_id="T1", goal_id="G1")
+    runner._approval_continuation_store = store
+
+    await runner._consume_hermes_session_continuation_async(continuation)
+
+    assert runner._observed_correlation == ("T1", "G1")
+    turn = state.list_session_logical_turns("session-live")[-1]
+    assert (turn["task_id"], turn["goal_id"]) == ("T1", "G1")
 
 
 @pytest.mark.asyncio

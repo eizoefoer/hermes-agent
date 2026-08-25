@@ -75,6 +75,59 @@ def test_duplicate_source_delivery_is_one_logical_turn_and_one_attempt(tmp_path)
     assert state.count_logical_turns("session-1") == 1
 
 
+def test_ordinary_gateway_sessions_never_fabricate_task_or_goal_ids(tmp_path):
+    from datetime import datetime
+    from gateway.session import SessionEntry
+
+    state = _db(tmp_path)
+    state.create_session("session-2", "telegram", user_id="user-2")
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._session_db = state
+    runner._running_agents = {}
+
+    for session_id, chat_id in (("session-1", "chat-1"), ("session-2", "chat-2")):
+        source = SessionSource(platform=Platform.TELEGRAM, user_id=chat_id, chat_id=chat_id)
+        entry = SessionEntry(
+            session_key=f"telegram:{chat_id}", session_id=session_id,
+            platform=Platform.TELEGRAM, chat_type="dm",
+            created_at=datetime.now(), updated_at=datetime.now(),
+        )
+        event = SimpleNamespace(
+            source=source, platform_update_id=None, message_id=f"msg-{chat_id}",
+            text="ordinary", internal=False, session_event_id=None,
+            session_event_type=None, task_id=None, goal_id=None,
+            branch=None, worktree=None,
+        )
+        claim = runner.admit_session_event(event, entry)
+        assert claim["outcome"] == "claimed"
+        turn = state.get_logical_turn(getattr(event, "_logical_turn_id"))
+        assert turn["session_id"] == session_id
+        assert turn["task_id"] is None
+        assert turn["goal_id"] is None
+
+
+def test_rehydrated_ordinary_gateway_turn_keeps_null_correlation(tmp_path):
+    state = _db(tmp_path)
+    source = SessionSource(platform=Platform.TELEGRAM, user_id="user-1", chat_id="chat-1")
+    turn = state.admit_session_event(
+        session_id="session-1", session_key="telegram:chat-1",
+        source_identity="telegram:message:chat-1:ordinary-restart",
+        event_type="inbound",
+        payload={
+            "text": "resume ordinary chat", "message_id": "ordinary-restart",
+            "source": source.to_dict(), "session_event_type": "inbound",
+        },
+    )
+
+    event = GatewayRunner._message_event_from_logical_turn(
+        state.get_logical_turn(turn["logical_turn_id"])
+    )
+
+    assert event is not None
+    assert event.task_id is None
+    assert event.goal_id is None
+
+
 def test_release_promotes_next_queued_turn_and_crashed_attempt_is_reclaimable(tmp_path):
     state = _db(tmp_path)
     first = state.admit_logical_turn(

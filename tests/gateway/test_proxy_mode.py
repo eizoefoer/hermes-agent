@@ -256,6 +256,7 @@ class TestRunAgentViaProxy:
                         ],
                         source=source,
                         session_id="session-abc",
+                        task_id="task-real-1",
                     )
 
         # Verify request URL
@@ -266,6 +267,7 @@ class TestRunAgentViaProxy:
 
         # Verify session ID header
         assert session.captured_headers["X-Hermes-Session-Id"] == "session-abc"
+        assert session.captured_json["hermes_task_id"] == "task-real-1"
 
         # Verify messages include system, history, and current message
         messages = session.captured_json["messages"]

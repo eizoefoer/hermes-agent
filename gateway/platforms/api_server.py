@@ -1706,6 +1706,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
+        task_id = body.get("hermes_task_id")
+        if task_id is not None:
+            if not isinstance(task_id, str) or not task_id.strip():
+                return web.json_response(
+                    _openai_error("hermes_task_id must be a non-empty string"),
+                    status=400,
+                )
+            task_id = task_id.strip()
+
         stream = _coerce_request_bool(body.get("stream"), default=False)
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
@@ -1890,6 +1899,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 source_identity=source_identity,
                 source_event_type="api-chat-completions",
+                task_id=task_id,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -1911,6 +1921,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 source_identity=source_identity,
                 source_event_type="api-chat-completions",
+                task_id=task_id,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -3495,6 +3506,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_key=f"api:{session_id}",
                 source_identity=source_identity,
                 event_type=source_event_type,
+                task_id=task_id,
                 payload={
                     "user_message": user_message,
                     "conversation_history": conversation_history,

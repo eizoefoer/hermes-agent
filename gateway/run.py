@@ -4393,7 +4393,7 @@ class GatewayRunner:
                 internal=True,
                 session_event_id=f"approval:{continuation.id}",
                 session_event_type="approval-continuation",
-                task_id=turn_id,
+                task_id=str(continuation.payload.get("task_id") or "") or None,
                 goal_id=str(continuation.payload.get("goal_id") or "") or None,
                 branch=str(continuation.payload.get("branch") or "") or None,
                 worktree=str(continuation.payload.get("worktree") or "") or None,
@@ -5238,7 +5238,6 @@ class GatewayRunner:
             internal=True,
             session_event_id=f"cli-handoff:{cli_session_id}:{session_key}",
             session_event_type="handoff",
-            task_id=cli_session_id,
         )
 
         logger.info(
@@ -8717,6 +8716,8 @@ class GatewayRunner:
                             session_entry=session_entry,
                             source=source,
                             final_response=_final_text,
+                            task_id=getattr(event, "task_id", None),
+                            goal_id=getattr(event, "goal_id", None),
                         )
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
@@ -9975,6 +9976,7 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
+                task_id=getattr(event, "task_id", None),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -12153,7 +12155,7 @@ class GatewayRunner:
                     session_event_id=f"goal-kickoff:{session_entry.session_id}:{uuid.uuid4().hex}",
                     session_event_type="goal-kickoff",
                     task_id=getattr(event, "task_id", None),
-                    goal_id=session_entry.session_id,
+                    goal_id=getattr(event, "goal_id", None),
                     branch=getattr(event, "branch", None),
                     worktree=getattr(event, "worktree", None),
                 )
@@ -12284,6 +12286,8 @@ class GatewayRunner:
         session_entry: Any,
         source: Any,
         final_response: str,
+        task_id: Optional[str] = None,
+        goal_id: Optional[str] = None,
     ) -> None:
         """Run the goal judge after a gateway turn and, if still active,
         enqueue a continuation prompt for the same session.
@@ -12344,8 +12348,8 @@ class GatewayRunner:
                     channel_prompt=None,
                     session_event_id=f"goal:{sid}:{uuid.uuid4().hex}",
                     session_event_type="goal-continuation",
-                    task_id=getattr(session_entry, "task_id", None),
-                    goal_id=sid,
+                    task_id=task_id,
+                    goal_id=goal_id,
                 )
                 self._admit_and_enqueue_session_event(
                     cont_event, session_entry=session_entry, adapter=adapter,
@@ -17310,6 +17314,7 @@ class GatewayRunner:
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        task_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -17385,6 +17390,8 @@ class GatewayRunner:
             "messages": api_messages,
             "stream": True,
         }
+        if task_id:
+            body["hermes_task_id"] = task_id
 
         # Set up platform streaming if available -------------------------
         _stream_consumer = None
@@ -17598,6 +17605,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        task_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -17622,6 +17630,7 @@ class GatewayRunner:
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                task_id=task_id,
             )
 
         from run_agent import AIAgent
@@ -18744,6 +18753,10 @@ class GatewayRunner:
                                 "permanent_pattern_keys": list(
                                     approval_data.get("permanent_pattern_keys") or []
                                 ),
+                                "task_id": getattr(event, "task_id", None),
+                                "goal_id": getattr(event, "goal_id", None),
+                                "branch": getattr(event, "branch", None),
+                                "worktree": getattr(event, "worktree", None),
                                 "process_local_fast_path": True,
                             },
                             "idempotency_key": (
@@ -18931,7 +18944,7 @@ class GatewayRunner:
                 )
                 _conversation_kwargs = {
                     "conversation_history": agent_history,
-                    "task_id": session_id,
+                    "task_id": task_id,
                 }
                 if observed_group_context:
                     _conversation_kwargs["persist_user_message"] = message
@@ -19743,6 +19756,11 @@ class GatewayRunner:
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    task_id=(
+                        getattr(pending_event, "task_id", None)
+                        if pending_event is not None
+                        else task_id
+                    ),
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
