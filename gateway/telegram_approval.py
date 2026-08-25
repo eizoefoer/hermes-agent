@@ -78,6 +78,9 @@ class TelegramApprovalService:
         request = self.store.get_request(request_id)
         if request is None:
             raise KeyError(request_id)
+        approval_user_id = str(request.payload.get("approval_user_id") or "")
+        if approval_user_id and approval_user_id != str(decided_by):
+            raise PermissionError("approval belongs to another Telegram user")
         local_owner = None
         if (
             request.continuation_kind == HERMES_SESSION

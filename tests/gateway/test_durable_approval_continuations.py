@@ -2,6 +2,8 @@
 
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
+
 from gateway.approval_store import ApprovalStore
 from gateway.approval_continuation import (
     AmbiguousExternalResult,
@@ -267,6 +269,26 @@ def test_telegram_hermes_session_decision_never_resolves_process_local_queue(tmp
     assert outcome.local_resolution_count == 0
     assert outcome.continuation.state == "pending"
     assert local_resolutions == []
+
+
+def test_telegram_approval_is_bound_to_initiating_user(tmp_path):
+    store = ApprovalStore(tmp_path / "approvals.db")
+    service = TelegramApprovalService(
+        store,
+        process_local_resolver=lambda *_args: 0,
+    )
+    service.create(
+        request_id="telegram-identity-bound",
+        session_key="telegram:chat:7",
+        continuation_kind="hermes_session",
+        payload={"session_id": "session-7", "approval_user_id": "user-1"},
+        idempotency_key="identity-turn-7",
+    )
+
+    with pytest.raises(PermissionError, match="another Telegram user"):
+        service.decide("telegram-identity-bound", "once", decided_by="user-2")
+
+    assert store.get_request("telegram-identity-bound").decision is None
 
 
 def test_telegram_compatibility_fast_path_is_logically_once(tmp_path):

@@ -336,6 +336,26 @@ class TestTelegramApprovalCallback:
         local_resolve.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_durable_callback_rejects_different_authorized_user(self):
+        adapter = _make_adapter()
+        adapter._telegram_approval_service = MagicMock()
+        adapter._telegram_approval_service.decide.side_effect = PermissionError
+
+        query = AsyncMock()
+        query.data = "ea:once:didentitybound"
+        query.message = MagicMock(chat_id=12345)
+        query.from_user = MagicMock(id="authorized-other", first_name="Other")
+        update = MagicMock(callback_query=query)
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            await adapter._handle_callback_query(update, MagicMock())
+
+        query.answer.assert_awaited_once_with(
+            text="⛔ This approval belongs to another Telegram user."
+        )
+        query.edit_message_text.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_resume_typing_after_inline_approval(self):
         """Clicking an inline approval button must un-pause the chat's typing.
 

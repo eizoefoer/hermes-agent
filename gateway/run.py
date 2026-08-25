@@ -18794,6 +18794,10 @@ class GatewayRunner:
                                 ),
                                 "task_id": getattr(event, "task_id", None),
                                 "goal_id": getattr(event, "goal_id", None),
+                                "approval_user_id": str(
+                                    getattr(event.source, "user_id", None)
+                                    or _status_chat_id
+                                ),
                                 "branch": getattr(event, "branch", None),
                                 "worktree": getattr(event, "worktree", None),
                                 "process_local_fast_path": True,

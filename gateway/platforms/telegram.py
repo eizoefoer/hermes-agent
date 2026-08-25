@@ -3322,6 +3322,11 @@ class TelegramAdapter(BasePlatformAdapter):
                     except KeyError:
                         await query.answer(text="This approval has expired.")
                         return
+                    except PermissionError:
+                        await query.answer(
+                            text="⛔ This approval belongs to another Telegram user."
+                        )
+                        return
                     except Exception as exc:
                         logger.error("Failed to persist durable Telegram approval: %s", exc)
                         await query.answer(text="Could not record approval; please retry.")
