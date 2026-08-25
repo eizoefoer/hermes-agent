@@ -11,7 +11,25 @@ import os
 import threading
 from typing import Any, Callable
 
-from gateway.approval_store import ApprovalRequest, ApprovalStore, Continuation
+from gateway.approval_store import (
+    ApprovalRequest,
+    ApprovalStore as ContinuationApprovalStore,
+    Continuation,
+)
+from gateway.signed_telegram_approval import (
+    ApprovalStore,
+    ResumeKind,
+    ResumeRegistration,
+    ResumeResult,
+    UnknownResumeKindError,
+    _RESUME_REGISTRY,
+    handle_callback,
+    primary_keyboard,
+    register_resume_handler,
+    resume_request,
+    scope_keyboard,
+    validate_resume_registry,
+)
 
 
 HERMES_SESSION = "hermes_session"
@@ -30,7 +48,7 @@ class TelegramApprovalService:
 
     def __init__(
         self,
-        store: ApprovalStore,
+        store: ContinuationApprovalStore,
         *,
         process_local_resolver: Callable[[str, str], int],
     ) -> None:
@@ -60,6 +78,9 @@ class TelegramApprovalService:
         request = self.store.get_request(request_id)
         if request is None:
             raise KeyError(request_id)
+        approval_user_id = str(request.payload.get("approval_user_id") or "")
+        if approval_user_id and approval_user_id != str(decided_by):
+            raise PermissionError("approval belongs to another Telegram user")
         local_owner = None
         if (
             request.continuation_kind == HERMES_SESSION
