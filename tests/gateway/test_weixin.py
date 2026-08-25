@@ -845,12 +845,10 @@ class TestIsStaleSessionRet:
         assert weixin._is_stale_session_ret(None, None, "unknown error") is False
 
 
-class TestWeixinContentDedup:
-    """Regression tests for Issue #16182 — upstream API sends duplicate content
-    with different message_ids, bypassing message_id deduplication.
-    """
+class TestWeixinOccurrenceDedup:
+    """Only authoritative transport identity may suppress an occurrence."""
 
-    def test_duplicate_content_with_different_message_ids_is_dropped(self):
+    def test_identical_content_with_different_message_ids_is_preserved(self):
         adapter = _make_adapter()
         adapter._poll_session = object()
         adapter.handle_message = AsyncMock()
@@ -873,11 +871,11 @@ class TestWeixinContentDedup:
 
         asyncio.run(_drive())
 
-        # Content-dedup drops the second (duplicate) message before it is even
-        # enqueued, so only one combined dispatch reaches handle_message.
+        # The debounce layer may combine rapid messages into one delivery, but
+        # both accepted transport occurrences remain in that delivery.
         assert adapter.handle_message.await_count == 1
         event = adapter.handle_message.await_args[0][0]
-        assert event.text == "hello world"
+        assert event.text == "hello world\nhello world"
 
     def test_content_dedup_not_called_for_messages_without_text(self):
         adapter = _make_adapter()
@@ -893,8 +891,7 @@ class TestWeixinContentDedup:
         asyncio.run(adapter._process_message(empty_msg))
 
         assert adapter.handle_message.await_count == 0
-        # is_duplicate should only be called for message_id, never for content
-        assert all("content:" not in str(call) for call in adapter._dedup.is_duplicate.call_args_list)
+        adapter._dedup.is_duplicate.assert_called_once_with("msg-1")
 
 
 class TestWeixinTextDebounce:
