@@ -4273,11 +4273,11 @@ class APIServerAdapter(BasePlatformAdapter):
             return 0
         db.reconcile_logical_turns()
         scheduled = 0
-        for turn in db.list_ready_logical_turns(limit=100):
+        for turn in db.list_ready_logical_turns(
+            limit=100, event_type_prefixes=("api-",)
+        ):
             payload = turn.get("payload") or {}
             event_type = str(payload.get("event_type") or "")
-            if not event_type.startswith("api-"):
-                continue
             task = asyncio.create_task(
                 self._run_agent(
                     user_message=payload.get("user_message", ""),

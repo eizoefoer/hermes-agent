@@ -3505,6 +3505,11 @@ class DiscordAdapter(BasePlatformAdapter):
             message_type=msg_type,
             source=source,
             raw_message=interaction,
+            session_event_id=(
+                f"interaction:{interaction.id}"
+                if getattr(interaction, "id", None) is not None
+                else None
+            ),
             channel_prompt=self._resolve_channel_prompt(channel_id, parent_id or None),
         )
 
@@ -3588,6 +3593,11 @@ class DiscordAdapter(BasePlatformAdapter):
             message_type=MessageType.TEXT,
             source=source,
             raw_message=interaction,
+            session_event_id=(
+                f"interaction:{interaction.id}:thread:{thread_id}:starter"
+                if getattr(interaction, "id", None) is not None
+                else None
+            ),
             auto_skill=_skills,
             channel_prompt=_channel_prompt,
         )

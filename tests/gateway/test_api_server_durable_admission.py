@@ -139,3 +139,36 @@ async def test_startup_does_not_steal_unexpired_lease(adapter):
         assert await adapter._recover_api_logical_turns() == 0
     create.assert_not_called()
     assert db.get_logical_turn(turn["logical_turn_id"])["current_attempt_id"] == claim["attempt_id"]
+
+
+@pytest.mark.asyncio
+async def test_api_recovery_bound_excludes_older_foreign_turns(adapter):
+    db = adapter._session_db
+    db.create_session("foreign-session", "cron")
+    for index in range(105):
+        db.admit_session_event(
+            session_id="foreign-session", session_key="cron:foreign",
+            source_identity=f"cron:foreign:{index}", event_type="cron-job",
+            payload={"job": {"id": f"foreign-{index}"}},
+        )
+    api_turns = []
+    for index in range(3):
+        session_id = f"api-recover-{index}"
+        db.create_session(session_id, "api_server")
+        api_turns.append(db.admit_session_event(
+            session_id=session_id, session_key=f"api:{session_id}",
+            source_identity=f"api:test:recover:{index}",
+            event_type="api-session-chat",
+            payload={"user_message": f"api {index}", "conversation_history": []},
+        ))
+
+    fake = _agent()
+    with patch.object(adapter, "_create_agent", return_value=fake):
+        assert await adapter._recover_api_logical_turns() == 3
+        await asyncio.gather(*list(adapter._background_tasks))
+
+    assert fake.run_conversation.call_count == 3
+    assert all(db.get_logical_turn(turn["logical_turn_id"])["state"] == "completed" for turn in api_turns)
+    assert len(db.list_ready_logical_turns(
+        limit=200, event_types=("cron-job",)
+    )) == 105

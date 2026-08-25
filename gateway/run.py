@@ -68,6 +68,25 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
+# Exact durable event classes owned by the gateway startup dispatcher. Other
+# producers (API, ACP, cron, Feishu, CLI/TUI) have their own scoped recovery
+# loops and must not consume this dispatcher's bounded query.
+GATEWAY_RECOVERY_EVENT_TYPES = (
+    "inbound",
+    "internal",
+    "recovered",
+    "approval-continuation",
+    "handoff",
+    "queued-command",
+    "steer-fallback",
+    "retry",
+    "goal-kickoff",
+    "goal-continuation",
+    "background-watch",
+    "background-complete",
+    "gateway-background",
+)
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not Telegram chat
     r"auxiliary\s+.+\s+failed"
@@ -9030,23 +9049,13 @@ class GatewayRunner:
             return {"outcome": "unmanaged"}
         source = event.source
         platform = getattr(getattr(source, "platform", None), "value", "unknown")
-        update_id = getattr(event, "platform_update_id", None)
-        message_id = getattr(event, "message_id", None)
         event_type = str(getattr(event, "session_event_type", None) or (
             "internal" if getattr(event, "internal", False) else "inbound"
         ))
+        source_identity, source_identity_authoritative = self._gateway_event_source_identity(event)
+        update_id = getattr(event, "platform_update_id", None)
+        message_id = getattr(event, "message_id", None)
         event_id = getattr(event, "session_event_id", None)
-        if event_id:
-            source_identity = f"{platform}:event:{event_type}:{event_id}"
-        elif update_id is not None:
-            source_identity = f"{platform}:update:{source.chat_id}:{update_id}"
-        elif message_id:
-            source_identity = f"{platform}:message:{source.chat_id}:{message_id}"
-        else:
-            # Internal emitters must supply a stable message_id.  The fallback
-            # keeps ordinary CLI-like adapters functional while making the
-            # weaker identity explicit in the durable audit trail.
-            source_identity = f"{platform}:synthetic:{session_entry.session_id}:{event.text}"
         if not state.get_session(session_entry.session_id):
             state.create_session(
                 session_entry.session_id,
@@ -9064,6 +9073,8 @@ class GatewayRunner:
                 "platform_update_id": update_id,
                 "internal": bool(getattr(event, "internal", False)),
                 "session_event_id": event_id,
+                "occurrence_id": getattr(event, "occurrence_id", None),
+                "source_identity_authoritative": source_identity_authoritative,
                 "session_event_type": event_type,
                 "source": source.to_dict() if hasattr(source, "to_dict") else {},
                 "delegation_id": getattr(event, "delegation_id", None),
@@ -9194,7 +9205,7 @@ class GatewayRunner:
         if not source_data:
             return None
         source = SessionSource.from_dict(source_data)
-        return MessageEvent(
+        event = MessageEvent(
             text=str(payload.get("text") or ""),
             message_type=MessageType.TEXT,
             source=source,
@@ -9202,6 +9213,10 @@ class GatewayRunner:
             platform_update_id=payload.get("platform_update_id"),
             internal=bool(payload.get("internal")),
             session_event_id=payload.get("session_event_id"),
+            occurrence_id=(
+                payload.get("occurrence_id")
+                or uuid.uuid4().hex
+            ),
             session_event_type=payload.get("session_event_type") or payload.get("event_type"),
             task_id=turn.get("task_id"),
             goal_id=turn.get("goal_id"),
@@ -9211,6 +9226,16 @@ class GatewayRunner:
             branch=turn.get("branch"),
             worktree=turn.get("worktree"),
         )
+        # Preserve the exact admitted identity, including legacy rows created
+        # before occurrence_id existed. Rehydration must never mint a second
+        # logical turn merely because the original transport lacked an ID.
+        setattr(event, "_durable_source_identity", turn.get("source_identity"))
+        setattr(
+            event,
+            "_source_identity_authoritative",
+            bool(payload.get("source_identity_authoritative", False)),
+        )
+        return event
 
     async def _drain_durable_logical_turn(self, completed_turn_id: str) -> None:
         """Publish the next persisted turn to the adapter without self-waiting."""
@@ -9246,7 +9271,9 @@ class GatewayRunner:
         if self._session_db is None:
             return 0
         scheduled = 0
-        for turn in self._session_db.list_ready_logical_turns(limit=limit):
+        for turn in self._session_db.list_ready_logical_turns(
+            limit=limit, event_types=GATEWAY_RECOVERY_EVENT_TYPES
+        ):
             if (turn.get("payload") or {}).get("event_type") == "gateway-background":
                 try:
                     if await self._recover_gateway_background_turn(turn):
@@ -13077,9 +13104,16 @@ class GatewayRunner:
 
     def _gateway_event_source_identity(self, event: MessageEvent) -> tuple[str, bool]:
         """Return one gateway ingress identity and whether it is authoritative."""
+        durable_identity = getattr(event, "_durable_source_identity", None)
+        if durable_identity:
+            return str(durable_identity), bool(
+                getattr(event, "_source_identity_authoritative", False)
+            )
         source = event.source
         platform = getattr(getattr(source, "platform", None), "value", "unknown")
-        event_type = str(getattr(event, "session_event_type", None) or "inbound")
+        event_type = str(getattr(event, "session_event_type", None) or (
+            "internal" if getattr(event, "internal", False) else "inbound"
+        ))
         event_id = getattr(event, "session_event_id", None)
         update_id = getattr(event, "platform_update_id", None)
         message_id = getattr(event, "message_id", None)
@@ -13089,10 +13123,11 @@ class GatewayRunner:
             return f"{platform}:update:{source.chat_id}:{update_id}", True
         if message_id:
             return f"{platform}:message:{source.chat_id}:{message_id}", True
-        # The gateway transport supplied no replay key. Mint an occurrence at
-        # acceptance so identical commands remain distinct; transport retries
-        # without an authoritative id cannot be reconstructed idempotently.
-        return f"{platform}:occurrence:{uuid.uuid4().hex}", False
+        # The transport supplied no replay key. MessageEvent assigns this once
+        # at acceptance; queueing and rehydration preserve the same value.
+        occurrence_id = str(getattr(event, "occurrence_id", None) or uuid.uuid4().hex)
+        event.occurrence_id = occurrence_id
+        return f"{platform}:occurrence:{occurrence_id}", False
 
     def _admit_gateway_background_turn(
         self, event: MessageEvent, prompt: str

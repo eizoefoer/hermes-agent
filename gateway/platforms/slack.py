@@ -3261,6 +3261,11 @@ class SlackAdapter(BasePlatformAdapter):
             ),
             source=source,
             raw_message=command,
+            session_event_id=(
+                f"slash:{command['trigger_id']}"
+                if command.get("trigger_id")
+                else None
+            ),
         )
 
         # Stash the Slack response_url so the first reply for this

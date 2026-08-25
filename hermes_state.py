@@ -1329,28 +1329,42 @@ class SessionDB:
         *,
         limit: int = 100,
         event_types: Optional[Iterable[str]] = None,
+        event_type_prefixes: Optional[Iterable[str]] = None,
+        session_id: Optional[str] = None,
     ) -> list[Dict[str, Any]]:
         """Return a bounded startup-drain snapshot of executable turns only.
 
-        When event types are supplied, filtering happens in SQLite before the
-        limit so unrelated producers cannot consume a caller's recovery
-        budget.
+        Producer and session filters are applied in SQLite before ordering and
+        limiting so unrelated durable work cannot consume a caller's bounded
+        recovery budget. Exact event types and prefixes are ORed when both are
+        supplied. Calls without filters retain the historical global view.
         """
         selected_types = tuple(dict.fromkeys(str(item) for item in (event_types or ())))
-        event_filter = ""
+        selected_prefixes = tuple(
+            dict.fromkeys(str(item) for item in (event_type_prefixes or ()))
+        )
+        filters: list[str] = []
         params: list[Any] = []
+        event_filters: list[str] = []
+        event_expr = "COALESCE(json_extract(payload_json, '$.event_type'), '')"
         if selected_types:
             placeholders = ", ".join("?" for _ in selected_types)
-            event_filter = (
-                "AND json_extract(payload_json, '$.event_type') "
-                f"IN ({placeholders}) "
-            )
+            event_filters.append(f"{event_expr} IN ({placeholders})")
             params.extend(selected_types)
+        for prefix in selected_prefixes:
+            event_filters.append(f"substr({event_expr}, 1, ?) = ?")
+            params.extend((len(prefix), prefix))
+        if event_filters:
+            filters.append("(" + " OR ".join(event_filters) + ")")
+        if session_id is not None:
+            filters.append("session_id = ?")
+            params.append(str(session_id))
+        filter_sql = "".join(f" AND {clause}" for clause in filters)
         params.append(max(1, int(limit)))
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM logical_turns WHERE state IN ('queued', 'retry') "
-                f"{event_filter}ORDER BY created_at LIMIT ?",
+                f"{filter_sql} ORDER BY created_at, logical_turn_id LIMIT ?",
                 tuple(params),
             ).fetchall()
         return [self._logical_turn_row(row) for row in rows]

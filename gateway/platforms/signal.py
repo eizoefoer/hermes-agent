@@ -604,7 +604,10 @@ class SignalAdapter(BasePlatformAdapter):
                 msg_type = MessageType.PHOTO
 
         # Parse timestamp from envelope data (milliseconds since epoch)
-        ts_ms = envelope_data.get("timestamp", 0)
+        # Signal identifies messages by author + sent timestamp (the same pair
+        # used by reactions). Prefer the data-message timestamp for Note to
+        # Self/sync envelopes, whose outer envelope timestamp may differ.
+        ts_ms = data_message.get("timestamp") or envelope_data.get("timestamp", 0)
         if ts_ms:
             try:
                 timestamp = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
@@ -624,6 +627,7 @@ class SignalAdapter(BasePlatformAdapter):
             media_types=media_types,
             timestamp=timestamp,
             raw_message={"sender": sender, "timestamp_ms": ts_ms},
+            message_id=(f"{sender}:{ts_ms}" if ts_ms else None),
             reply_to_message_id=reply_to_id,
             reply_to_text=reply_to_text,
         )

@@ -1343,6 +1343,10 @@ class MessageEvent:
     # Stable identity for future work. A reply/message id is only an outbound
     # anchor and cannot deduplicate an unrelated synthetic logical turn.
     session_event_id: Optional[str] = None
+    # Acceptance-time identity for transports that do not provide a stable
+    # replay key.  A new MessageEvent is a new occurrence; rehydration must
+    # restore this value from the durable payload instead of generating again.
+    occurrence_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     session_event_type: Optional[str] = None
     task_id: Optional[str] = None
     goal_id: Optional[str] = None

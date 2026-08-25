@@ -5,9 +5,9 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
-from gateway.platforms.base import Platform
+from gateway.platforms.base import MessageEvent, Platform
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource
+from gateway.session import SessionEntry, SessionSource
 from hermes_state import SessionDB
 
 
@@ -73,6 +73,90 @@ def test_duplicate_source_delivery_is_one_logical_turn_and_one_attempt(tmp_path)
     assert replay["logical_turn_id"] == first["logical_turn_id"]
     assert replay["duplicate"] is True
     assert state.count_logical_turns("session-1") == 1
+
+
+def test_no_id_occurrences_are_unique_but_accepted_replay_is_idempotent(tmp_path):
+    from datetime import datetime
+
+    state = _db(tmp_path)
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._session_db = state
+    source = SessionSource(platform=Platform.TELEGRAM, user_id="u1", chat_id="c1")
+    entry = SessionEntry(
+        session_key="telegram:c1", session_id="session-1",
+        platform=Platform.TELEGRAM, chat_type="dm",
+        created_at=datetime.now(), updated_at=datetime.now(),
+    )
+    first = MessageEvent(text="identical", source=source)
+    second = MessageEvent(text="identical", source=source)
+
+    admitted_one = runner.admit_session_event(first, entry, claim=False)["turn"]
+    admitted_two = runner.admit_session_event(second, entry, claim=False)["turn"]
+    replay = MessageEvent(
+        text="identical", source=source, occurrence_id=first.occurrence_id
+    )
+    admitted_replay = runner.admit_session_event(replay, entry, claim=False)["turn"]
+    rehydrated = runner._message_event_from_logical_turn(
+        state.get_logical_turn(admitted_one["logical_turn_id"])
+    )
+    admitted_after_restart = runner.admit_session_event(
+        rehydrated, entry, claim=False
+    )["turn"]
+
+    assert first.occurrence_id != second.occurrence_id
+    assert admitted_one["logical_turn_id"] != admitted_two["logical_turn_id"]
+    assert admitted_replay["logical_turn_id"] == admitted_one["logical_turn_id"]
+    assert admitted_after_restart["logical_turn_id"] == admitted_one["logical_turn_id"]
+    assert state.count_logical_turns("session-1") == 2
+    assert admitted_one["payload"]["source_identity_authoritative"] is False
+
+
+def test_authoritative_gateway_message_id_retains_replay_idempotency(tmp_path):
+    from datetime import datetime
+
+    state = _db(tmp_path)
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._session_db = state
+    source = SessionSource(platform=Platform.TELEGRAM, user_id="u1", chat_id="c1")
+    entry = SessionEntry(
+        session_key="telegram:c1", session_id="session-1",
+        platform=Platform.TELEGRAM, chat_type="dm",
+        created_at=datetime.now(), updated_at=datetime.now(),
+    )
+    first = MessageEvent(text="same", source=source, message_id="m-1")
+    replay = MessageEvent(text="same", source=source, message_id="m-1")
+
+    one = runner.admit_session_event(first, entry, claim=False)["turn"]
+    two = runner.admit_session_event(replay, entry, claim=False)["turn"]
+
+    assert two["logical_turn_id"] == one["logical_turn_id"]
+    assert one["payload"]["source_identity_authoritative"] is True
+
+
+def test_ready_turn_filters_apply_before_limit_and_order_deterministically(tmp_path):
+    state = _db(tmp_path)
+    for index in range(5):
+        state.admit_session_event(
+            session_id="session-1", session_key="foreign",
+            source_identity=f"foreign:{index}", event_type="cron-job", payload={},
+        )
+    expected = []
+    for index in range(4):
+        turn = state.admit_session_event(
+            session_id="session-1", session_key="api",
+            source_identity=f"api:{index}", event_type="api-session-chat", payload={},
+        )
+        expected.append(turn["logical_turn_id"])
+    state._execute_write(
+        lambda conn: conn.execute("UPDATE logical_turns SET created_at = 1.0")
+    )
+
+    ready = state.list_ready_logical_turns(
+        limit=3, event_type_prefixes=("api-",), session_id="session-1"
+    )
+
+    assert [turn["logical_turn_id"] for turn in ready] == sorted(expected)[:3]
+    assert len(state.list_ready_logical_turns(limit=2, event_types=("cron-job",))) == 2
 
 
 def test_ordinary_gateway_sessions_never_fabricate_task_or_goal_ids(tmp_path):
@@ -273,12 +357,14 @@ def test_startup_drain_snapshot_excludes_claimed_completed_and_terminal_turns(tm
 async def test_startup_drain_dispatches_persisted_queue_and_replays_delivery_only(tmp_path):
     state = _db(tmp_path)
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="7", user_id="user-1")
-    queued = state.admit_logical_turn(
+    queued = state.admit_session_event(
         session_id="session-1", session_key="telegram:7", source_identity="startup:queued",
+        event_type="inbound",
         payload={"source": source.to_dict(), "text": "durable queued", "message_id": "11"},
     )
-    completed = state.admit_logical_turn(
+    completed = state.admit_session_event(
         session_id="session-1", session_key="telegram:7", source_identity="startup:delivery",
+        event_type="inbound",
         payload={"source": source.to_dict(), "text": "already ran", "message_id": "12"},
     )
     claim = state.claim_logical_turn(completed["logical_turn_id"], owner="gateway:old", pid=1)
@@ -314,6 +400,46 @@ async def test_startup_drain_dispatches_persisted_queue_and_replays_delivery_onl
     assert state.get_logical_turn(completed["logical_turn_id"])["state"] == "completed"
     assert state.get_logical_turn(completed["logical_turn_id"])["delivery_state"] == "delivered"
     assert state.get_logical_turn(queued["logical_turn_id"])["state"] == "queued"
+
+
+@pytest.mark.asyncio
+async def test_gateway_startup_bound_excludes_older_foreign_producers(tmp_path):
+    state = _db(tmp_path)
+    for index in range(105):
+        state.admit_session_event(
+            session_id="session-1", session_key="api:foreign",
+            source_identity=f"api:foreign:{index}",
+            event_type="api-session-chat",
+            payload={"user_message": "foreign"},
+        )
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="7", user_id="user-1")
+    gateway_turn = state.admit_session_event(
+        session_id="session-1", session_key="telegram:7",
+        source_identity="telegram:message:7:later",
+        event_type="inbound",
+        payload={"source": source.to_dict(), "text": "gateway later", "message_id": "later"},
+    )
+
+    class Adapter:
+        def __init__(self):
+            self.handled = []
+
+        async def handle_message(self, event):
+            self.handled.append(event)
+
+    adapter = Adapter()
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._session_db = state
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._background_tasks = set()
+
+    assert await runner._drain_startup_logical_turns(limit=100) == 1
+    await asyncio.sleep(0)
+    assert [event.text for event in adapter.handled] == ["gateway later"]
+    assert state.get_logical_turn(gateway_turn["logical_turn_id"])["state"] == "queued"
+    assert len(state.list_ready_logical_turns(
+        limit=200, event_type_prefixes=("api-",)
+    )) == 105
 
 
 def test_terminal_unrecoverable_turn_never_replays(tmp_path):

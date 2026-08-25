@@ -1246,19 +1246,12 @@ class HermesACPAgent(acp.Agent):
         db = self.session_manager._get_db()
         db.reconcile_logical_turns()
         executed = 0
-        while True:
-            ready = next(
-                (
-                    turn
-                    for turn in db.list_ready_logical_turns(
-                        limit=100, event_types=("acp-prompt",)
-                    )
-                    if turn.get("session_id") == session_id
-                ),
-                None,
-            )
-            if ready is None:
-                break
+        ready_rows = db.list_ready_logical_turns(
+            limit=100,
+            event_types=("acp-prompt",),
+            session_id=session_id,
+        )
+        for ready in ready_rows:
             payload = ready.get("payload") or {}
             user_text = str(payload.get("user_text") or "[Recovered attachment]")
             if self._conn:
