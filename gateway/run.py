@@ -9070,6 +9070,7 @@ class GatewayRunner:
             payload={
                 "text": event.text,
                 "message_id": message_id,
+                "reply_to_message_id": getattr(event, "reply_to_message_id", None),
                 "platform_update_id": update_id,
                 "internal": bool(getattr(event, "internal", False)),
                 "session_event_id": event_id,
@@ -9210,6 +9211,7 @@ class GatewayRunner:
             message_type=MessageType.TEXT,
             source=source,
             message_id=payload.get("message_id"),
+            reply_to_message_id=payload.get("reply_to_message_id"),
             platform_update_id=payload.get("platform_update_id"),
             internal=bool(payload.get("internal")),
             session_event_id=payload.get("session_event_id"),
@@ -16575,8 +16577,10 @@ class GatewayRunner:
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
-                message_id=str(evt.get("message_id") or "").strip() or None,
-                session_event_id=str(evt.get("event_id") or f"process:{evt.get('session_id')}:watch:{synth_text}"),
+                # watcher message_id is the original user-message reply anchor,
+                # not the identity of this newly accepted watch occurrence.
+                reply_to_message_id=str(evt.get("message_id") or "").strip() or None,
+                session_event_id=str(evt.get("event_id") or "").strip() or None,
                 session_event_type="background-watch",
                 task_id=evt.get("task_id"),
             )

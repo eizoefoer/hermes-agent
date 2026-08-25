@@ -284,6 +284,107 @@ async def test_inject_watch_notification_routes_from_session_store_origin(monkey
 
 
 @pytest.mark.asyncio
+async def test_distinct_identical_watch_matches_admit_distinct_durable_occurrences(
+    monkeypatch, tmp_path
+):
+    """The watch ingress path must never use rendered text or reply anchors as identity."""
+    from gateway.session import SessionSource
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    session_key = "agent:main:telegram:dm:123:24296"
+    entry = SimpleNamespace(
+        session_key=session_key,
+        session_id="gateway-watch-session",
+        platform=Platform.TELEGRAM,
+        origin=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="123",
+            chat_type="dm",
+            thread_id="24296",
+            user_id="user-1",
+        ),
+    )
+    runner.session_store._entries[session_key] = entry
+    events = []
+    turns = []
+
+    async def _admit(event):
+        events.append(event)
+        turns.append(runner.admit_session_event(event, entry, claim=False)["turn"])
+
+    adapter.handle_message = AsyncMock(side_effect=_admit)
+    watch = {
+        "session_id": "proc-watch-1",
+        "session_key": session_key,
+        "message_id": "original-user-message",
+    }
+    rendered = "[SYSTEM: identical watch match]"
+
+    await runner._inject_watch_notification(rendered, dict(watch))
+    await runner._inject_watch_notification(rendered, dict(watch))
+
+    assert events[0].session_event_id is None
+    assert events[0].message_id is None
+    assert events[0].reply_to_message_id == "original-user-message"
+    assert events[0].occurrence_id != events[1].occurrence_id
+    assert turns[0]["logical_turn_id"] != turns[1]["logical_turn_id"]
+    assert turns[0]["task_id"] is None
+    assert turns[0]["goal_id"] is None
+
+    # Replaying the already accepted Hermes occurrence is idempotent.
+    await adapter.handle_message(events[0])
+    assert turns[2]["logical_turn_id"] == turns[0]["logical_turn_id"]
+
+    # Rehydration restores both occurrence identity and the non-identity reply anchor.
+    rehydrated = runner._message_event_from_logical_turn(
+        runner._session_db.get_logical_turn(turns[0]["logical_turn_id"])
+    )
+    assert rehydrated.occurrence_id == events[0].occurrence_id
+    assert rehydrated.reply_to_message_id == "original-user-message"
+    await adapter.handle_message(rehydrated)
+    assert turns[3]["logical_turn_id"] == turns[0]["logical_turn_id"]
+
+
+@pytest.mark.asyncio
+async def test_authoritative_watch_event_id_controls_replay_only_for_that_match(
+    monkeypatch, tmp_path
+):
+    from gateway.session import SessionSource
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    session_key = "agent:main:telegram:group:-100:42"
+    entry = SimpleNamespace(
+        session_key=session_key,
+        session_id="gateway-watch-authoritative",
+        platform=Platform.TELEGRAM,
+        origin=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-100",
+            chat_type="group",
+            thread_id="42",
+            user_id="user-1",
+        ),
+    )
+    runner.session_store._entries[session_key] = entry
+    turns = []
+
+    async def _admit(event):
+        turns.append(runner.admit_session_event(event, entry, claim=False)["turn"])
+
+    adapter.handle_message = AsyncMock(side_effect=_admit)
+    base = {"session_id": "proc-watch-1", "session_key": session_key}
+
+    await runner._inject_watch_notification("same text", {**base, "event_id": "match-1"})
+    await runner._inject_watch_notification("same text", {**base, "event_id": "match-1"})
+    await runner._inject_watch_notification("same text", {**base, "event_id": "match-2"})
+
+    assert turns[1]["logical_turn_id"] == turns[0]["logical_turn_id"]
+    assert turns[2]["logical_turn_id"] != turns[0]["logical_turn_id"]
+
+
+@pytest.mark.asyncio
 async def test_agent_notification_carries_message_id_reply_anchor(monkeypatch, tmp_path):
     """notify_on_complete injection carries the triggering message_id so the
     synthetic event can be reply-anchored back into a Telegram DM topic.
@@ -358,7 +459,7 @@ async def test_agent_notification_no_message_id_is_tolerated(monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_inject_watch_notification_carries_message_id_reply_anchor(monkeypatch, tmp_path):
+async def test_inject_watch_notification_separates_reply_anchor_from_occurrence(monkeypatch, tmp_path):
     from gateway.session import SessionSource
 
     runner = _build_runner(monkeypatch, tmp_path, "all")
@@ -384,7 +485,9 @@ async def test_inject_watch_notification_carries_message_id_reply_anchor(monkeyp
 
     adapter.handle_message.assert_awaited_once()
     synth_event = adapter.handle_message.await_args.args[0]
-    assert synth_event.message_id == "777"
+    assert synth_event.message_id is None
+    assert synth_event.reply_to_message_id == "777"
+    assert synth_event.session_event_id is None
     assert synth_event.source.thread_id == "24296"
 
 

@@ -309,6 +309,11 @@ class TestMSGraphNotifications:
         await asyncio.sleep(0.05)
 
         assert len(scheduled) == 2
+        first_event = scheduled[0][1]
+        second_event = scheduled[1][1]
+        assert first_event.message_id is None
+        assert second_event.message_id is None
+        assert first_event.occurrence_id != second_event.occurrence_id
 
     @pytest.mark.anyio
     async def test_resource_patterns_accept_leading_slash(self):
