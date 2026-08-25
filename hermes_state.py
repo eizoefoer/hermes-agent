@@ -7636,10 +7636,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()
             if row is not None:
                 current_holder = row["holder"]
-                if (
-                    float(row["expires_at"]) <= now
-                    or _compression_lock_holder_process_is_dead(current_holder)
-                ):
+                # A turn lease is durable execution ownership.  Process
+                # liveness is diagnostic only: a missing local PID does not
+                # prove the work stopped (the holder may be remote, PID reuse
+                # is possible, and recovery must be ordered by the durable
+                # TTL).  Only normal expiry makes this row reclaimable.
+                if float(row["expires_at"]) <= now:
                     conn.execute(
                         "DELETE FROM session_turn_leases "
                         "WHERE conversation_id = ? AND holder = ?",
@@ -10422,13 +10424,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     )
             elif lease is not None:
                 current_holder = lease["holder"]
-                if (
-                    float(lease["expires_at"]) <= now
-                    or _compression_lock_holder_process_is_dead(current_holder)
-                ):
-                    # Match acquisition semantics: an expired or provably dead
-                    # owner is reclaimable. Deleting it inside this BEGIN IMMEDIATE
-                    # transaction also fences a stale late flush after the mutation.
+                if float(lease["expires_at"]) <= now:
+                    # Match acquisition semantics: only expiry makes a turn
+                    # owner reclaimable.  Deleting it inside this BEGIN
+                    # IMMEDIATE transaction also fences a stale late flush
+                    # after the mutation.
                     conn.execute(
                         "DELETE FROM session_turn_leases "
                         "WHERE conversation_id = ? AND holder = ?",
