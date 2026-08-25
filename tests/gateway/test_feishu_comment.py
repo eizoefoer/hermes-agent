@@ -5,6 +5,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
+
 from gateway.platforms.feishu_comment import (
     parse_drive_comment_event,
     _ALLOWED_NOTICE_TYPES,
@@ -150,6 +152,73 @@ class TestAccessControlIntegration(unittest.TestCase):
         evt = _make_event()
         self._run(handle_drive_comment_event(Mock(), evt, self_open_id="ou_bot"))
         mock_allowed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_comment_event_identity_is_durable_and_idempotent(tmp_path, monkeypatch):
+    from gateway.platforms.feishu_comment import handle_drive_comment_event
+    from gateway.platforms.feishu_comment_rules import ResolvedCommentRule
+    from hermes_state import SessionDB
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("hermes_state.DEFAULT_DB_PATH", tmp_path / "state.db")
+    rule = ResolvedCommentRule(True, "allowlist", frozenset(), "exact")
+    execution = {"response": "reply", "result": {"final_response": "reply", "messages": []}}
+
+    with patch("gateway.platforms.feishu_comment_rules.load_config", return_value={}), \
+         patch("gateway.platforms.feishu_comment_rules.resolve_rule", return_value=rule), \
+         patch("gateway.platforms.feishu_comment_rules.is_user_allowed", return_value=True), \
+         patch("gateway.platforms.feishu_comment_rules.has_wiki_keys", return_value=False), \
+         patch("gateway.platforms.feishu_comment.query_document_meta", new=AsyncMock(return_value={"title": "Doc", "url": "u"})), \
+         patch("gateway.platforms.feishu_comment.batch_query_comment", new=AsyncMock(return_value={"is_whole": False, "quote": ""})), \
+         patch("gateway.platforms.feishu_comment.list_comment_replies", new=AsyncMock(return_value=[])), \
+         patch("gateway.platforms.feishu_comment.add_comment_reaction", new=AsyncMock()), \
+         patch("gateway.platforms.feishu_comment.delete_comment_reaction", new=AsyncMock()), \
+         patch("gateway.platforms.feishu_comment.deliver_comment_reply", new=AsyncMock(return_value=True)) as deliver, \
+         patch("gateway.platforms.feishu_comment._run_comment_agent", return_value=execution) as run_agent:
+        event = _make_event()
+        await handle_drive_comment_event(Mock(), event, self_open_id="ou_bot")
+        await handle_drive_comment_event(Mock(), event, self_open_id="ou_bot")
+
+    run_agent.assert_called_once()
+    deliver.assert_awaited_once()
+    db = SessionDB(db_path=tmp_path / "state.db")
+    assert db.count_logical_turns() == 1
+    turn = db.list_ready_logical_turns(event_types=("feishu-comment",))
+    assert turn == []
+
+
+@pytest.mark.asyncio
+async def test_separate_comment_events_with_same_content_remain_distinct(tmp_path, monkeypatch):
+    from gateway.platforms.feishu_comment import handle_drive_comment_event
+    from gateway.platforms.feishu_comment_rules import ResolvedCommentRule
+    from hermes_state import SessionDB
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("hermes_state.DEFAULT_DB_PATH", tmp_path / "state.db")
+    rule = ResolvedCommentRule(True, "allowlist", frozenset(), "exact")
+    execution = {"response": "reply", "result": {"final_response": "reply", "messages": []}}
+    first = _make_event()
+    second = _make_event()
+    second.event["event_id"] = "evt_2"
+
+    with patch("gateway.platforms.feishu_comment_rules.load_config", return_value={}), \
+         patch("gateway.platforms.feishu_comment_rules.resolve_rule", return_value=rule), \
+         patch("gateway.platforms.feishu_comment_rules.is_user_allowed", return_value=True), \
+         patch("gateway.platforms.feishu_comment_rules.has_wiki_keys", return_value=False), \
+         patch("gateway.platforms.feishu_comment.query_document_meta", new=AsyncMock(return_value={"title": "Doc", "url": "u"})), \
+         patch("gateway.platforms.feishu_comment.batch_query_comment", new=AsyncMock(return_value={"is_whole": False, "quote": ""})), \
+         patch("gateway.platforms.feishu_comment.list_comment_replies", new=AsyncMock(return_value=[])), \
+         patch("gateway.platforms.feishu_comment.add_comment_reaction", new=AsyncMock()), \
+         patch("gateway.platforms.feishu_comment.delete_comment_reaction", new=AsyncMock()), \
+         patch("gateway.platforms.feishu_comment.deliver_comment_reply", new=AsyncMock(return_value=True)), \
+         patch("gateway.platforms.feishu_comment._run_comment_agent", return_value=execution) as run_agent:
+        await handle_drive_comment_event(Mock(), first, self_open_id="ou_bot")
+        await handle_drive_comment_event(Mock(), second, self_open_id="ou_bot")
+
+    assert run_agent.call_count == 2
+    db = SessionDB(db_path=tmp_path / "state.db")
+    assert db.count_logical_turns() == 2
 
 
 class TestSanitizeCommentText(unittest.TestCase):

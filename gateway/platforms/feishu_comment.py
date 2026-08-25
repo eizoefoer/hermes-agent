@@ -1254,7 +1254,7 @@ async def handle_drive_comment_event(
         logical_turn_id = admitted["logical_turn_id"]
         if admitted.get("state") == "completed":
             stored = admitted.get("result") or {}
-            if admitted.get("delivery_state") not in {"acknowledged", "not_required"} and stored.get("response"):
+            if admitted.get("delivery_state") not in {"transport_accepted", "delivered", "not_required"} and stored.get("response"):
                 current_attempt_id = admitted.get("current_attempt_id")
                 if current_attempt_id:
                     session_db.begin_logical_turn_delivery(logical_turn_id, current_attempt_id)

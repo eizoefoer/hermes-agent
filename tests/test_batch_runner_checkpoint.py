@@ -6,6 +6,12 @@ from threading import Lock
 
 import pytest
 
+
+def test_batch_items_are_explicit_ephemeral_one_shots():
+    from batch_runner import BATCH_EXECUTION_CLASS
+
+    assert BATCH_EXECUTION_CLASS == "E_EPHEMERAL_ONE_SHOT"
+
 # batch_runner uses relative imports, ensure project root is on path
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))

@@ -929,6 +929,45 @@ class TestRunJobSessionPersistence:
         assert fake_db.close.call_count == 2
         mock_agent.close.assert_called_once()
 
+
+class TestRunJobSessionPersistenceAndDurability:
+    def test_same_occurrence_replay_is_idempotent_and_distinct_ticks_are_unique(self, tmp_path, monkeypatch):
+        from cron.scheduler import _admit_cron_occurrence
+        from hermes_state import SessionDB
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr("hermes_state.DEFAULT_DB_PATH", tmp_path / "state.db")
+        first = {"id": "durable-job", "prompt": "same", "_cron_occurrence_id": "2026-08-24T10:00:00Z"}
+        replay = dict(first)
+        later = {"id": "durable-job", "prompt": "same", "_cron_occurrence_id": "2026-08-24T10:01:00Z"}
+
+        one = _admit_cron_occurrence(first)
+        duplicate = _admit_cron_occurrence(replay)
+        two = _admit_cron_occurrence(later)
+
+        assert duplicate["logical_turn_id"] == one["logical_turn_id"]
+        assert two["logical_turn_id"] != one["logical_turn_id"]
+        db = SessionDB(db_path=tmp_path / "state.db")
+        assert db.count_logical_turns() == 2
+
+    def test_unexpired_cron_lease_is_not_reconciled_or_stolen(self, tmp_path, monkeypatch):
+        from cron.scheduler import _admit_cron_occurrence
+        from hermes_state import SessionDB
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr("hermes_state.DEFAULT_DB_PATH", tmp_path / "state.db")
+        job = {"id": "owned-job", "prompt": "work", "_cron_occurrence_id": "tick-1"}
+        turn = _admit_cron_occurrence(job)
+        db = SessionDB(db_path=tmp_path / "state.db")
+        claim = db.claim_logical_turn(turn["logical_turn_id"], owner="other", pid=999999)
+        db.mark_logical_turn_started(turn["logical_turn_id"], claim["attempt_id"])
+
+        assert db.reconcile_logical_turns() == 0
+        assert db.claim_logical_turn(
+            turn["logical_turn_id"], owner="replacement", pid=1
+        )["outcome"] == "busy"
+        assert db.get_logical_turn(turn["logical_turn_id"])["current_attempt_id"] == claim["attempt_id"]
+
     def test_run_job_closes_agent_on_failure_to_prevent_fd_leak(self, tmp_path):
         # Regression: if ``run_conversation`` raises, the ephemeral cron
         # agent was previously leaked — over days of ticks this accumulated

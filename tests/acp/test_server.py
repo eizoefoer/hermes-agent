@@ -68,6 +68,49 @@ async def test_new_session_exposes_edit_approvals_as_modes_not_config_options(ag
 
 
 @pytest.mark.asyncio
+async def test_attached_session_rehydrates_same_queued_logical_turn(tmp_path):
+    db_path = tmp_path / "state.db"
+    first_db = SessionDB(db_path=db_path)
+    first_manager = SessionManager(
+        agent_factory=lambda **_kwargs: MagicMock(name="first-agent"), db=first_db
+    )
+    state = first_manager.create_session(cwd=str(tmp_path))
+    turn = first_db.admit_session_event(
+        session_id=state.session_id,
+        session_key=f"acp:{state.session_id}",
+        source_identity="acp:test:accepted-before-restart",
+        event_type="acp-prompt",
+        payload={"user_text": "resume this", "user_content": "resume this"},
+    )
+    first_db.close()
+
+    fake_agent = MagicMock()
+    fake_agent.run_conversation.return_value = {
+        "final_response": "resumed",
+        "messages": [
+            {"role": "user", "content": "resume this"},
+            {"role": "assistant", "content": "resumed"},
+        ],
+    }
+    second_db = SessionDB(db_path=db_path)
+    second_manager = SessionManager(
+        agent_factory=lambda **_kwargs: fake_agent, db=second_db
+    )
+    resumed = second_manager.get_session(state.session_id)
+    assert resumed is not None
+    server = HermesACPAgent(session_manager=second_manager)
+    conn = MagicMock(spec=acp.Client)
+    conn.session_update = AsyncMock()
+    server._conn = conn
+
+    assert await server._rehydrate_acp_session(state.session_id) == 1
+    recovered = second_db.get_logical_turn(turn["logical_turn_id"])
+    assert recovered["state"] == "completed"
+    assert recovered["logical_turn_id"] == turn["logical_turn_id"]
+    fake_agent.run_conversation.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_set_config_option_persists_edit_approval_policy_without_advertising_config(agent):
     resp = await agent.new_session(cwd="/tmp")
     update = await agent.set_config_option(
