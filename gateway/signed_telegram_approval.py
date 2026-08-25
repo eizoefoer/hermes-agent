@@ -378,6 +378,11 @@ class ApprovalStore:
                 connection.rollback()
                 return Resolution("invalid")
             request = dict(row)
+            try:
+                verify_request_integrity(request)
+            except (KeyError, TypeError, ValueError, RuntimeError, json.JSONDecodeError):
+                connection.rollback()
+                return Resolution("invalid", request)
             body = f"{CALLBACK_PREFIX}:{operation}:{request_id}"
             signed_body = f"{body}:{request['approval_version']}:{request['checksum']}"
             if not hmac.compare_digest(signature, _short_signature(self.secret, signed_body)):
