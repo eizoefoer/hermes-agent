@@ -209,12 +209,16 @@ class TestPendingTitleValueError:
     """When set_session_title raises ValueError (duplicate/invalid title),
     pending_title must be cleared — not left wedged forever."""
 
-    def test_valueerror_clears_pending_title(self, monkeypatch):
+    def test_valueerror_clears_pending_title(self, monkeypatch, tmp_path):
         """ValueError from set_session_title should drop pending_title."""
         from tui_gateway import server
 
-        mock_db = MagicMock()
-        mock_db.set_session_title.side_effect = ValueError("duplicate title")
+        db = _make_session_db(tmp_path)
+        monkeypatch.setattr(
+            db,
+            "set_session_title",
+            MagicMock(side_effect=ValueError("duplicate title")),
+        )
 
         class _Agent:
             session_id = "test-session"
@@ -231,7 +235,7 @@ class TestPendingTitleValueError:
             pending_title="My Title",
         )
 
-        monkeypatch.setattr(server, "_get_db", lambda: mock_db)
+        monkeypatch.setattr(server, "_get_db", lambda: db)
         monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
         monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
         monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
@@ -262,13 +266,18 @@ class TestPendingTitleValueError:
             )
         finally:
             server._sessions.pop("sid", None)
+            db.close()
 
-    def test_other_exception_keeps_pending_title_for_retry(self, monkeypatch):
+    def test_other_exception_keeps_pending_title_for_retry(self, monkeypatch, tmp_path):
         """Non-ValueError exceptions should keep pending_title for retry."""
         from tui_gateway import server
 
-        mock_db = MagicMock()
-        mock_db.set_session_title.side_effect = RuntimeError("transient DB lock")
+        db = _make_session_db(tmp_path)
+        monkeypatch.setattr(
+            db,
+            "set_session_title",
+            MagicMock(side_effect=RuntimeError("transient DB lock")),
+        )
 
         class _Agent:
             session_id = "test-session"
@@ -285,7 +294,7 @@ class TestPendingTitleValueError:
             pending_title="My Title",
         )
 
-        monkeypatch.setattr(server, "_get_db", lambda: mock_db)
+        monkeypatch.setattr(server, "_get_db", lambda: db)
         monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
         monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
         monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
@@ -316,6 +325,7 @@ class TestPendingTitleValueError:
             )
         finally:
             server._sessions.pop("sid", None)
+            db.close()
 
 
 # ===========================================================================

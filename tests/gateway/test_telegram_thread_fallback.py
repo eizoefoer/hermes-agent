@@ -9,6 +9,7 @@ avoid retrying with a partial topic route that can render outside the lane.
 """
 
 import sys
+import importlib
 import types
 from types import SimpleNamespace
 
@@ -107,12 +108,31 @@ _fake_telegram_request.HTTPXRequest = object
 
 @pytest.fixture(autouse=True)
 def _inject_fake_telegram(monkeypatch):
-    """Inject fake telegram modules so the adapter can import from them."""
+    """Import the adapter against scoped Telegram fakes and restore caches."""
+    platforms = importlib.import_module("gateway.platforms")
+    missing = object()
+    previous_attribute = getattr(platforms, "telegram", missing)
+    previous_module = sys.modules.get("gateway.platforms.telegram", missing)
+
     monkeypatch.setitem(sys.modules, "telegram", _fake_telegram)
     monkeypatch.setitem(sys.modules, "telegram.error", _fake_telegram_error)
     monkeypatch.setitem(sys.modules, "telegram.constants", _fake_telegram_constants)
     monkeypatch.setitem(sys.modules, "telegram.ext", _fake_telegram_ext)
     monkeypatch.setitem(sys.modules, "telegram.request", _fake_telegram_request)
+    sys.modules.pop("gateway.platforms.telegram", None)
+    try:
+        importlib.import_module("gateway.platforms.telegram")
+        yield
+    finally:
+        if previous_module is missing:
+            sys.modules.pop("gateway.platforms.telegram", None)
+        else:
+            sys.modules["gateway.platforms.telegram"] = previous_module
+        if previous_attribute is missing:
+            if hasattr(platforms, "telegram"):
+                delattr(platforms, "telegram")
+        else:
+            setattr(platforms, "telegram", previous_attribute)
 
 
 def _make_adapter():

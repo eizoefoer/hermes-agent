@@ -131,6 +131,17 @@ class FailingAgent:
         }
 
 
+class CorrelationCaptureAgent:
+    task_ids = []
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).task_ids.append(task_id)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
 def _make_runner(adapter):
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
@@ -186,6 +197,31 @@ def _install_fakes(monkeypatch, agent_cls, *, cleanup_on: bool):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_gateway_executor_uses_only_authoritative_task_metadata(monkeypatch, tmp_path):
+    adapter = CleanupCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(monkeypatch, CorrelationCaptureAgent, cleanup_on=False)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    CorrelationCaptureAgent.task_ids = []
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001")
+
+    await runner._run_agent(
+        message="ordinary one", context_prompt="", history=[], source=source,
+        session_id="S1", session_key="key-1", task_id=None,
+    )
+    await runner._run_agent(
+        message="ordinary two", context_prompt="", history=[], source=source,
+        session_id="S2", session_key="key-2", task_id=None,
+    )
+    await runner._run_agent(
+        message="task backed", context_prompt="", history=[], source=source,
+        session_id="S1", session_key="key-1", task_id="T1",
+    )
+
+    assert CorrelationCaptureAgent.task_ids == [None, None, "T1"]
 
 
 @pytest.mark.asyncio

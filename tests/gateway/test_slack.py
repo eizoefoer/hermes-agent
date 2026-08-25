@@ -162,6 +162,22 @@ class TestSlashCommandSessionIsolation:
         assert event.source.chat_id == "D123"
         assert event.source.user_id == "U123"
 
+    @pytest.mark.asyncio
+    async def test_slash_command_uses_authoritative_trigger_identity(self, adapter):
+        command = {
+            "command": "/hermes",
+            "text": "same",
+            "user_id": "U123",
+            "channel_id": "D123",
+            "team_id": "T123",
+            "trigger_id": "trigger-unique-1",
+        }
+
+        await adapter._handle_slash_command(command)
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.session_event_id == "slash:trigger-unique-1"
+
 
 # ---------------------------------------------------------------------------
 # TestAppMentionHandler

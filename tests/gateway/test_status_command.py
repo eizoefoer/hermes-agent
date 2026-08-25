@@ -10,6 +10,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
+from hermes_state import SessionDB
 
 
 def _make_source(platform: Platform = Platform.TELEGRAM) -> SessionSource:
@@ -22,11 +23,19 @@ def _make_source(platform: Platform = Platform.TELEGRAM) -> SessionSource:
     )
 
 
-def _make_event(text: str, *, platform: Platform = Platform.TELEGRAM) -> MessageEvent:
+def _make_event(
+    text: str,
+    *,
+    platform: Platform = Platform.TELEGRAM,
+    task_id: str | None = None,
+    goal_id: str | None = None,
+) -> MessageEvent:
     return MessageEvent(
         text=text,
         source=_make_source(platform),
         message_id="m1",
+        task_id=task_id,
+        goal_id=goal_id,
     )
 
 
@@ -69,6 +78,12 @@ def _make_runner(session_entry: SessionEntry, *, platform: Platform = Platform.T
     runner._capture_gateway_honcho_if_configured = lambda *args, **kwargs: None
     runner._emit_gateway_run_progress = AsyncMock()
     return runner
+
+
+def _attach_durable_session(runner, session_entry, tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(session_entry.session_id, session_entry.platform.value)
+    runner._session_db = db
 
 
 @pytest.mark.asyncio
@@ -244,7 +259,7 @@ async def test_tasks_alias_routes_to_agents_command(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_handle_message_persists_agent_token_counts(monkeypatch):
+async def test_handle_message_persists_agent_token_counts(monkeypatch, tmp_path):
     import gateway.run as gateway_run
 
     session_entry = SessionEntry(
@@ -256,6 +271,7 @@ async def test_handle_message_persists_agent_token_counts(monkeypatch):
         chat_type="dm",
     )
     runner = _make_runner(session_entry)
+    _attach_durable_session(runner, session_entry, tmp_path)
     runner.session_store.load_transcript.return_value = [{"role": "user", "content": "earlier"}]
     runner._run_agent = AsyncMock(
         return_value={
@@ -279,6 +295,10 @@ async def test_handle_message_persists_agent_token_counts(monkeypatch):
     result = await runner._handle_message(_make_event("hello"))
 
     assert result == "ok"
+    assert runner._run_agent.await_args.kwargs["task_id"] is None
+    turn = runner._session_db.list_session_logical_turns("sess-1")[-1]
+    assert turn["task_id"] is None
+    assert turn["goal_id"] is None
     runner.session_store.update_session.assert_called_once_with(
         session_entry.session_key,
         last_prompt_tokens=80,
@@ -286,7 +306,43 @@ async def test_handle_message_persists_agent_token_counts(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_first_run_slack_home_channel_onboarding_uses_parent_command(monkeypatch):
+async def test_task_backed_message_preserves_authoritative_task_correlation(monkeypatch, tmp_path):
+    import gateway.run as gateway_run
+
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-task",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    _attach_durable_session(runner, session_entry, tmp_path)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "ok", "messages": [], "tools": [],
+            "history_offset": 0, "last_prompt_tokens": 0,
+            "input_tokens": 0, "output_tokens": 0, "model": "openai/test-model",
+        }
+    )
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100000,
+    )
+
+    result = await runner._handle_message(_make_event("task work", task_id="T1"))
+
+    assert result == "ok"
+    assert runner._run_agent.await_args.kwargs["task_id"] == "T1"
+    turn = runner._session_db.list_session_logical_turns("sess-task")[-1]
+    assert turn["task_id"] == "T1"
+    assert turn["goal_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_first_run_slack_home_channel_onboarding_uses_parent_command(monkeypatch, tmp_path):
     import gateway.run as gateway_run
 
     session_entry = SessionEntry(
@@ -298,6 +354,7 @@ async def test_first_run_slack_home_channel_onboarding_uses_parent_command(monke
         chat_type="dm",
     )
     runner = _make_runner(session_entry, platform=Platform.SLACK)
+    _attach_durable_session(runner, session_entry, tmp_path)
     runner.session_store.load_transcript.return_value = []
     runner.session_store.has_any_sessions.return_value = False
     runner._run_agent = AsyncMock(
@@ -330,7 +387,7 @@ async def test_first_run_slack_home_channel_onboarding_uses_parent_command(monke
 
 
 @pytest.mark.asyncio
-async def test_first_run_non_slack_home_channel_onboarding_keeps_direct_command(monkeypatch):
+async def test_first_run_non_slack_home_channel_onboarding_keeps_direct_command(monkeypatch, tmp_path):
     import gateway.run as gateway_run
 
     session_entry = SessionEntry(
@@ -342,6 +399,7 @@ async def test_first_run_non_slack_home_channel_onboarding_keeps_direct_command(
         chat_type="dm",
     )
     runner = _make_runner(session_entry, platform=Platform.TELEGRAM)
+    _attach_durable_session(runner, session_entry, tmp_path)
     runner.session_store.load_transcript.return_value = []
     runner.session_store.has_any_sessions.return_value = False
     runner._run_agent = AsyncMock(
@@ -373,7 +431,7 @@ async def test_first_run_non_slack_home_channel_onboarding_keeps_direct_command(
 
 
 @pytest.mark.asyncio
-async def test_handle_message_discards_stale_result_after_session_invalidation(monkeypatch):
+async def test_handle_message_discards_stale_result_after_session_invalidation(monkeypatch, tmp_path):
     import gateway.run as gateway_run
 
     session_entry = SessionEntry(
@@ -385,6 +443,7 @@ async def test_handle_message_discards_stale_result_after_session_invalidation(m
         chat_type="dm",
     )
     runner = _make_runner(session_entry)
+    _attach_durable_session(runner, session_entry, tmp_path)
     runner.session_store.load_transcript.return_value = [{"role": "user", "content": "earlier"}]
     session_key = session_entry.session_key
     runner.adapters[Platform.TELEGRAM]._post_delivery_callbacks = {session_key: object()}
@@ -419,7 +478,7 @@ async def test_handle_message_discards_stale_result_after_session_invalidation(m
 
 
 @pytest.mark.asyncio
-async def test_handle_message_stale_result_keeps_newer_generation_callback(monkeypatch):
+async def test_handle_message_stale_result_keeps_newer_generation_callback(monkeypatch, tmp_path):
     import gateway.run as gateway_run
 
     class _Adapter:
@@ -452,6 +511,7 @@ async def test_handle_message_stale_result_keeps_newer_generation_callback(monke
         chat_type="dm",
     )
     runner = _make_runner(session_entry)
+    _attach_durable_session(runner, session_entry, tmp_path)
     runner.session_store.load_transcript.return_value = [{"role": "user", "content": "earlier"}]
     session_key = session_entry.session_key
     adapter = _Adapter()

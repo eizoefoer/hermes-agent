@@ -2629,8 +2629,8 @@ class TelegramAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send an inline-keyboard approval prompt with interactive buttons.
 
-        The buttons call ``resolve_gateway_approval()`` to unblock the waiting
-        agent thread — same mechanism as the text ``/approve`` flow.
+        Durable continuations persist the request before delivery. Legacy
+        callers retain the process-local ``/approve`` compatibility flow.
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
@@ -2646,13 +2646,25 @@ class TelegramAdapter(BasePlatformAdapter):
             # Resolve thread context for thread replies
             thread_id = self._metadata_thread_id(metadata)
 
-            # We'll use the message_id as part of callback_data to look up session_key
-            # Send a placeholder first, then update — or use a counter.
-            # Simpler: use a monotonic counter to generate short IDs.
-            import itertools
-            if not hasattr(self, "_approval_counter"):
-                self._approval_counter = itertools.count(1)
-            approval_id = next(self._approval_counter)
+            continuation = metadata.get("approval_continuation") if metadata else None
+            if isinstance(continuation, dict):
+                # The durable token is self-describing, so a callback can be
+                # handled after a restart without rebuilding the in-memory map.
+                import secrets
+                approval_id = f"d{secrets.token_hex(8)}"
+                self._get_telegram_approval_service().create(
+                    request_id=approval_id,
+                    session_key=session_key,
+                    continuation_kind=str(continuation["kind"]),
+                    payload=dict(continuation.get("payload") or {}),
+                    idempotency_key=str(continuation["idempotency_key"]),
+                )
+            else:
+                # Compatibility path for the blocking process-local queue.
+                import itertools
+                if not hasattr(self, "_approval_counter"):
+                    self._approval_counter = itertools.count(1)
+                approval_id = next(self._approval_counter)
 
             keyboard = InlineKeyboardMarkup([
                 [
@@ -2693,6 +2705,23 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("[%s] send_exec_approval failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
+
+    def _get_telegram_approval_service(self):
+        service = getattr(self, "_telegram_approval_service", None)
+        if service is not None:
+            return service
+
+        from gateway.approval_store import ApprovalStore
+        from gateway.telegram_approval import TelegramApprovalService
+        from tools.approval import resolve_gateway_approval
+
+        store = ApprovalStore()
+        service = TelegramApprovalService(
+            store, process_local_resolver=resolve_gateway_approval
+        )
+        self._telegram_approval_store = store
+        self._telegram_approval_service = service
+        return service
 
     async def send_slash_confirm(
         self, chat_id: str, title: str, message: str, session_key: str,
@@ -3244,11 +3273,16 @@ class TelegramAdapter(BasePlatformAdapter):
             parts = data.split(":", 2)
             if len(parts) == 3:
                 choice = parts[1]  # once, session, always, deny
-                try:
-                    approval_id = int(parts[2])
-                except (ValueError, IndexError):
-                    await query.answer(text="Invalid approval data.")
-                    return
+                approval_token = parts[2]
+                durable = approval_token.startswith("d")
+                if durable:
+                    approval_id = approval_token
+                else:
+                    try:
+                        approval_id = int(approval_token)
+                    except (ValueError, IndexError):
+                        await query.answer(text="Invalid approval data.")
+                        return
 
                 # Only authorized users may click approval buttons.
                 caller_id = str(getattr(query.from_user, "id", ""))
@@ -3263,9 +3297,25 @@ class TelegramAdapter(BasePlatformAdapter):
                     return
 
                 session_key = self._approval_state.pop(approval_id, None)
-                if not session_key:
+                if not durable and not session_key:
                     await query.answer(text="This approval has already been resolved.")
                     return
+
+                durable_outcome = None
+                if durable:
+                    # Commit before reporting success. Never touch the
+                    # process-local tools.approval queue for this path.
+                    try:
+                        durable_outcome = self._get_telegram_approval_service().decide(
+                            approval_id, choice, decided_by=caller_id,
+                        )
+                    except KeyError:
+                        await query.answer(text="This approval has expired.")
+                        return
+                    except Exception as exc:
+                        logger.error("Failed to persist durable Telegram approval: %s", exc)
+                        await query.answer(text="Could not record approval; please retry.")
+                        return
 
                 # Map choice to human-readable label
                 label_map = {
@@ -3291,11 +3341,14 @@ class TelegramAdapter(BasePlatformAdapter):
 
                 # Resolve the approval — unblocks the agent thread
                 try:
-                    from tools.approval import resolve_gateway_approval
-                    count = resolve_gateway_approval(session_key, choice)
+                    if durable:
+                        count = 1 if durable_outcome.durable else durable_outcome.local_resolution_count
+                    else:
+                        from tools.approval import resolve_gateway_approval
+                        count = resolve_gateway_approval(session_key, choice)
                     logger.info(
                         "Telegram button resolved %d approval(s) for session %s (choice=%s, user=%s)",
-                        count, session_key, choice, user_display,
+                        count, session_key or "durable", choice, user_display,
                     )
                 except Exception as exc:
                     logger.error("Failed to resolve gateway approval from Telegram button: %s", exc)

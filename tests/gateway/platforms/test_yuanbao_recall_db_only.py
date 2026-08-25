@@ -8,8 +8,12 @@ JSONL file gone.  When a row has no platform id (e.g. agent-processed
 @bot messages whose adapter didn't carry a msg_id, or pre-column legacy
 rows), recall falls through to content-match.
 """
-from gateway.session import SessionStore
-from gateway.config import GatewayConfig
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+from gateway.session import SessionSource, SessionStore
+from gateway.config import GatewayConfig, Platform
+from gateway.platforms.yuanbao import RecallGuardMiddleware
 
 
 def _pin_db(monkeypatch, tmp_path):
@@ -86,3 +90,35 @@ def test_recall_branch_a2_content_match_when_no_platform_id(tmp_path, monkeypatc
         None,
     )
     assert target is not None
+
+
+def test_recall_synthesis_is_stable_for_same_durable_parent_occurrence():
+    adapter = SimpleNamespace(
+        name="yuanbao",
+        build_source=lambda **kwargs: SessionSource(
+            platform=Platform.YUANBAO,
+            chat_id=kwargs["chat_id"],
+            chat_type=kwargs["chat_type"],
+            user_id=kwargs.get("user_id"),
+            thread_id=kwargs.get("thread_id"),
+        ),
+        _pending_messages={},
+        _active_sessions={"session": MagicMock()},
+        _processing_msg_texts={},
+    )
+
+    RecallGuardMiddleware._interrupt_for_recall(
+        adapter, "session", "parent-message-1", "group-1", "user-1"
+    )
+    first = adapter._pending_messages["session"].occurrence_id
+    RecallGuardMiddleware._interrupt_for_recall(
+        adapter, "session", "parent-message-1", "group-1", "user-1"
+    )
+    replay = adapter._pending_messages["session"].occurrence_id
+    RecallGuardMiddleware._interrupt_for_recall(
+        adapter, "session", "parent-message-2", "group-1", "user-1"
+    )
+    distinct = adapter._pending_messages["session"].occurrence_id
+
+    assert replay == first
+    assert distinct != first

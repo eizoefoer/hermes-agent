@@ -252,7 +252,9 @@ class TestRunStatus:
                     await asyncio.sleep(0.05)
 
                 mock_agent.run_conversation.assert_called_once()
-                assert mock_agent.run_conversation.call_args.kwargs["task_id"] == "space-session"
+                # A run is a real task resource; its task correlation is the
+                # run id, never a fabricated copy of the conversation session.
+                assert mock_agent.run_conversation.call_args.kwargs["task_id"] == run_id
                 assert status["session_id"] == "space-session"
 
     @pytest.mark.asyncio

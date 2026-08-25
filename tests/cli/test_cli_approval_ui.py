@@ -290,7 +290,7 @@ class TestCliApprovalUi:
         # Command got truncated with a marker.
         assert "(command truncated" in rendered
 
-    def test_background_task_registers_thread_local_approval_callbacks(self):
+    def test_background_task_registers_thread_local_approval_callbacks(self, monkeypatch):
         """Background /btw tasks must use the prompt_toolkit approval UI.
 
         The foreground chat path registers dangerous-command callbacks inside
@@ -300,6 +300,7 @@ class TestCliApprovalUi:
         prompt_toolkit.
         """
         cli = _make_background_cli_stub()
+        monkeypatch.setenv("HERMES_CLI_TEST_EPHEMERAL", "1")
         seen = {}
 
         class FakeAgent:

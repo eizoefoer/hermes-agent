@@ -10,6 +10,7 @@ Covers:
 """
 
 import os
+import importlib
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,7 +21,15 @@ import pytest
 from gateway.config import PlatformConfig
 
 
-def _ensure_telegram_mock():
+_TestChatType = SimpleNamespace(
+    GROUP="group",
+    SUPERGROUP="supergroup",
+    CHANNEL="channel",
+    PRIVATE="private",
+)
+
+
+def _fake_telegram_modules():
     telegram_mod = MagicMock()
     telegram_mod.ext.ContextTypes.DEFAULT_TYPE = type(None)
 
@@ -29,23 +38,49 @@ def _ensure_telegram_mock():
     # with string-valued members (not auto-generated MagicMocks).
     constants_mod = MagicMock()
     constants_mod.ParseMode.MARKDOWN_V2 = "MarkdownV2"
-    constants_mod.ChatType.GROUP = "group"
-    constants_mod.ChatType.SUPERGROUP = "supergroup"
-    constants_mod.ChatType.CHANNEL = "channel"
-    constants_mod.ChatType.PRIVATE = "private"
+    constants_mod.ChatType = _TestChatType
 
-    sys.modules["telegram"] = telegram_mod
-    sys.modules["telegram.ext"] = telegram_mod.ext
-    sys.modules["telegram.constants"] = constants_mod
-    sys.modules["telegram.request"] = telegram_mod.request
-
-    # Force reimport so the adapter picks up the mock ChatType.
-    sys.modules.pop("gateway.platforms.telegram", None)
+    return {
+        "telegram": telegram_mod,
+        "telegram.ext": telegram_mod.ext,
+        "telegram.constants": constants_mod,
+        "telegram.request": telegram_mod.request,
+    }
 
 
-_ensure_telegram_mock()
+_TelegramAdapter = None
 
-from gateway.platforms.telegram import TelegramAdapter  # noqa: E402
+
+@pytest.fixture(autouse=True)
+def isolated_telegram_module(monkeypatch):
+    """Bind this file's adapter to scoped Telegram mocks, then restore it."""
+    global _TelegramAdapter
+
+    platforms = importlib.import_module("gateway.platforms")
+    missing = object()
+    previous_attribute = getattr(platforms, "telegram", missing)
+    previous_module = sys.modules.get("gateway.platforms.telegram", missing)
+    previous_adapter = _TelegramAdapter
+
+    with monkeypatch.context() as isolated:
+        for name, module in _fake_telegram_modules().items():
+            isolated.setitem(sys.modules, name, module)
+        sys.modules.pop("gateway.platforms.telegram", None)
+        try:
+            imported = importlib.import_module("gateway.platforms.telegram")
+            _TelegramAdapter = imported.TelegramAdapter
+            yield
+        finally:
+            _TelegramAdapter = previous_adapter
+            if previous_module is missing:
+                sys.modules.pop("gateway.platforms.telegram", None)
+            else:
+                sys.modules["gateway.platforms.telegram"] = previous_module
+            if previous_attribute is missing:
+                if hasattr(platforms, "telegram"):
+                    delattr(platforms, "telegram")
+            else:
+                setattr(platforms, "telegram", previous_attribute)
 
 
 def _make_adapter(dm_topics_config=None, group_topics_config=None):
@@ -56,7 +91,7 @@ def _make_adapter(dm_topics_config=None, group_topics_config=None):
     if group_topics_config is not None:
         extra["group_topics"] = group_topics_config
     config = PlatformConfig(enabled=True, token="***", extra=extra)
-    adapter = TelegramAdapter(config)
+    adapter = _TelegramAdapter(config)
     return adapter
 
 
@@ -667,11 +702,8 @@ def test_build_message_event_preserves_true_dm_topic_thread_id():
 
 # ── _build_message_event: group_topics skill binding ──
 
-# The telegram mock sets sys.modules["telegram.constants"] = telegram_mod (root mock),
-# so `from telegram.constants import ChatType` in telegram.py resolves to
-# telegram_mod.ChatType — not telegram_mod.constants.ChatType.  We must use
-# the same ChatType object the production code sees so equality checks work.
-from telegram.constants import ChatType as _ChatType  # noqa: E402
+# Use the same string-valued constants as this file's isolated adapter import.
+_ChatType = _TestChatType
 
 
 def test_group_topic_skill_binding():

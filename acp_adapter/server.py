@@ -9,6 +9,7 @@ import contextvars
 import json
 import logging
 import os
+import uuid
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -1122,6 +1123,7 @@ class HermesACPAgent(acp.Agent):
             )
         self._schedule_available_commands_update(session_id)
         self._schedule_usage_update(state)
+        asyncio.create_task(self._rehydrate_acp_session(session_id))
         return LoadSessionResponse(
             models=self._build_model_state(state),
             modes=self._session_modes(state),
@@ -1154,6 +1156,7 @@ class HermesACPAgent(acp.Agent):
             )
         self._schedule_available_commands_update(state.session_id)
         self._schedule_usage_update(state)
+        asyncio.create_task(self._rehydrate_acp_session(state.session_id))
         return ResumeSessionResponse(
             models=self._build_model_state(state),
             modes=self._session_modes(state),
@@ -1238,6 +1241,32 @@ class HermesACPAgent(acp.Agent):
         next_cursor = sessions[-1].session_id if has_more and sessions else None
         return ListSessionsResponse(sessions=sessions, next_cursor=next_cursor)
 
+    async def _rehydrate_acp_session(self, session_id: str) -> int:
+        """Execute queued/retry ACP turns for one attached persisted session."""
+        db = self.session_manager._get_db()
+        db.reconcile_logical_turns()
+        executed = 0
+        ready_rows = db.list_ready_logical_turns(
+            limit=100,
+            event_types=("acp-prompt",),
+            session_id=session_id,
+        )
+        for ready in ready_rows:
+            payload = ready.get("payload") or {}
+            user_text = str(payload.get("user_text") or "[Recovered attachment]")
+            if self._conn:
+                await self._conn.session_update(
+                    session_id, acp.update_user_message_text(user_text)
+                )
+            await self.prompt(
+                prompt=[TextContentBlock(type="text", text=user_text)],
+                session_id=session_id,
+                _logical_turn_id=ready["logical_turn_id"],
+                _user_content_override=payload.get("user_content", user_text),
+            )
+            executed += 1
+        return executed
+
     # ---- Prompt (core) ------------------------------------------------------
 
     async def prompt(
@@ -1261,11 +1290,17 @@ class HermesACPAgent(acp.Agent):
         user_text = _extract_text(prompt).strip()
         user_content = _content_blocks_to_openai_user_content(prompt)
         text_only_prompt = all(isinstance(block, TextContentBlock) for block in prompt)
+        content_override = kwargs.pop("_user_content_override", None)
+        if content_override is not None:
+            user_content = content_override
+            text_only_prompt = isinstance(content_override, str)
         has_content = bool(user_text) or (
             isinstance(user_content, list) and bool(user_content)
         )
         if not has_content:
             return PromptResponse(stop_reason="end_turn")
+
+        preadmitted_turn_id = kwargs.pop("_logical_turn_id", None)
 
         # /steer on an idle session has no in-flight tool call to inject into.
         # Rewrite it so the payload runs as a normal user prompt, matching the
@@ -1304,6 +1339,14 @@ class HermesACPAgent(acp.Agent):
         # Slash commands are text-only; if the client included images/resources,
         # send the whole multimodal prompt to the agent instead of treating it as
         # an ACP command.
+        force_queue = False
+        if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/queue "):
+            # /queue creates a future Hermes reasoning turn.  Treat it as an
+            # admitted prompt, not a process-local list entry.
+            user_text = user_text.split(maxsplit=1)[1].strip()
+            user_content = user_text
+            force_queue = True
+
         if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/"):
             response_text = self._handle_slash_command(user_text, state)
             if response_text is not None:
@@ -1313,20 +1356,51 @@ class HermesACPAgent(acp.Agent):
                     await self._send_usage_update(state)
                 return PromptResponse(stop_reason="end_turn")
 
-        # If Zed sends another regular prompt while the same ACP session is
-        # still running, queue it instead of racing two AIAgent loops against
-        # the same state.history. /steer and /queue are handled above and can
-        # land immediately.
+        db = self.session_manager._get_db()
+        if preadmitted_turn_id is None:
+            admitted = db.admit_session_event(
+                session_id=session_id,
+                session_key=f"acp:{session_id}",
+                source_identity=f"acp:prompt:{session_id}:occurrence:{uuid.uuid4().hex}",
+                event_type="acp-prompt",
+                payload={"user_text": user_text, "user_content": user_content},
+            )
+            preadmitted_turn_id = admitted["logical_turn_id"]
+            if force_queue:
+                if self._conn:
+                    await self._conn.session_update(
+                        session_id,
+                        acp.update_agent_message_text("Queued durably for the next turn."),
+                    )
+                return PromptResponse(stop_reason="end_turn")
+        claim = db.claim_logical_turn(
+            preadmitted_turn_id, owner=f"acp:{os.getpid()}", pid=os.getpid()
+        )
+        if claim.get("outcome") == "busy":
+            if self._conn:
+                await self._conn.session_update(
+                    session_id,
+                    acp.update_agent_message_text("Queued durably for the next turn."),
+                )
+            return PromptResponse(stop_reason="end_turn")
+        if claim.get("outcome") == "terminal":
+            return PromptResponse(stop_reason="end_turn")
+        if claim.get("outcome") != "claimed":
+            logger.error("ACP logical turn claim failed: %s", claim.get("outcome"))
+            return PromptResponse(stop_reason="refusal")
+        attempt_id = claim["attempt_id"]
+        db.mark_logical_turn_started(preadmitted_turn_id, attempt_id)
+
+        # Process-local state remains a mutation guard only; SessionDB lease
+        # ownership above is the execution authority.
         with state.runtime_lock:
             if state.is_running:
-                queued_text = user_text or "[Image attachment]"
-                state.queued_prompts.append(queued_text)
-                depth = len(state.queued_prompts)
-                if self._conn:
-                    update = acp.update_agent_message_text(
-                        f"Queued for the next turn. ({depth} queued)"
-                    )
-                    await self._conn.session_update(session_id, update)
+                db.fail_logical_turn(
+                    preadmitted_turn_id,
+                    attempt_id,
+                    "ACP local mutation guard was already active",
+                    retryable=True,
+                )
                 return PromptResponse(stop_reason="end_turn")
             state.is_running = True
             state.current_prompt_text = user_text or "[Image attachment]"
@@ -1456,13 +1530,13 @@ class HermesACPAgent(acp.Agent):
                 result = agent.run_conversation(
                     user_message=user_content,
                     conversation_history=state.history,
-                    task_id=session_id,
+                    task_id=None,
                     persist_user_message=user_text or "[Image attachment]",
                 )
                 return result
             except Exception as e:
                 logger.exception("Agent error in session %s", session_id)
-                return {"final_response": f"Error: {e}", "messages": state.history}
+                return {"final_response": f"Error: {e}", "error": str(e), "messages": state.history}
             finally:
                 # Restore HERMES_INTERACTIVE.
                 if previous_interactive is None:
@@ -1502,10 +1576,33 @@ class HermesACPAgent(acp.Agent):
             result = await loop.run_in_executor(_executor, ctx.run, _run_agent)
         except Exception:
             logger.exception("Executor error for session %s", session_id)
+            db.fail_logical_turn(
+                preadmitted_turn_id, attempt_id, "ACP executor error", retryable=True
+            )
             with state.runtime_lock:
                 state.is_running = False
                 state.current_prompt_text = ""
             return PromptResponse(stop_reason="end_turn")
+
+        if result.get("error") or result.get("failed"):
+            db.fail_logical_turn(
+                preadmitted_turn_id,
+                attempt_id,
+                str(result.get("error") or "ACP execution failed"),
+                retryable=bool(result.get("interrupted")),
+            )
+        else:
+            needs_final_delivery = bool(
+                result.get("final_response")
+                and conn
+                and (not streamed_message or result.get("response_transformed"))
+            )
+            db.complete_logical_turn(
+                preadmitted_turn_id,
+                attempt_id,
+                {"result": result},
+                delivery_required=needs_final_delivery,
+            )
 
         if result.get("messages"):
             state.history = result["messages"]
@@ -1539,8 +1636,18 @@ class HermesACPAgent(acp.Agent):
             # or when a plugin hook transformed the response after streaming
             # finished (e.g. transform_llm_output) — otherwise the appended /
             # rewritten text never reaches the client.
+            db.begin_logical_turn_delivery(preadmitted_turn_id, attempt_id)
             update = acp.update_agent_message_text(final_response)
-            await conn.session_update(session_id, update)
+            try:
+                await conn.session_update(session_id, update)
+                # ACP session_update acceptance has no end-client ACK; this is
+                # transport acceptance, not proof the editor rendered it.
+                db.acknowledge_logical_turn_delivery(preadmitted_turn_id, attempt_id)
+            except Exception as exc:
+                db.fail_logical_turn_delivery(
+                    preadmitted_turn_id, attempt_id, str(exc), retryable=True
+                )
+                raise
 
         # Mark this turn idle before draining queued work so recursive prompt()
         # calls can acquire the session. Queued turns are intentionally run as
@@ -1549,20 +1656,7 @@ class HermesACPAgent(acp.Agent):
             state.is_running = False
             state.current_prompt_text = ""
 
-        while True:
-            with state.runtime_lock:
-                if not state.queued_prompts:
-                    break
-                next_prompt = state.queued_prompts.pop(0)
-            if conn:
-                await conn.session_update(
-                    session_id,
-                    acp.update_user_message_text(next_prompt),
-                )
-            await self.prompt(
-                prompt=[TextContentBlock(type="text", text=next_prompt)],
-                session_id=session_id,
-            )
+        await self._rehydrate_acp_session(session_id)
 
         usage = None
         if any(result.get(key) is not None for key in ("prompt_tokens", "completion_tokens", "total_tokens")):

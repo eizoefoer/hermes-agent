@@ -937,6 +937,28 @@ class TestVoiceChannelCommands:
         assert event.message_type == MessageType.VOICE
         assert event.source.chat_id == "123"
         assert event.source.chat_type == "channel"
+        assert event.occurrence_id
+
+    @pytest.mark.asyncio
+    async def test_separate_identical_voice_inputs_receive_distinct_occurrences(self, runner):
+        """STT callbacks have no transport replay key; accepted utterances are unique."""
+        from gateway.config import Platform
+
+        mock_adapter = AsyncMock()
+        mock_adapter._voice_text_channels = {111: 123}
+        mock_adapter._voice_sources = {}
+        mock_adapter._client = MagicMock()
+        mock_adapter._client.get_channel = MagicMock(return_value=AsyncMock())
+        mock_adapter.handle_message = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+        runner._is_duplicate_voice_transcript = lambda *_args: False
+
+        await runner._handle_voice_channel_input(111, 42, "same transcript")
+        await runner._handle_voice_channel_input(111, 42, "same transcript")
+
+        events = [call.args[0] for call in mock_adapter.handle_message.await_args_list]
+        assert len(events) == 2
+        assert events[0].occurrence_id != events[1].occurrence_id
 
     @pytest.mark.asyncio
     async def test_input_reuses_bound_source_metadata(self, runner):

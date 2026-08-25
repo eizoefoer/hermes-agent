@@ -7,6 +7,7 @@ import types
 from pathlib import Path
 from unittest.mock import patch
 
+from hermes_state import SessionDB
 from tui_gateway import server
 
 
@@ -787,6 +788,15 @@ def _session(agent=None, **extra):
     }
 
 
+def _canonical_tui_db(monkeypatch, tmp_path, key="session-key"):
+    """Give prompt tests real canonical admission without auto-draining retries."""
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session(key, "tui")
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_rehydrate_tui_session_turns", lambda *_args: 0)
+    return db
+
+
 def test_session_close_commits_memory_and_fires_finalize_hook(monkeypatch):
     calls = {"hooks": []}
 
@@ -1100,7 +1110,7 @@ def test_session_title_set_errors_when_row_lookup_fails_after_noop(monkeypatch):
         server._sessions.pop("sid", None)
 
 
-def test_session_create_drops_pending_title_on_valueerror(monkeypatch):
+def test_session_create_drops_pending_title_on_valueerror(monkeypatch, tmp_path):
     """When set_session_title raises ValueError during post-message title flush,
     pending_title should be dropped (non-retryable). Updated for post-#18370
     lazy session creation where title is applied post-first-message.
@@ -1119,10 +1129,6 @@ def test_session_create_drops_pending_title_on_valueerror(monkeypatch):
                 "final_response": "ok",
                 "messages": [{"role": "assistant", "content": "ok"}],
             }
-
-    class _FakeDB:
-        def set_session_title(self, _key, _title):
-            raise ValueError("Title already in use")
 
     class _ImmediateThread:
         def __init__(self, target=None, daemon=None, **kw):
@@ -1149,7 +1155,12 @@ def test_session_create_drops_pending_title_on_valueerror(monkeypatch):
     }
 
     server._sessions["sid"] = session
-    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    db = _canonical_tui_db(monkeypatch, tmp_path, key="test-session")
+    monkeypatch.setattr(
+        db,
+        "set_session_title",
+        lambda *_args: (_ for _ in ()).throw(ValueError("Title already in use")),
+    )
     monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
@@ -2229,7 +2240,7 @@ def test_prompt_submit_sets_approval_session_key(monkeypatch):
     assert captured["session_key"] == "session-key"
 
 
-def test_prompt_submit_expands_context_refs(monkeypatch):
+def test_prompt_submit_expands_context_refs(monkeypatch, tmp_path):
     captured = {}
 
     class _Agent:
@@ -2267,6 +2278,7 @@ def test_prompt_submit_expands_context_refs(monkeypatch):
     fake_meta.get_model_context_length = lambda *args, **kwargs: 100000
 
     server._sessions["sid"] = _session(agent=_Agent())
+    _canonical_tui_db(monkeypatch, tmp_path)
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
     monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
@@ -2825,7 +2837,7 @@ def test_rollback_restore_rejects_full_history_while_running(monkeypatch):
         server._sessions.pop("sid", None)
 
 
-def test_prompt_submit_history_version_mismatch_surfaces_warning(monkeypatch):
+def test_prompt_submit_history_version_mismatch_surfaces_warning(monkeypatch, tmp_path):
     """Fix for TUI silent-drop #2: the defensive backstop at prompt.submit
     must attach a 'warning' to message.complete when history was
     mutated externally during the turn (instead of silently dropping
@@ -2855,6 +2867,7 @@ def test_prompt_submit_history_version_mismatch_surfaces_warning(monkeypatch):
             self._target()
 
     server._sessions["sid"] = _session(agent=_RacyAgent())
+    _canonical_tui_db(monkeypatch, tmp_path)
     session_ref["s"] = server._sessions["sid"]
     emits: list[tuple] = []
     try:
@@ -2893,7 +2906,7 @@ def test_prompt_submit_history_version_mismatch_surfaces_warning(monkeypatch):
         server._sessions.pop("sid", None)
 
 
-def test_prompt_submit_history_version_match_persists_normally(monkeypatch):
+def test_prompt_submit_history_version_match_persists_normally(monkeypatch, tmp_path):
     """Regression guard: the backstop does not affect the happy path."""
 
     class _Agent:
@@ -2913,6 +2926,7 @@ def test_prompt_submit_history_version_match_persists_normally(monkeypatch):
             self._target()
 
     server._sessions["sid"] = _session(agent=_Agent())
+    _canonical_tui_db(monkeypatch, tmp_path)
     emits: list[tuple] = []
     try:
         monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
@@ -2944,7 +2958,7 @@ def test_prompt_submit_history_version_match_persists_normally(monkeypatch):
         server._sessions.pop("sid", None)
 
 
-def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
+def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch, tmp_path):
     """Desktop user-message edits should restart the turn from the edited user."""
 
     seen = {}
@@ -2978,22 +2992,21 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
         {"role": "assistant", "content": "second reply"},
     ]
     server._sessions["sid"] = _session(agent=_Agent(), history=original_history)
+    db = _canonical_tui_db(monkeypatch, tmp_path)
+    replaced = []
+    replace_messages = db.replace_messages
 
-    class _StubDb:
-        def __init__(self):
-            self.replaced = []
+    def _record_replace(session_id, messages):
+        replaced.append((session_id, list(messages)))
+        return replace_messages(session_id, messages)
 
-        def replace_messages(self, session_id, messages):
-            self.replaced.append((session_id, list(messages)))
-
-    stub_db = _StubDb()
+    monkeypatch.setattr(db, "replace_messages", _record_replace)
 
     try:
         monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
         monkeypatch.setattr(server, "_emit", lambda *a: None)
-        monkeypatch.setattr(server, "_get_db", lambda: stub_db)
 
         resp = server.handle_request(
             {
@@ -3016,7 +3029,7 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
             {"role": "assistant", "content": "edited reply"},
         ]
         assert server._sessions["sid"]["history_version"] == 2
-        assert stub_db.replaced == [("session-key", original_history[:2])]
+        assert replaced == [("session-key", original_history[:2])]
     finally:
         server._sessions.pop("sid", None)
 
@@ -3849,7 +3862,7 @@ class _ImmediateThread:
         self._target()
 
 
-def test_prompt_submit_auto_titles_session_on_complete(monkeypatch):
+def test_prompt_submit_auto_titles_session_on_complete(monkeypatch, tmp_path):
     """maybe_auto_title is called after a successful (complete) prompt."""
 
     class _Agent:
@@ -3865,11 +3878,11 @@ def test_prompt_submit_auto_titles_session_on_complete(monkeypatch):
             }
 
     server._sessions["sid"] = _session(agent=_Agent())
+    _canonical_tui_db(monkeypatch, tmp_path)
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
     monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
-    monkeypatch.setattr(server, "_get_db", lambda: None)
 
     with patch("agent.title_generator.maybe_auto_title") as mock_title:
         server.handle_request(
@@ -3887,7 +3900,7 @@ def test_prompt_submit_auto_titles_session_on_complete(monkeypatch):
     assert args[3] == "Rome was founded in 753 BC."
 
 
-def test_prompt_submit_skips_auto_title_when_interrupted(monkeypatch):
+def test_prompt_submit_skips_auto_title_when_interrupted(monkeypatch, tmp_path):
     """maybe_auto_title must NOT be called when the agent was interrupted."""
 
     class _Agent:
@@ -3901,11 +3914,11 @@ def test_prompt_submit_skips_auto_title_when_interrupted(monkeypatch):
             }
 
     server._sessions["sid"] = _session(agent=_Agent())
+    _canonical_tui_db(monkeypatch, tmp_path)
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
     monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
-    monkeypatch.setattr(server, "_get_db", lambda: None)
 
     with patch("agent.title_generator.maybe_auto_title") as mock_title:
         server.handle_request(
@@ -3919,7 +3932,7 @@ def test_prompt_submit_skips_auto_title_when_interrupted(monkeypatch):
     mock_title.assert_not_called()
 
 
-def test_prompt_submit_skips_auto_title_when_response_empty(monkeypatch):
+def test_prompt_submit_skips_auto_title_when_response_empty(monkeypatch, tmp_path):
     """maybe_auto_title must NOT be called when the agent returns an empty reply."""
 
     class _Agent:
@@ -3932,11 +3945,11 @@ def test_prompt_submit_skips_auto_title_when_response_empty(monkeypatch):
             }
 
     server._sessions["sid"] = _session(agent=_Agent())
+    _canonical_tui_db(monkeypatch, tmp_path)
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
     monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
-    monkeypatch.setattr(server, "_get_db", lambda: None)
 
     with patch("agent.title_generator.maybe_auto_title") as mock_title:
         server.handle_request(
@@ -3950,7 +3963,7 @@ def test_prompt_submit_skips_auto_title_when_response_empty(monkeypatch):
     mock_title.assert_not_called()
 
 
-def test_prompt_submit_surfaces_backend_error_as_visible_text(monkeypatch):
+def test_prompt_submit_surfaces_backend_error_as_visible_text(monkeypatch, tmp_path):
     """When the backend fails with no visible response (e.g. invalid model slug
     → provider 4xx), the TUI must surface result['error'] as visible text
     instead of emitting a blank message.complete turn."""
@@ -3969,6 +3982,7 @@ def test_prompt_submit_surfaces_backend_error_as_visible_text(monkeypatch):
             }
 
     server._sessions["sid"] = _session(agent=_Agent())
+    _canonical_tui_db(monkeypatch, tmp_path)
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
 
     emitted: list[tuple[str, str, dict]] = []
@@ -3979,7 +3993,6 @@ def test_prompt_submit_surfaces_backend_error_as_visible_text(monkeypatch):
     )
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
-    monkeypatch.setattr(server, "_get_db", lambda: None)
 
     server.handle_request(
         {
@@ -3997,7 +4010,7 @@ def test_prompt_submit_surfaces_backend_error_as_visible_text(monkeypatch):
     assert "kimi-k2.6" in payload.get("text", "")
 
 
-def test_prompt_submit_preserves_empty_response_without_error(monkeypatch):
+def test_prompt_submit_preserves_empty_response_without_error(monkeypatch, tmp_path):
     """An empty final_response with NO backend error must stay empty — do not
     synthesize an error string. Preserves the existing None/empty-sentinel
     semantics owned by downstream handlers."""
@@ -4014,6 +4027,7 @@ def test_prompt_submit_preserves_empty_response_without_error(monkeypatch):
             }
 
     server._sessions["sid"] = _session(agent=_Agent())
+    _canonical_tui_db(monkeypatch, tmp_path)
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
 
     emitted: list[tuple[str, str, dict]] = []
@@ -4024,7 +4038,6 @@ def test_prompt_submit_preserves_empty_response_without_error(monkeypatch):
     )
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
-    monkeypatch.setattr(server, "_get_db", lambda: None)
 
     server.handle_request(
         {
@@ -4104,7 +4117,7 @@ def test_session_active_list_reports_live_sessions(monkeypatch):
     assert rows["sid-b"]["preview"] == "writing code"
 
 
-def test_session_activate_returns_inflight_stream_before_completion(monkeypatch):
+def test_session_activate_returns_inflight_stream_before_completion(monkeypatch, tmp_path):
     """Switching into a still-running live session must hydrate partial output.
 
     The committed session history is only updated after run_conversation returns,
@@ -4134,9 +4147,9 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
             }
 
     server._sessions["sid-live"] = _session(agent=_Agent())
+    _canonical_tui_db(monkeypatch, tmp_path)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
-    monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
 
     def _emit(event, sid, payload=None):
@@ -5159,7 +5172,7 @@ def test_config_show_displays_nested_max_turns(monkeypatch):
     assert ["Max Turns", "120"] in agent_rows
 
 
-def test_notification_poller_delivers_completion(monkeypatch):
+def test_notification_poller_delivers_completion(monkeypatch, tmp_path):
     """Poller picks up completion events and triggers agent turns."""
     from tools.process_registry import process_registry
 
@@ -5182,6 +5195,7 @@ def test_notification_poller_delivers_completion(monkeypatch):
 
     sess = _session(agent=_Agent())
     server._sessions["sid_poll"] = sess
+    _canonical_tui_db(monkeypatch, tmp_path)
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
     monkeypatch.setattr(server, "_emit", lambda *a, **kw: emitted.append(a))
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
@@ -5271,8 +5285,8 @@ def test_notification_poller_skips_consumed(monkeypatch):
             process_registry.completion_queue.get_nowait()
 
 
-def test_notification_poller_requeues_when_busy(monkeypatch):
-    """When the agent is busy, the poller requeues the event."""
+def test_notification_poller_persists_before_busy_scheduling(monkeypatch, tmp_path):
+    """A busy session keeps the completion in SessionDB, not only a local queue."""
     import queue as _queue_mod
 
     from tools.process_registry import process_registry
@@ -5282,6 +5296,15 @@ def test_notification_poller_requeues_when_busy(monkeypatch):
     sess = _session(running=True)  # agent is busy
     server._sessions["sid_busy"] = sess
     monkeypatch.setattr(server, "_emit", lambda *a, **kw: emitted.append(a))
+    db = _canonical_tui_db(monkeypatch, tmp_path)
+    active = server._admit_tui_turn(
+        "sid_busy",
+        sess,
+        "active turn",
+        event_type="tui.prompt",
+        source_identity="tui:prompt:session-key:active",
+    )
+    assert active["outcome"] == "claimed"
 
     # Isolate the completion queue for the duration of this test. The poller
     # reads process_registry.completion_queue by attribute at runtime, so a
@@ -5311,9 +5334,13 @@ def test_notification_poller_requeues_when_busy(monkeypatch):
         status_calls = [a for a in emitted if a[0] == "status.update"]
         assert len(status_calls) == 1
 
-        # Event was requeued (agent was busy, no turn triggered)
-        assert not isolated_queue.empty()
-        requeued = isolated_queue.get_nowait()
-        assert requeued["session_id"] == "proc_busy_test"
+        # The local transport was consumed only after the event became a
+        # durable queued logical turn behind the active lease.
+        assert isolated_queue.empty()
+        turns = db.list_session_logical_turns("session-key")
+        assert len(turns) == 2
+        queued = [turn for turn in turns if turn["state"] == "queued"]
+        assert len(queued) == 1
+        assert queued[0]["source_identity"] == "tui:process:completion:proc_busy_test"
     finally:
         server._sessions.pop("sid_busy", None)

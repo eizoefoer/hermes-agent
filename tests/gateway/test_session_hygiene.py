@@ -21,6 +21,7 @@ from agent.model_metadata import estimate_messages_tokens_rough
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.session import SessionEntry, SessionSource
+from hermes_state import SessionDB
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +76,12 @@ class HygieneCaptureAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id: str):
         return {"id": chat_id}
+
+
+def _attach_durable_session(runner, tmp_path, session_id="sess-1"):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(session_id, "telegram")
+    runner._session_db = db
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +358,7 @@ async def test_session_hygiene_messages_stay_in_originating_topic(monkeypatch, t
     runner._running_agents = {}
     runner._pending_messages = {}
     runner._pending_approvals = {}
-    runner._session_db = None
+    _attach_durable_session(runner, tmp_path)
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
     runner._run_agent = AsyncMock(
@@ -460,7 +467,7 @@ async def test_session_hygiene_warns_user_when_compression_aborts(monkeypatch, t
     runner._running_agents = {}
     runner._pending_messages = {}
     runner._pending_approvals = {}
-    runner._session_db = None
+    _attach_durable_session(runner, tmp_path)
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
     runner._run_agent = AsyncMock(
@@ -580,7 +587,7 @@ async def test_session_hygiene_informs_user_when_aux_model_fails_but_recovers(mo
     runner._running_agents = {}
     runner._pending_messages = {}
     runner._pending_approvals = {}
-    runner._session_db = None
+    _attach_durable_session(runner, tmp_path)
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
     runner._run_agent = AsyncMock(
@@ -709,7 +716,7 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
     runner._running_agents = {}
     runner._pending_messages = {}
     runner._pending_approvals = {}
-    runner._session_db = None
+    _attach_durable_session(runner, tmp_path)
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
     runner._run_agent = AsyncMock(
@@ -812,7 +819,7 @@ async def test_session_hygiene_default_hard_message_limit_does_not_fire_at_12_me
     runner._running_agents = {}
     runner._pending_messages = {}
     runner._pending_approvals = {}
-    runner._session_db = None
+    _attach_durable_session(runner, tmp_path)
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
     runner._run_agent = AsyncMock(

@@ -1340,6 +1340,22 @@ class MessageEvent:
     # completion notifications) that must bypass user authorization checks.
     internal: bool = False
 
+    # Stable identity for future work. A reply/message id is only an outbound
+    # anchor and cannot deduplicate an unrelated synthetic logical turn.
+    session_event_id: Optional[str] = None
+    # Acceptance-time identity for transports that do not provide a stable
+    # replay key.  A new MessageEvent is a new occurrence; rehydration must
+    # restore this value from the durable payload instead of generating again.
+    occurrence_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    session_event_type: Optional[str] = None
+    task_id: Optional[str] = None
+    goal_id: Optional[str] = None
+    delegation_id: Optional[str] = None
+    barrier_id: Optional[str] = None
+    parent_logical_turn_id: Optional[str] = None
+    branch: Optional[str] = None
+    worktree: Optional[str] = None
+
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
     
@@ -4117,6 +4133,21 @@ class BasePlatformAdapter(ABC):
                 event,
                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
             )
+
+            # Gateway execution is already terminal before platform delivery.
+            # Report only an explicit adapter send acknowledgement here; a
+            # missing/failed send remains a durable delivery obligation and
+            # must never cause the model/tools to execute again on recovery.
+            delivery_callback = getattr(event, "_logical_turn_delivery_callback", None)
+            if delivery_callback is not None:
+                try:
+                    delivery_callback(
+                        event,
+                        delivery_succeeded,
+                        None if delivery_succeeded else "no successful delivery acknowledgement",
+                    )
+                except Exception:
+                    logger.warning("[%s] durable logical-turn delivery record failed", self.name, exc_info=True)
 
             # The active drain owns debounce state. If a queue-mode timer has
             # not fired yet, force-flush into _pending_messages here and let

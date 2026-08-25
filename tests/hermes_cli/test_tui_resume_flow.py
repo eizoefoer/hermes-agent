@@ -797,7 +797,34 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
     from hermes_cli.oneshot import _run_agent
 
     captured = {}
-    sentinel_db = object()
+    class SentinelDB:
+        """Fixture contract for oneshot's durable admission, not just recall."""
+        def reconcile_logical_turns(self):
+            return 0
+
+        def get_session(self, session_id):
+            return {"id": session_id}
+
+        def create_session(self, session_id, source):
+            raise AssertionError("existing fixture session should be reused")
+
+        def admit_session_event(self, **kwargs):
+            captured["admission"] = kwargs
+            return {"logical_turn_id": "turn-1"}
+
+        def claim_logical_turn(self, logical_turn_id, **kwargs):
+            return {"outcome": "claimed", "attempt_id": "attempt-1"}
+
+        def mark_logical_turn_started(self, logical_turn_id, attempt_id):
+            captured["started"] = (logical_turn_id, attempt_id)
+
+        def complete_logical_turn(self, logical_turn_id, attempt_id, result):
+            captured["completed"] = (logical_turn_id, attempt_id, result)
+
+        def fail_logical_turn(self, *args, **kwargs):
+            raise AssertionError("successful fixture must not fail")
+
+    sentinel_db = SentinelDB()
 
     class FakeAgent:
         def __init__(self, **kwargs):
@@ -806,9 +833,10 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
             self.stream_delta_callback = object()
             self.tool_gen_callback = object()
 
-        def chat(self, prompt):
-            captured["prompt"] = prompt
-            return "ok"
+        def run_conversation(self, *, user_message, task_id):
+            captured["prompt"] = user_message
+            assert task_id is None
+            return {"final_response": "ok"}
 
     class FakeSessionDB:
         def __new__(cls):
@@ -856,6 +884,9 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
     assert captured["session_db"] is sentinel_db
     assert captured["enabled_toolsets"] == ["session_search"]
     assert captured["prompt"] == "recall this"
+    assert captured["admission"]["event_type"] == "cli-oneshot"
+    assert captured["started"] == ("turn-1", "attempt-1")
+    assert captured["completed"][2]["response"] == "ok"
 
 
 def test_launch_tui_exports_model_provider_and_toolsets(monkeypatch, main_mod):

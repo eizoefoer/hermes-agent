@@ -867,6 +867,22 @@ class TestDeliverResultErrorReturns:
         assert "no delivery target" in result
 
 
+def _canonical_session_db_mock():
+    """Unit fixture implementing the canonical admission/lease contract."""
+    db = MagicMock()
+    db.get_session.return_value = None
+    db.admit_session_event.return_value = {
+        "logical_turn_id": "cron-test-turn",
+        "state": "queued",
+    }
+    db.claim_logical_turn.return_value = {
+        "outcome": "claimed",
+        "attempt_id": "cron-test-attempt",
+    }
+    db.get_logical_turn.return_value = {"state": "completed"}
+    return db
+
+
 class TestRunJobSessionPersistence:
     def test_run_job_passes_session_db_and_cron_platform(self, tmp_path):
         job = {
@@ -874,7 +890,7 @@ class TestRunJobSessionPersistence:
             "name": "test",
             "prompt": "hello",
         }
-        fake_db = MagicMock()
+        fake_db = _canonical_session_db_mock()
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
              patch("cron.scheduler._resolve_origin", return_value=None), \
@@ -909,8 +925,48 @@ class TestRunJobSessionPersistence:
         call_args = fake_db.end_session.call_args
         assert call_args[0][0].startswith("cron_test-job_")
         assert call_args[0][1] == "cron_complete"
-        fake_db.close.assert_called_once()
+        # One handle records admission and one owns execution.
+        assert fake_db.close.call_count == 2
         mock_agent.close.assert_called_once()
+
+
+class TestRunJobSessionPersistenceAndDurability:
+    def test_same_occurrence_replay_is_idempotent_and_distinct_ticks_are_unique(self, tmp_path, monkeypatch):
+        from cron.scheduler import _admit_cron_occurrence
+        from hermes_state import SessionDB
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr("hermes_state.DEFAULT_DB_PATH", tmp_path / "state.db")
+        first = {"id": "durable-job", "prompt": "same", "_cron_occurrence_id": "2026-08-24T10:00:00Z"}
+        replay = dict(first)
+        later = {"id": "durable-job", "prompt": "same", "_cron_occurrence_id": "2026-08-24T10:01:00Z"}
+
+        one = _admit_cron_occurrence(first)
+        duplicate = _admit_cron_occurrence(replay)
+        two = _admit_cron_occurrence(later)
+
+        assert duplicate["logical_turn_id"] == one["logical_turn_id"]
+        assert two["logical_turn_id"] != one["logical_turn_id"]
+        db = SessionDB(db_path=tmp_path / "state.db")
+        assert db.count_logical_turns() == 2
+
+    def test_unexpired_cron_lease_is_not_reconciled_or_stolen(self, tmp_path, monkeypatch):
+        from cron.scheduler import _admit_cron_occurrence
+        from hermes_state import SessionDB
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr("hermes_state.DEFAULT_DB_PATH", tmp_path / "state.db")
+        job = {"id": "owned-job", "prompt": "work", "_cron_occurrence_id": "tick-1"}
+        turn = _admit_cron_occurrence(job)
+        db = SessionDB(db_path=tmp_path / "state.db")
+        claim = db.claim_logical_turn(turn["logical_turn_id"], owner="other", pid=999999)
+        db.mark_logical_turn_started(turn["logical_turn_id"], claim["attempt_id"])
+
+        assert db.reconcile_logical_turns() == 0
+        assert db.claim_logical_turn(
+            turn["logical_turn_id"], owner="replacement", pid=1
+        )["outcome"] == "busy"
+        assert db.get_logical_turn(turn["logical_turn_id"])["current_attempt_id"] == claim["attempt_id"]
 
     def test_run_job_closes_agent_on_failure_to_prevent_fd_leak(self, tmp_path):
         # Regression: if ``run_conversation`` raises, the ephemeral cron
@@ -921,7 +977,7 @@ class TestRunJobSessionPersistence:
             "name": "failing",
             "prompt": "hello",
         }
-        fake_db = MagicMock()
+        fake_db = _canonical_session_db_mock()
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
              patch("cron.scheduler._resolve_origin", return_value=None), \
@@ -958,7 +1014,7 @@ class TestRunJobSessionPersistence:
             "name": "aux-clean",
             "prompt": "hello",
         }
-        fake_db = MagicMock()
+        fake_db = _canonical_session_db_mock()
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
              patch("cron.scheduler._resolve_origin", return_value=None), \
@@ -986,7 +1042,7 @@ class TestRunJobSessionPersistence:
 
     def _make_run_job_patches(self, tmp_path):
         """Common patches for run_job tests."""
-        fake_db = MagicMock()
+        fake_db = _canonical_session_db_mock()
         return fake_db, [
             patch("cron.scheduler._hermes_home", tmp_path),
             patch("cron.scheduler._resolve_origin", return_value=None),
@@ -1125,7 +1181,7 @@ class TestRunJobSessionPersistence:
             "name": "silent test",
             "prompt": "do work via tools only",
         }
-        fake_db = MagicMock()
+        fake_db = _canonical_session_db_mock()
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
              patch("cron.scheduler._resolve_origin", return_value=None), \
@@ -1201,7 +1257,7 @@ class TestRunJobSessionPersistence:
             "name": "failing api",
             "prompt": "do something",
         }
-        fake_db = MagicMock()
+        fake_db = _canonical_session_db_mock()
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
              patch("cron.scheduler._resolve_origin", return_value=None), \
@@ -1240,7 +1296,7 @@ class TestRunJobSessionPersistence:
             "name": "ok",
             "prompt": "hello",
         }
-        fake_db = MagicMock()
+        fake_db = _canonical_session_db_mock()
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
              patch("cron.scheduler._resolve_origin", return_value=None), \
@@ -1287,7 +1343,7 @@ class TestRunJobSessionPersistence:
             "last_status": None,
         }
 
-        fake_db = MagicMock()
+        fake_db = _canonical_session_db_mock()
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
              patch("cron.scheduler.get_due_jobs", return_value=[job]), \
@@ -1312,7 +1368,7 @@ class TestRunJobSessionPersistence:
             "prompt": "hello",
             "deliver": "telegram",
         }
-        fake_db = MagicMock()
+        fake_db = _canonical_session_db_mock()
         seen = {}
 
         (tmp_path / ".env").write_text("TELEGRAM_HOME_CHANNEL=-2002\n")
@@ -1358,7 +1414,7 @@ class TestRunJobSessionPersistence:
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_PLATFORM") is None
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID") is None
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID") is None
-        fake_db.close.assert_called_once()
+        assert fake_db.close.call_count == 2
 
     def test_run_job_clears_stale_auto_delivery_thread_id_between_jobs(self, tmp_path, monkeypatch):
         jobs = [
@@ -1375,7 +1431,7 @@ class TestRunJobSessionPersistence:
                 "deliver": "telegram:-2002",
             },
         ]
-        fake_db = MagicMock()
+        fake_db = _canonical_session_db_mock()
         seen = []
 
         monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_PLATFORM", raising=False)
@@ -1432,7 +1488,7 @@ class TestRunJobSessionPersistence:
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_PLATFORM") is None
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID") is None
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID") is None
-        assert fake_db.close.call_count == 2
+        assert fake_db.close.call_count == 4
 
 
 class TestRunJobConfigLogging:
@@ -1524,7 +1580,7 @@ class TestRunJobConfigEnvVarExpansion:
         monkeypatch.setenv("_HERMES_TEST_CRON_MODEL", "gpt-4o-mini-cron-test")
 
         job = {"id": "env-job", "name": "env test", "prompt": "hi"}
-        fake_db = MagicMock()
+        fake_db = _canonical_session_db_mock()
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
              patch("cron.scheduler._resolve_origin", return_value=None), \
@@ -1556,7 +1612,7 @@ class TestRunJobConfigEnvVarExpansion:
         monkeypatch.setenv("_HERMES_TEST_CRON_FALLBACK", "gpt-4o-fallback-test")
 
         job = {"id": "fb-job", "name": "fallback test", "prompt": "hi"}
-        fake_db = MagicMock()
+        fake_db = _canonical_session_db_mock()
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
              patch("cron.scheduler._resolve_origin", return_value=None), \
@@ -1585,7 +1641,7 @@ class TestRunJobConfigEnvVarExpansion:
         monkeypatch.delenv("_HERMES_TEST_CRON_UNSET_VAR", raising=False)
 
         job = {"id": "unset-job", "name": "unset var test", "prompt": "hi"}
-        fake_db = MagicMock()
+        fake_db = _canonical_session_db_mock()
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
              patch("cron.scheduler._resolve_origin", return_value=None), \
@@ -1614,7 +1670,7 @@ class TestRunJobSkillBacked:
             "skill": "notion",
         }
 
-        fake_db = MagicMock()
+        fake_db = _canonical_session_db_mock()
 
         def _skill_view(name):
             assert name == "notion"
@@ -1666,7 +1722,7 @@ class TestRunJobSkillBacked:
             "skill": "google-workspace",
         }
 
-        fake_db = MagicMock()
+        fake_db = _canonical_session_db_mock()
 
         # Create a credential file so register_credential_file succeeds
         cred_dir = tmp_path / "credentials"
@@ -1725,7 +1781,7 @@ class TestRunJobSkillBacked:
             "skill": "blogwatcher",
         }
 
-        fake_db = MagicMock()
+        fake_db = _canonical_session_db_mock()
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
              patch("cron.scheduler._resolve_origin", return_value=None), \
@@ -1768,7 +1824,7 @@ class TestRunJobSkillBacked:
             "skills": ["blogwatcher", "maps"],
         }
 
-        fake_db = MagicMock()
+        fake_db = _canonical_session_db_mock()
 
         def _skill_view(name):
             return json.dumps({"success": True, "content": f"# {name}\nInstructions for {name}."})

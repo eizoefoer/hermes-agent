@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import uuid
 from contextlib import redirect_stderr, redirect_stdout
 from typing import Optional
 
@@ -227,7 +228,7 @@ def run_oneshot(
 
 
 def _create_session_db_for_oneshot():
-    """Best-effort SessionDB for ``hermes -z`` / oneshot mode.
+    """Create SessionDB for ``hermes -z`` / oneshot mode.
 
     Oneshot bypasses ``HermesCLI._init_agent()``, so it must wire the SQLite
     session store itself. Without this, the ``session_search``/recall tool is
@@ -238,8 +239,7 @@ def _create_session_db_for_oneshot():
 
         return SessionDB()
     except Exception as exc:
-        logging.debug("SQLite session store not available for oneshot mode: %s", exc)
-        return None
+        raise RuntimeError(f"SessionDB unavailable for hermes -z: {exc}") from exc
 
 
 def _run_agent(
@@ -327,12 +327,38 @@ def _run_agent(
     if toolsets_list is None and use_config_toolsets:
         toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
 
+    # A caller that needs replay/recovery may provide both identities (the
+    # public CLI syntax remains unchanged). A normal invocation gets a fresh
+    # event/session, so two legitimate identical prompts are distinct.
+    session_id = os.getenv("HERMES_ONESHOT_SESSION_ID", "").strip() or f"oneshot-{uuid.uuid4().hex}"
+    source_identity = os.getenv("HERMES_ONESHOT_SOURCE_ID", "").strip() or f"cli:oneshot:{session_id}"
     session_db = _create_session_db_for_oneshot()
+    session_db.reconcile_logical_turns()
+    if not session_db.get_session(session_id):
+        session_db.create_session(session_id, "cli-oneshot")
+    admitted = session_db.admit_session_event(
+        session_id=session_id,
+        session_key=f"cli:{session_id}",
+        source_identity=source_identity,
+        event_type="cli-oneshot",
+        payload={"text": prompt, "source": "cli-oneshot"},
+        task_id=None,
+        goal_id=None,
+    )
+    claim = session_db.claim_logical_turn(
+        admitted["logical_turn_id"], owner=f"cli-oneshot:{os.getpid()}", pid=os.getpid()
+    )
+    if claim.get("outcome") == "terminal":
+        return str((claim.get("turn") or {}).get("result", {}).get("response") or "")
+    if claim.get("outcome") != "claimed":
+        raise RuntimeError(f"oneshot logical turn is {claim.get('outcome')}")
+    session_db.mark_logical_turn_started(admitted["logical_turn_id"], claim["attempt_id"])
     # Read the effective fallback chain from profile config so oneshot workers
     # honour the same merge semantics as interactive CLI and gateway sessions.
     _fb = get_fallback_chain(cfg)
 
-    agent = AIAgent(
+    try:
+        agent = AIAgent(
         api_key=runtime.get("api_key"),
         base_url=runtime.get("base_url"),
         provider=runtime.get("provider"),
@@ -341,6 +367,7 @@ def _run_agent(
         enabled_toolsets=toolsets_list,
         quiet_mode=True,
         platform="cli",
+        session_id=session_id,
         session_db=session_db,
         credential_pool=runtime.get("credential_pool"),
         fallback_model=_fb or None,
@@ -355,8 +382,14 @@ def _run_agent(
         #                (set above); also falls back to deny on non-tty
         #   - dangerous-command approval → bypassed via HERMES_YOLO_MODE=1
         #   - skill secret capture → returns gracefully when no callback set
-        clarify_callback=_oneshot_clarify_callback,
-    )
+            clarify_callback=_oneshot_clarify_callback,
+        )
+    except BaseException as exc:
+        session_db.fail_logical_turn(
+            admitted["logical_turn_id"], claim["attempt_id"],
+            f"agent construction failed: {exc}", retryable=True,
+        )
+        raise
 
     # Belt-and-braces: make sure AIAgent doesn't invoke any streaming
     # display callbacks that would bypass our stdout capture.
@@ -364,7 +397,25 @@ def _run_agent(
     agent.stream_delta_callback = None
     agent.tool_gen_callback = None
 
-    return agent.chat(prompt) or ""
+    try:
+        result = agent.run_conversation(user_message=prompt, task_id=None)
+    except BaseException as exc:
+        session_db.fail_logical_turn(
+            admitted["logical_turn_id"], claim["attempt_id"], str(exc), retryable=True
+        )
+        raise
+    if result.get("failed") or result.get("error") or result.get("interrupted"):
+        session_db.fail_logical_turn(
+            admitted["logical_turn_id"], claim["attempt_id"],
+            str(result.get("error") or "oneshot turn failed"),
+            retryable=bool(result.get("interrupted")),
+        )
+    else:
+        session_db.complete_logical_turn(
+            admitted["logical_turn_id"], claim["attempt_id"],
+            {"response": result.get("final_response", "")},
+        )
+    return result.get("final_response", "") or ""
 
 
 def _oneshot_clarify_callback(question: str, choices=None) -> str:

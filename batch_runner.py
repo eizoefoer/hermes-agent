@@ -58,6 +58,12 @@ from model_tools import TOOL_TO_TOOLSET_MAP
 # Global configuration for worker processes
 _WORKER_CONFIG = {}
 
+# Phase-1 producer classification: E (ephemeral one-shot).  A batch item has
+# no persisted/reused Hermes session contract.  Checkpoint resume preserves
+# completed output artifacts and reruns unfinished items from scratch; it does
+# not resume an agent conversation or execution lease.
+BATCH_EXECUTION_CLASS = "E_EPHEMERAL_ONE_SHOT"
+
 # All possible tools - auto-derived from the master mapping in model_tools.py.
 # This stays in sync automatically when new tools are added to TOOL_TO_TOOLSET_MAP.
 # Used for consistent schema in Arrow/Parquet (HuggingFace datasets) and for
@@ -1318,4 +1324,3 @@ def main(
 
 if __name__ == "__main__":
     fire.Fire(main)
-

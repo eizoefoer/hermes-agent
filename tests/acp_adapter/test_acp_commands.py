@@ -47,6 +47,9 @@ class CaptureConn:
 
 
 class NoopDb:
+    def __init__(self):
+        self.turns = []
+
     def get_session(self, *_args, **_kwargs):
         return None
 
@@ -54,6 +57,50 @@ class NoopDb:
         return None
 
     def update_session(self, *_args, **_kwargs):
+        return None
+
+    def replace_messages(self, *_args, **_kwargs):
+        return None
+
+    def admit_session_event(self, **kwargs):
+        turn = {
+            "logical_turn_id": f"turn-{len(self.turns) + 1}",
+            "session_id": kwargs["session_id"],
+            "state": "queued",
+            "payload": {**kwargs.get("payload", {}), "event_type": kwargs["event_type"]},
+        }
+        self.turns.append(turn)
+        return turn
+
+    def claim_logical_turn(self, logical_turn_id, **_kwargs):
+        turn = next(t for t in self.turns if t["logical_turn_id"] == logical_turn_id)
+        if turn["state"] == "completed":
+            return {"outcome": "terminal"}
+        turn["state"] = "claimed"
+        return {"outcome": "claimed", "attempt_id": f"attempt-{logical_turn_id}"}
+
+    def mark_logical_turn_started(self, *_args, **_kwargs):
+        return None
+
+    def complete_logical_turn(self, logical_turn_id, _attempt_id, *_args, **_kwargs):
+        next(t for t in self.turns if t["logical_turn_id"] == logical_turn_id)["state"] = "completed"
+
+    def fail_logical_turn(self, logical_turn_id, _attempt_id, *_args, **_kwargs):
+        next(t for t in self.turns if t["logical_turn_id"] == logical_turn_id)["state"] = "failed"
+
+    def reconcile_logical_turns(self):
+        return 0
+
+    def list_ready_logical_turns(self, **_kwargs):
+        return [t for t in self.turns if t["state"] == "queued"]
+
+    def begin_logical_turn_delivery(self, *_args, **_kwargs):
+        return None
+
+    def acknowledge_logical_turn_delivery(self, *_args, **_kwargs):
+        return None
+
+    def fail_logical_turn_delivery(self, *_args, **_kwargs):
         return None
 
 
@@ -177,14 +224,18 @@ async def test_acp_queue_slash_command_adds_next_turn_without_running_now():
     )
 
     assert response.stop_reason == "end_turn"
-    assert state.queued_prompts == ["run the tests after this"]
+    ready = acp_agent.session_manager._get_db().list_ready_logical_turns()
+    assert [turn["payload"]["user_text"] for turn in ready] == ["run the tests after this"]
     assert fake.runs == []
 
 
 @pytest.mark.asyncio
 async def test_acp_prompt_drains_queued_turns_after_current_run():
     acp_agent, state, fake, conn = make_agent_and_state()
-    state.queued_prompts.append("then run tests")
+    await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="/queue then run tests")],
+    )
 
     response = await acp_agent.prompt(
         session_id=state.session_id,

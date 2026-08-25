@@ -758,6 +758,44 @@ def test_command_dispatch_retry_handles_multipart_content(server):
     assert result["message"] == "analyze this"
 
 
+def test_command_dispatch_retry_while_busy_routes_to_durable_prompt_submit(server):
+    """Busy /retry is forwarded as a new prompt instead of ownership rejection."""
+    sid = "test-session"
+    history = [
+        {"role": "user", "content": "previous request"},
+        {"role": "assistant", "content": "previous answer"},
+    ]
+    server._sessions[sid] = {
+        "session_key": sid,
+        "agent": None,
+        "history": list(history),
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "inflight_turn": {
+            "assistant": "partial",
+            "streaming": True,
+            "user": "current request",
+        },
+        "running": True,
+    }
+
+    resp = server.handle_request({
+        "id": "busy-retry",
+        "method": "command.dispatch",
+        "params": {"name": "retry", "session_id": sid},
+    })
+
+    assert "error" not in resp
+    assert resp["result"]["type"] == "send"
+    assert resp["result"]["message"] == "current request"
+    assert "queued" in resp["result"]["notice"].lower()
+    # Current execution still owns its history mutation window. Ink submits
+    # the returned message through prompt.submit, where SessionDB admission
+    # durably queues the new reasoning turn.
+    assert server._sessions[sid]["history"] == history
+    assert server._sessions[sid]["history_version"] == 0
+
+
 def test_command_dispatch_returns_skill_payload(server):
     """command.dispatch returns structured skill payload for the TUI to send()."""
     sid = "test-session"

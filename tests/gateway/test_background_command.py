@@ -5,6 +5,9 @@ background session) across gateway messenger platforms.
 """
 
 import asyncio
+import os
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -12,6 +15,7 @@ import pytest
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
+from hermes_state import SessionDB
 
 
 def _make_event(text="/background", platform=Platform.TELEGRAM,
@@ -32,7 +36,9 @@ def _make_runner():
     runner = object.__new__(GatewayRunner)
     runner.adapters = {}
     runner._voice_mode = {}
-    runner._session_db = None
+    runner._session_db = SessionDB(
+        db_path=Path(os.environ["HERMES_HOME"]) / "state.db"
+    )
     runner._reasoning_config = None
     runner._provider_routing = {}
     runner._fallback_model = None
@@ -40,12 +46,47 @@ def _make_runner():
     runner._background_tasks = set()
 
     mock_store = MagicMock()
+    mock_store.get_or_create_session.return_value = SimpleNamespace(
+        session_id="gateway-background-parent",
+        session_key="telegram:parent",
+    )
     runner.session_store = mock_store
+
+    if not runner._session_db.get_session("gateway-background-parent"):
+        runner._session_db.create_session("gateway-background-parent", "telegram")
 
     from gateway.hooks import HookRegistry
     runner.hooks = HookRegistry()
 
     return runner
+
+
+@pytest.fixture(autouse=True)
+def _isolated_state(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+
+async def _run_admitted_background(runner, prompt, source, task_id, **kwargs):
+    event = MessageEvent(
+        text=f"/background {prompt}",
+        source=source,
+        message_id=f"event-{task_id}",
+    )
+    admitted = runner._admit_gateway_background_turn(event, prompt)
+    claim = admitted["claim"]
+    assert claim["outcome"] == "claimed"
+    await runner._run_background_task(
+        prompt,
+        source,
+        admitted["task_id"],
+        logical_turn_id=admitted["logical_turn_id"],
+        attempt_id=claim["attempt_id"],
+        **kwargs,
+    )
+    return admitted
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +225,94 @@ class TestHandleBackgroundCommand:
                 result = await runner._handle_background_command(event)
                 assert "Background task started" in result
 
+    @pytest.mark.asyncio
+    async def test_child_is_durable_before_started_ack_and_parent_replay_is_idempotent(self):
+        runner = _make_runner()
+        created = []
+
+        def capture_task(coro, *args, **kwargs):
+            coro.close()
+            task = MagicMock()
+            created.append(task)
+            return task
+
+        event = _make_event(text="/background identical work")
+        event.message_id = "authoritative-message-1"
+        with patch("gateway.run.asyncio.create_task", side_effect=capture_task):
+            first = await runner._handle_background_command(event)
+            replay = await runner._handle_background_command(event)
+
+        turns = [
+            turn
+            for session in runner._session_db.list_sessions_rich(
+                source="gateway-background", limit=20, include_children=True
+            )
+            for turn in runner._session_db.list_session_logical_turns(session["id"])
+        ]
+        assert first == replay
+        assert len(created) == 1
+        assert len(turns) == 1
+        assert turns[0]["state"] == "executing"
+        assert turns[0]["task_id"] == turns[0]["session_id"]
+        assert runner._session_db.get_session_turn_lease(turns[0]["session_id"])
+
+    @pytest.mark.asyncio
+    async def test_identical_commands_with_distinct_message_ids_create_distinct_children(self):
+        runner = _make_runner()
+
+        def capture_task(coro, *args, **kwargs):
+            coro.close()
+            return MagicMock()
+
+        first_event = _make_event(text="/background same text")
+        first_event.message_id = "message-a"
+        second_event = _make_event(text="/background same text")
+        second_event.message_id = "message-b"
+        with patch("gateway.run.asyncio.create_task", side_effect=capture_task):
+            first = await runner._handle_background_command(first_event)
+            second = await runner._handle_background_command(second_event)
+
+        sessions = runner._session_db.list_sessions_rich(
+            source="gateway-background", limit=20, include_children=True
+        )
+        assert first != second
+        assert len(sessions) == 2
+        assert len({session["id"] for session in sessions}) == 2
+
+    @pytest.mark.asyncio
+    async def test_unexpired_background_lease_is_not_stolen_then_expiry_recovers(self):
+        runner = _make_runner()
+        event = _make_event(text="/background survive restart")
+        event.message_id = "restart-message"
+        admitted = runner._admit_gateway_background_turn(event, "survive restart")
+        original = runner._session_db.get_logical_turn(admitted["logical_turn_id"])
+        original_lease = runner._session_db.get_session_turn_lease(admitted["task_id"])
+        runner._run_background_task = AsyncMock()
+
+        # A valid durable lease remains authoritative even though no local
+        # asyncio task owns it in this replacement runner.
+        assert await runner._drain_startup_logical_turns(limit=10) == 0
+        assert runner._run_background_task.await_count == 0
+        assert runner._session_db.get_session_turn_lease(admitted["task_id"]) == original_lease
+        assert runner._session_db.get_logical_turn(admitted["logical_turn_id"])["attempt_count"] == 1
+
+        assert runner._session_db.renew_session_turn_lease(
+            admitted["task_id"],
+            original["lease_holder"],
+            original["current_attempt_id"],
+            ttl_seconds=-1,
+        )
+        assert runner._session_db.reconcile_logical_turns() == 1
+        assert await runner._drain_startup_logical_turns(limit=10) == 1
+        if runner._background_tasks:
+            await asyncio.gather(*list(runner._background_tasks))
+
+        recovered = runner._session_db.get_logical_turn(admitted["logical_turn_id"])
+        assert runner._run_background_task.await_count == 1
+        assert runner._run_background_task.call_args.kwargs["logical_turn_id"] == admitted["logical_turn_id"]
+        assert recovered["attempt_count"] == 2
+        assert recovered["current_attempt_id"] != original["current_attempt_id"]
+
 
 # ---------------------------------------------------------------------------
 # _run_background_task
@@ -204,7 +333,7 @@ class TestRunBackgroundTask:
             user_name="testuser",
         )
         # No adapters set — should not raise
-        await runner._run_background_task("test prompt", source, "bg_test")
+        await _run_admitted_background(runner, "test prompt", source, "bg_test")
 
     @pytest.mark.asyncio
     async def test_no_credentials_sends_error(self):
@@ -222,7 +351,7 @@ class TestRunBackgroundTask:
         )
 
         with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": None}):
-            await runner._run_background_task("test prompt", source, "bg_test")
+            await _run_admitted_background(runner, "test prompt", source, "bg_test")
 
         # Should have sent an error message
         mock_adapter.send.assert_called_once()
@@ -256,7 +385,7 @@ class TestRunBackgroundTask:
             mock_agent_instance.run_conversation.return_value = mock_result
             MockAgent.return_value = mock_agent_instance
 
-            await runner._run_background_task("say hello", source, "bg_test")
+            await _run_admitted_background(runner, "say hello", source, "bg_test")
 
         # Should have sent the result
         mock_adapter.send.assert_called_once()
@@ -304,7 +433,8 @@ class TestRunBackgroundTask:
             thread_id="20197",
         )
 
-        await runner._run_background_task(
+        await _run_admitted_background(
+            runner,
             "say hello",
             source,
             "bg_test",
@@ -342,7 +472,7 @@ class TestRunBackgroundTask:
             mock_agent_instance.run_conversation.side_effect = RuntimeError("boom")
             MockAgent.return_value = mock_agent_instance
 
-            await runner._run_background_task("say hello", source, "bg_test")
+            await _run_admitted_background(runner, "say hello", source, "bg_test")
 
         mock_adapter.send.assert_called_once()
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
@@ -364,7 +494,7 @@ class TestRunBackgroundTask:
         )
 
         with patch("gateway.run._resolve_runtime_agent_kwargs", side_effect=RuntimeError("boom")):
-            await runner._run_background_task("test prompt", source, "bg_test")
+            await _run_admitted_background(runner, "test prompt", source, "bg_test")
 
         mock_adapter.send.assert_called_once()
         call_args = mock_adapter.send.call_args

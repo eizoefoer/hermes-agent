@@ -438,7 +438,7 @@ def auth_adapter():
 
 class TestAgentExecution:
     @pytest.mark.asyncio
-    async def test_run_agent_uses_session_id_as_task_id(self, adapter):
+    async def test_run_agent_does_not_fabricate_task_id_from_session(self, adapter):
         mock_agent = MagicMock()
         mock_agent.run_conversation.return_value = {"final_response": "ok"}
         mock_agent.session_prompt_tokens = 1
@@ -462,7 +462,7 @@ class TestAgentExecution:
         mock_agent.run_conversation.assert_called_once_with(
             user_message="hello",
             conversation_history=[],
-            task_id="session-123",
+            task_id=None,
         )
 
 

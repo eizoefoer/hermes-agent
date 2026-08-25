@@ -1084,6 +1084,51 @@ class TestSignalQuoteExtraction:
         assert event.reply_to_text is None
 
     @pytest.mark.asyncio
+    async def test_signal_author_timestamp_identity_keeps_identical_messages_distinct(
+        self, monkeypatch, tmp_path
+    ):
+        from datetime import datetime
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionEntry
+        from hermes_state import SessionDB
+
+        adapter = _make_signal_adapter(monkeypatch)
+        captured = []
+
+        async def fake_handle(event):
+            captured.append(event)
+
+        adapter.handle_message = fake_handle
+        for timestamp in (1000000000, 1000000001):
+            await adapter._handle_envelope({
+                "envelope": {
+                    "sourceNumber": "+15550001111",
+                    "sourceUuid": "uuid-sender",
+                    "timestamp": timestamp,
+                    "dataMessage": {"message": "identical"},
+                }
+            })
+
+        assert [event.message_id for event in captured] == [
+            "+15550001111:1000000000",
+            "+15550001111:1000000001",
+        ]
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("signal-session", "signal")
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner._session_db = db
+        entry = SessionEntry(
+            session_key="signal:dm", session_id="signal-session",
+            platform=Platform.SIGNAL, chat_type="dm",
+            created_at=datetime.now(), updated_at=datetime.now(),
+        )
+        turns = [
+            runner.admit_session_event(event, entry, claim=False)["turn"]
+            for event in captured
+        ]
+        assert turns[0]["logical_turn_id"] != turns[1]["logical_turn_id"]
+
+    @pytest.mark.asyncio
     async def test_handle_envelope_quote_without_text_sets_only_reply_id(self, monkeypatch):
         adapter = _make_signal_adapter(monkeypatch)
         captured = {}
