@@ -11,7 +11,25 @@ import os
 import threading
 from typing import Any, Callable
 
-from gateway.approval_store import ApprovalRequest, ApprovalStore, Continuation
+from gateway.approval_store import (
+    ApprovalRequest,
+    ApprovalStore as ContinuationApprovalStore,
+    Continuation,
+)
+from gateway.signed_telegram_approval import (
+    ApprovalStore,
+    ResumeKind,
+    ResumeRegistration,
+    ResumeResult,
+    UnknownResumeKindError,
+    _RESUME_REGISTRY,
+    handle_callback,
+    primary_keyboard,
+    register_resume_handler,
+    resume_request,
+    scope_keyboard,
+    validate_resume_registry,
+)
 
 
 HERMES_SESSION = "hermes_session"
@@ -30,7 +48,7 @@ class TelegramApprovalService:
 
     def __init__(
         self,
-        store: ApprovalStore,
+        store: ContinuationApprovalStore,
         *,
         process_local_resolver: Callable[[str, str], int],
     ) -> None:

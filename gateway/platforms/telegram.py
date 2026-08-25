@@ -3242,6 +3242,16 @@ class TelegramAdapter(BasePlatformAdapter):
         if not query or not query.data:
             return
         data = query.data
+
+        # Signed repository/task approvals are a separate durable protocol
+        # used by control-plane plugins.  Import through the compatibility
+        # module so a plugin-installed denial bridge remains observable.
+        if data.startswith("pa:"):
+            from gateway import telegram_approval
+
+            await telegram_approval.handle_callback(self, query)
+            return
+
         query_message = getattr(query, "message", None)
         query_chat_id = getattr(query_message, "chat_id", None)
         query_chat = getattr(query_message, "chat", None)

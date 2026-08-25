@@ -264,6 +264,19 @@ class TestTelegramApprovalCallback:
     """Test the approval callback handling in _handle_callback_query."""
 
     @pytest.mark.asyncio
+    async def test_routes_signed_repository_approval_callback(self, monkeypatch):
+        adapter = _make_adapter()
+        query = AsyncMock()
+        query.data = "pa:1:request:decision:signature"
+        update = MagicMock(callback_query=query)
+        handler = AsyncMock(return_value=True)
+        monkeypatch.setattr("gateway.telegram_approval.handle_callback", handler)
+
+        await adapter._handle_callback_query(update, MagicMock())
+
+        handler.assert_awaited_once_with(adapter, query)
+
+    @pytest.mark.asyncio
     async def test_resolves_approval_on_click(self):
         adapter = _make_adapter()
         # Set up approval state
