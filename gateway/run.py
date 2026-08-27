@@ -6175,13 +6175,47 @@ class TurnRunner:
             # false positives from MagicMock auto-attribute creation in tests.
             if getattr(type(ctx._status_adapter), "send_exec_approval", None) is not None:
                 try:
+                    approval_metadata = dict(ctx._status_thread_metadata or {})
+                    approval_metadata["approval_continuation"] = {
+                        "kind": "hermes_session",
+                        "payload": {
+                            "session_id": ctx.session_id,
+                            "command": cmd,
+                            "description": desc,
+                            "pattern_key": approval_data.get("pattern_key"),
+                            "pattern_keys": list(
+                                approval_data.get("pattern_keys") or []
+                            ),
+                            "permanent_pattern_keys": list(
+                                approval_data.get("permanent_pattern_keys") or []
+                            ),
+                            "task_id": getattr(event, "task_id", None),
+                            "goal_id": getattr(event, "goal_id", None),
+                            "approval_user_id": str(
+                                getattr(event.source, "user_id", None)
+                                or ctx._status_chat_id
+                            ),
+                            "branch": getattr(event, "branch", None),
+                            "worktree": getattr(event, "worktree", None),
+                            "parent_logical_turn_id": getattr(
+                                event, "_logical_turn_id", None
+                            ),
+                            "process_local_fast_path": True,
+                        },
+                        # This fresh identifier is persisted before Telegram
+                        # delivery. Replayed callback data resolves the same
+                        # request; later legitimate approvals get a new key.
+                        "idempotency_key": (
+                            f"gateway-approval:{ctx.session_id}:{uuid.uuid4().hex}"
+                        ),
+                    }
                     _approval_fut = safe_schedule_threadsafe(
                         ctx._status_adapter.send_exec_approval(
                             chat_id=ctx._status_chat_id,
                             command=cmd,
                             session_key=_approval_session_key,
                             description=desc,
-                            metadata=ctx._status_thread_metadata,
+                            metadata=approval_metadata,
                             allow_permanent=approval_data.get("allow_permanent", True),
                             allow_session=approval_data.get("allow_session", True),
                             smart_denied=approval_data.get("smart_denied", False),
@@ -6980,6 +7014,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # process exit; this one is a steady state NAS polls during its
         # request -> poll -> proceed loop.
         self._external_drain_active = False
+        self._approval_continuation_runtimes: Dict[Path, tuple[Any, Any]] = {}
         self._restart_requested = False
         # Set by shutdown_signal_handler when a SIGTERM/SIGINT arrived
         # WITHOUT a planned-stop / takeover marker — i.e. an unexpected
@@ -13311,6 +13346,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._install_plugin_message_injector()
         self._update_runtime_status("running")
 
+        self._spawn_supervised(
+            self._approval_continuation_watcher,
+            "approval_continuation_watcher",
+            on_spawn=lambda task: setattr(
+                self, "_approval_continuation_task", task
+            ),
+        )
+
         self._start_loop_heartbeat_task()
 
         # Emit gateway:startup hook
@@ -15243,6 +15286,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     continue
                 _task.cancel()
             self._background_tasks.clear()
+
+            _approval_task = getattr(self, "_approval_continuation_task", None)
+            if _approval_task is not None:
+                try:
+                    await _approval_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.debug(
+                        "Approval continuation watcher shutdown failed",
+                        exc_info=True,
+                    )
+                self._approval_continuation_task = None
+
+            for _store, _worker in list(
+                getattr(self, "_approval_continuation_runtimes", {}).values()
+            ):
+                try:
+                    _store.close()
+                except Exception:
+                    logger.debug(
+                        "Approval continuation store close failed",
+                        exc_info=True,
+                    )
+            getattr(self, "_approval_continuation_runtimes", {}).clear()
 
             self.adapters.clear()
             for _session_key in list(self._running_agents):
@@ -19604,6 +19672,293 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc_info=True,
                     )
             await asyncio.sleep(1.0)
+
+    @staticmethod
+    def _approval_continuation_event(continuation, entry) -> MessageEvent:
+        """Translate a durable approval into one canonical gateway event."""
+        decision = str(continuation.decision or "deny")
+        command = str(continuation.payload.get("command") or "")
+        description = str(continuation.payload.get("description") or "")
+        marker = f"[approval-continuation:{continuation.id}]"
+        if decision == "deny":
+            text = (
+                f"{marker}\nThe user denied the dangerous command requested "
+                "in the interrupted turn. Do not execute or retry it. Continue "
+                "from persisted history and report that the workflow stopped."
+            )
+        else:
+            text = (
+                f"{marker}\nThe user approved the dangerous command from the "
+                f"interrupted turn with decision `{decision}`. Reconstruct the "
+                "pending workflow from persisted history, execute the approved "
+                "action only if it remains pending, and report the outcome.\n\n"
+                f"Approved command:\n```\n{command}\n```"
+            )
+            if description:
+                text += f"\nApproval reason: {description}"
+        return MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=dataclasses.replace(entry.origin),
+            message_id=None,
+            internal=True,
+            allow_gateway_control=False,
+            session_event_id=f"approval:{continuation.id}",
+            session_event_type="approval-continuation",
+            task_id=str(continuation.payload.get("task_id") or "") or None,
+            goal_id=str(continuation.payload.get("goal_id") or "") or None,
+            parent_logical_turn_id=(
+                str(continuation.payload.get("parent_logical_turn_id") or "")
+                or None
+            ),
+            branch=str(continuation.payload.get("branch") or "") or None,
+            worktree=str(continuation.payload.get("worktree") or "") or None,
+            metadata={"approval_continuation_id": continuation.id},
+        )
+
+    async def _consume_approval_continuation_async(
+        self, store, continuation
+    ) -> Dict[str, Any]:
+        """Admit and observe a continuation through ordinary gateway ingress.
+
+        The continuation worker never takes a session lease. SessionDB logical
+        turn claiming in ``_handle_message_with_agent`` remains the sole
+        execution-ownership path.
+        """
+        from gateway.approval_continuation import (
+            ContinuationPending,
+            ContinuationUnavailable,
+            UnrecoverableContinuation,
+        )
+
+        if not self._running:
+            raise ContinuationUnavailable("gateway is not running")
+        entry = await self.async_session_store.lookup_by_session_key(
+            continuation.session_key
+        )
+        if entry is None or entry.origin is None:
+            raise UnrecoverableContinuation(
+                "gateway session binding no longer exists"
+            )
+        state = self._session_db
+        if state is None:
+            raise ContinuationUnavailable("SessionDB unavailable")
+        requested_session_id = str(
+            continuation.payload.get("session_id") or ""
+        )
+        session_id = str(entry.session_id or "")
+        if not session_id or not await state.get_session(session_id):
+            raise UnrecoverableContinuation("persisted gateway session was deleted")
+        if requested_session_id and requested_session_id != session_id:
+            requested_tip = await state.get_compression_tip(requested_session_id)
+            if requested_tip != session_id:
+                raise UnrecoverableContinuation(
+                    "approval continuation no longer matches the active session"
+                )
+
+        event = self._approval_continuation_event(continuation, entry)
+        admission = await self.admit_session_event(event, entry, claim=False)
+        turn = admission.get("turn") or {}
+        logical_turn_id = str(turn.get("logical_turn_id") or "")
+        if not logical_turn_id:
+            raise ContinuationUnavailable(
+                "approval continuation could not create a logical turn"
+            )
+        # Bind the continuation to the durable transcript head that existed
+        # when its logical turn was accepted.  ``get_active_message_watermark``
+        # is the current-line SessionDB API for this value; the old Phase 1
+        # prototype's ``get_last_message_id`` helper no longer exists.
+        history_message_id = await state.get_active_message_watermark(session_id)
+        binding = await asyncio.to_thread(
+            store.get_or_create_turn_binding,
+            continuation.id,
+            session_id=session_id,
+            turn_id=logical_turn_id,
+            history_message_id=history_message_id,
+        )
+        if binding.turn_id != logical_turn_id:
+            raise UnrecoverableContinuation(
+                "approval continuation maps to conflicting logical turns"
+            )
+
+        async def _read_turn() -> Dict[str, Any]:
+            current = await state.get_logical_turn(logical_turn_id)
+            if current is None:
+                raise UnrecoverableContinuation(
+                    "approval logical turn disappeared"
+                )
+            return current
+
+        current = await _read_turn()
+        if current["state"] == "completed":
+            result = current.get("result") or {
+                "logical_turn_id": logical_turn_id,
+                "session_id": session_id,
+            }
+            await asyncio.to_thread(
+                store.acknowledge_turn_binding,
+                continuation.id,
+                result,
+            )
+            return result
+        if current["state"] in {
+            "blocked",
+            "cancelled",
+            "unrecoverable",
+        }:
+            raise UnrecoverableContinuation(
+                current.get("error")
+                or f"approval logical turn is {current['state']}"
+            )
+
+        # A valid durable owner is genuine contention. Leave the already
+        # admitted turn queued; the continuation retry does not spend its
+        # failure budget while waiting.
+        if await state.get_session_turn_lease(session_id):
+            raise ContinuationPending("approval logical turn is queued")
+
+        adapter = self._adapter_for_source(entry.origin)
+        if adapter is None:
+            raise ContinuationUnavailable("gateway platform adapter unavailable")
+
+        decision = str(continuation.decision or "deny")
+        pattern_keys = [
+            str(key)
+            for key in (continuation.payload.get("pattern_keys") or [])
+            if key
+        ]
+        if not pattern_keys and continuation.payload.get("pattern_key"):
+            pattern_keys = [str(continuation.payload["pattern_key"])]
+        temporary_keys: list[str] = []
+        session_key = entry.session_key
+        if decision != "deny" and pattern_keys:
+            from tools.approval import (
+                approve_permanent,
+                approve_session,
+                is_approved,
+                load_permanent_allowlist,
+                save_permanent_allowlist,
+            )
+
+            if decision == "once":
+                temporary_keys = [
+                    key for key in pattern_keys if not is_approved(session_key, key)
+                ]
+                for key in temporary_keys:
+                    approve_session(session_key, key)
+            else:
+                for key in pattern_keys:
+                    approve_session(session_key, key)
+                if decision == "always":
+                    permanent_keys = {
+                        str(key)
+                        for key in (
+                            continuation.payload.get("permanent_pattern_keys")
+                            or []
+                        )
+                        if key
+                    }
+                    if permanent_keys:
+                        persisted = load_permanent_allowlist()
+                        for key in permanent_keys:
+                            approve_permanent(key)
+                        save_permanent_allowlist(persisted | permanent_keys)
+
+        try:
+            await asyncio.to_thread(
+                store.mark_turn_binding_running,
+                continuation.id,
+            )
+            await adapter.handle_message(event)
+            task = getattr(adapter, "_session_tasks", {}).get(session_key)
+            if task is not None:
+                await asyncio.shield(task)
+            current = await _read_turn()
+        finally:
+            if temporary_keys:
+                from tools.approval import revoke_session_approvals
+
+                revoke_session_approvals(session_key, temporary_keys)
+
+        if current["state"] == "completed":
+            result = current.get("result") or {
+                "logical_turn_id": logical_turn_id,
+                "session_id": session_id,
+            }
+            await asyncio.to_thread(
+                store.acknowledge_turn_binding,
+                continuation.id,
+                result,
+            )
+            return result
+        if current["state"] in {
+            "blocked",
+            "cancelled",
+            "unrecoverable",
+        }:
+            raise UnrecoverableContinuation(
+                current.get("error")
+                or f"approval logical turn is {current['state']}"
+            )
+        raise ContinuationPending(
+            f"approval logical turn remains {current['state']}"
+        )
+
+    def _consume_approval_continuation(self, store, continuation):
+        """Bridge the worker thread onto the live gateway event loop."""
+        from gateway.approval_continuation import ContinuationUnavailable
+
+        loop = self._gateway_loop
+        if loop is None or not loop.is_running():
+            raise ContinuationUnavailable("gateway event loop unavailable")
+        future = asyncio.run_coroutine_threadsafe(
+            self._consume_approval_continuation_async(store, continuation),
+            loop,
+        )
+        return future.result()
+
+    async def _approval_continuation_watcher(
+        self, poll_interval: float = 0.5
+    ) -> None:
+        """Poll each profile's durable approval inbox with bounded work."""
+        from gateway.approval_continuation import ContinuationWorker
+        from gateway.approval_store import ApprovalStore
+        from hermes_constants import get_hermes_home
+
+        while self._running:
+            homes = [Path(get_hermes_home())]
+            if getattr(self.config, "multiplex_profiles", False):
+                homes.extend(
+                    home for _name, home in _multiplex_profile_homes(self.config)
+                )
+            processed = False
+            for home in dict.fromkeys(Path(value).resolve() for value in homes):
+                with _profile_runtime_scope(home):
+                    runtime = self._approval_continuation_runtimes.get(home)
+                    if runtime is None:
+                        store = ApprovalStore(home / "approvals.db")
+                        worker = ContinuationWorker(
+                            store,
+                            worker_id=(
+                                f"gateway:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+                            ),
+                            lease_seconds=30,
+                            base_backoff=1,
+                            max_backoff=60,
+                        )
+                        worker.register(
+                            "hermes_session",
+                            lambda item, _store=store: self._consume_approval_continuation(
+                                _store, item
+                            ),
+                        )
+                        runtime = (store, worker)
+                        self._approval_continuation_runtimes[home] = runtime
+                    _store, worker = runtime
+                    item = await asyncio.to_thread(worker.run_once)
+                    processed = processed or item is not None
+            if not processed:
+                await asyncio.sleep(poll_interval)
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
