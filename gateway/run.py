@@ -6464,7 +6464,10 @@ class TurnRunner:
             )
             _conversation_kwargs = {
                 "conversation_history": agent_history,
-                "task_id": ctx.session_id,
+                # A conversation session is not a task.  Only producers with
+                # an authoritative durable task may correlate model execution
+                # to one; ordinary gateway chat keeps this unset.
+                "task_id": getattr(event, "task_id", None),
             }
             if _persist_user_message_override is not None:
                 _conversation_kwargs["persist_user_message"] = _persist_user_message_override
@@ -19646,6 +19649,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     turn.get("session_key"),
                     exc_info=True,
                 )
+        # Independent /background child sessions have their own executor and
+        # must not be rehydrated as messages in the parent chat session.
+        dispatched += await self._drain_gateway_background_turns()
         return dispatched
 
     async def _gateway_logical_turn_watcher(self) -> None:
@@ -23611,6 +23617,230 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_metadata=metadata,
         )
 
+    @staticmethod
+    def _gateway_background_task_id(source_identity: str) -> str:
+        """Derive one stable child-task identity from its accepted command."""
+        value = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"hermes:gateway-background:{source_identity}",
+        ).hex
+        return f"bg_{value[:20]}"
+
+    async def _admit_gateway_background_task(
+        self,
+        parent_event: MessageEvent,
+        prompt: str,
+        *,
+        event_message_id: Optional[str] = None,
+        media_urls: Optional[List[str]] = None,
+        media_types: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Persist a /background child before the parent reports success."""
+        source_identity, authoritative = self._gateway_event_source_identity(
+            parent_event
+        )
+        # Preserve the acceptance mapping on the in-memory command too. A
+        # repeated handler invocation for this accepted occurrence resolves
+        # the same child; a separate no-ID command receives a fresh occurrence.
+        setattr(parent_event, "_durable_source_identity", source_identity)
+        setattr(parent_event, "_source_identity_authoritative", authoritative)
+        source = parent_event.source
+        task_id = self._gateway_background_task_id(source_identity)
+        session_key = f"agent:background:{task_id}"
+        entry = SessionEntry(
+            session_key=session_key,
+            session_id=task_id,
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=dataclasses.replace(source),
+            platform=source.platform,
+            chat_type=source.chat_type,
+        )
+        child_event = MessageEvent(
+            text=prompt,
+            message_type=MessageType.TEXT,
+            source=dataclasses.replace(source),
+            internal=True,
+            allow_gateway_control=False,
+            session_event_type="gateway-background-child",
+            task_id=task_id,
+            parent_logical_turn_id=(
+                str(getattr(parent_event, "_logical_turn_id", None) or "") or None
+            ),
+            branch=getattr(parent_event, "branch", None),
+            worktree=getattr(parent_event, "worktree", None),
+            metadata={
+                "logical_turn_recovery_policy": "manual_reconcile",
+                "background_task": {
+                    "task_id": task_id,
+                    "event_message_id": event_message_id,
+                    "media_urls": list(media_urls or []),
+                    "media_types": list(media_types or []),
+                },
+            },
+        )
+        setattr(child_event, "_durable_source_identity", source_identity)
+        setattr(child_event, "_source_identity_authoritative", authoritative)
+        admission = await self.admit_session_event(child_event, entry, claim=False)
+        turn = admission.get("turn") or {}
+        if not turn.get("logical_turn_id"):
+            raise DurableSessionAdmissionError(
+                "background child logical turn could not be persisted"
+            )
+        return {"task_id": task_id, "event": child_event, "turn": turn}
+
+    def _launch_gateway_background_turn(self, turn: Dict[str, Any]) -> bool:
+        """Launch one accepted child turn, deduplicated within this process."""
+        logical_turn_id = str(turn.get("logical_turn_id") or "")
+        payload = turn.get("payload") or {}
+        details = payload.get("metadata", {}).get("background_task", {})
+        source_data = payload.get("source") or {}
+        if not logical_turn_id or not details or not source_data:
+            return False
+        dispatching = getattr(self, "_gateway_background_turn_dispatching", None)
+        if dispatching is None:
+            dispatching = {}
+            self._gateway_background_turn_dispatching = dispatching
+        active = dispatching.get(logical_turn_id)
+        if active is not None and not active.done():
+            return False
+        try:
+            source = SessionSource.from_dict(source_data)
+        except Exception:
+            logger.warning(
+                "Could not rehydrate gateway background child %s",
+                logical_turn_id,
+                exc_info=True,
+            )
+            return False
+        task = asyncio.create_task(
+            self._run_background_task(
+                str(payload.get("text") or ""),
+                source,
+                str(details.get("task_id") or turn.get("task_id") or ""),
+                event_message_id=details.get("event_message_id"),
+                media_urls=list(details.get("media_urls") or []),
+                media_types=list(details.get("media_types") or []),
+                logical_turn_id=logical_turn_id,
+            )
+        )
+        dispatching[logical_turn_id] = task
+        self._background_tasks.add(task)
+
+        def _done(completed: asyncio.Task) -> None:
+            self._background_tasks.discard(completed)
+            if dispatching.get(logical_turn_id) is completed:
+                dispatching.pop(logical_turn_id, None)
+
+        task.add_done_callback(_done)
+        return True
+
+    async def _drain_gateway_background_turns(self) -> int:
+        """Boundedly dispatch accepted/retry background children on startup."""
+        state = self._session_db
+        if state is None:
+            return 0
+        turns = await state.list_ready_logical_turns(
+            limit=_GATEWAY_LOGICAL_TURN_DRAIN_LIMIT,
+            event_types=("gateway-background-child",),
+        )
+        launched = 0
+        for turn in turns:
+            if await state.get_session_turn_lease(turn["session_id"]):
+                continue
+            launched += int(self._launch_gateway_background_turn(turn))
+        deliveries = await state.list_pending_logical_turn_deliveries(
+            limit=_GATEWAY_LOGICAL_TURN_DRAIN_LIMIT,
+            include_transport_accepted=True,
+            event_types=("gateway-background-child",),
+        )
+        for turn in deliveries:
+            attempt_id = str(turn.get("current_attempt_id") or "")
+            if not attempt_id:
+                continue
+            if turn.get("delivery_state") == "transport_accepted":
+                await state.acknowledge_logical_turn_delivery(
+                    turn["logical_turn_id"], attempt_id
+                )
+                launched += 1
+                continue
+            launched += int(self._launch_gateway_background_delivery(turn))
+        return launched
+
+    def _launch_gateway_background_delivery(self, turn: Dict[str, Any]) -> bool:
+        logical_turn_id = str(turn.get("logical_turn_id") or "")
+        if not logical_turn_id:
+            return False
+        key = f"delivery:{logical_turn_id}"
+        dispatching = getattr(self, "_gateway_background_turn_dispatching", None)
+        if dispatching is None:
+            dispatching = {}
+            self._gateway_background_turn_dispatching = dispatching
+        active = dispatching.get(key)
+        if active is not None and not active.done():
+            return False
+        task = asyncio.create_task(self._recover_gateway_background_delivery(turn))
+        dispatching[key] = task
+        self._background_tasks.add(task)
+
+        def _done(completed: asyncio.Task) -> None:
+            self._background_tasks.discard(completed)
+            if dispatching.get(key) is completed:
+                dispatching.pop(key, None)
+
+        task.add_done_callback(_done)
+        return True
+
+    async def _recover_gateway_background_delivery(
+        self, turn: Dict[str, Any]
+    ) -> None:
+        """Replay only delivery for a terminal background execution."""
+        state = self._session_db
+        if state is None:
+            return
+        logical_turn_id = str(turn.get("logical_turn_id") or "")
+        attempt_id = str(turn.get("current_attempt_id") or "")
+        payload = turn.get("payload") or {}
+        details = payload.get("metadata", {}).get("background_task", {})
+        result = turn.get("result") or {}
+        if not logical_turn_id or not attempt_id or not details:
+            return
+        try:
+            source = SessionSource.from_dict(payload.get("source") or {})
+        except Exception:
+            logger.warning(
+                "Could not restore background delivery source for %s",
+                logical_turn_id,
+                exc_info=True,
+            )
+            return
+        await state.begin_logical_turn_delivery(logical_turn_id, attempt_id)
+        try:
+            succeeded = await self._deliver_gateway_background_response(
+                prompt=str(payload.get("text") or ""),
+                response=str(result.get("response") or ""),
+                source=source,
+                event_message_id=details.get("event_message_id"),
+            )
+        except Exception as exc:
+            await state.fail_logical_turn_delivery(
+                logical_turn_id, attempt_id, str(exc)
+            )
+            return
+        if not succeeded:
+            await state.fail_logical_turn_delivery(
+                logical_turn_id,
+                attempt_id,
+                "background result delivery was not fully acknowledged",
+            )
+            return
+        await state.record_logical_turn_transport_accepted(
+            logical_turn_id, attempt_id
+        )
+        await state.acknowledge_logical_turn_delivery(
+            logical_turn_id, attempt_id
+        )
+
     async def _run_background_task(
         self,
         prompt: str,
@@ -23619,6 +23849,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event_message_id: Optional[str] = None,
         media_urls: Optional[List[str]] = None,
         media_types: Optional[List[str]] = None,
+        logical_turn_id: Optional[str] = None,
     ) -> None:
         """Profile-scoping wrapper around the background agent task.
 
@@ -23629,13 +23860,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._run_background_task_inner(
-                prompt, source, task_id, event_message_id, media_urls, media_types,
+                prompt,
+                source,
+                task_id,
+                event_message_id,
+                media_urls,
+                media_types,
+                logical_turn_id,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
         with _profile_runtime_scope(profile_home):
             return await self._run_background_task_inner(
-                prompt, source, task_id, event_message_id, media_urls, media_types,
+                prompt,
+                source,
+                task_id,
+                event_message_id,
+                media_urls,
+                media_types,
+                logical_turn_id,
             )
 
     def _resolve_enabled_toolsets_for_source(
@@ -23673,6 +23916,125 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return sorted(_get_platform_tools(user_config, platform_key))
 
+    async def _deliver_gateway_background_response(
+        self,
+        *,
+        prompt: str,
+        response: str,
+        source: SessionSource,
+        event_message_id: Optional[str],
+    ) -> bool:
+        """Deliver a terminal child result without reopening model execution."""
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            return False
+        metadata = self._thread_metadata_for_source(source, event_message_id)
+        attempted = False
+        succeeded = True
+
+        async def _send(awaitable):
+            nonlocal attempted, succeeded
+            attempted = True
+            try:
+                outcome = await awaitable
+            except Exception:
+                succeeded = False
+                raise
+            if hasattr(outcome, "success") and outcome.success is not True:
+                succeeded = False
+            return outcome
+
+        preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+        header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
+        if not response:
+            await _send(
+                adapter.send(
+                    chat_id=source.chat_id,
+                    content=header + "(No response generated)",
+                    metadata=metadata,
+                )
+            )
+            return attempted and succeeded
+
+        media_files, cleaned = adapter.extract_media(response)
+        from gateway.platforms.base import (
+            BasePlatformAdapter,
+            should_send_media_as_audio as _should_send_media_as_audio,
+        )
+
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+        images, text_content = adapter.extract_images(cleaned)
+        if text_content:
+            await _send(
+                adapter.send(
+                    chat_id=source.chat_id,
+                    content=header + text_content,
+                    metadata=metadata,
+                )
+            )
+        elif not images and not media_files:
+            await _send(
+                adapter.send(
+                    chat_id=source.chat_id,
+                    content=header + "(No response generated)",
+                    metadata=metadata,
+                )
+            )
+
+        for image_url, alt_text in images or []:
+            try:
+                await _send(
+                    adapter.send_image(
+                        chat_id=source.chat_id,
+                        image_url=image_url,
+                        caption=alt_text,
+                        metadata=metadata,
+                    )
+                )
+            except Exception:
+                succeeded = False
+
+        image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+        video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
+        for media_path, is_voice in media_files or []:
+            extension = os.path.splitext(media_path)[1].lower()
+            try:
+                if _should_send_media_as_audio(source.platform, extension, is_voice):
+                    await _send(
+                        adapter.send_voice(
+                            chat_id=source.chat_id,
+                            audio_path=media_path,
+                            metadata=metadata,
+                        )
+                    )
+                elif extension in video_exts:
+                    await _send(
+                        adapter.send_video(
+                            chat_id=source.chat_id,
+                            video_path=media_path,
+                            metadata=metadata,
+                        )
+                    )
+                elif extension in image_exts:
+                    await _send(
+                        adapter.send_image_file(
+                            chat_id=source.chat_id,
+                            image_path=media_path,
+                            metadata=metadata,
+                        )
+                    )
+                else:
+                    await _send(
+                        adapter.send_document(
+                            chat_id=source.chat_id,
+                            file_path=media_path,
+                            metadata=metadata,
+                        )
+                    )
+            except Exception:
+                succeeded = False
+        return attempted and succeeded
+
     async def _run_background_task_inner(
         self,
         prompt: str,
@@ -23681,10 +24043,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event_message_id: Optional[str] = None,
         media_urls: Optional[List[str]] = None,
         media_types: Optional[List[str]] = None,
+        logical_turn_id: Optional[str] = None,
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
         from run_agent import AIAgent
 
+        if not logical_turn_id:
+            raise DurableSessionAdmissionError(
+                "refusing unmanaged persistent gateway background execution"
+            )
+        state = self._session_db
+        if state is None:
+            raise DurableSessionAdmissionError(
+                "SessionDB unavailable for gateway background execution"
+            )
         media_urls = media_urls or []
         media_types = media_types or []
 
@@ -23694,7 +24066,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
-
+        claim = await state.claim_logical_turn(
+            logical_turn_id,
+            owner=f"gateway-background:{os.getpid()}",
+            pid=os.getpid(),
+            ttl_seconds=_GATEWAY_LOGICAL_TURN_LEASE_TTL_SECONDS,
+        )
+        if claim.get("outcome") in {"busy", "terminal"}:
+            return
+        if claim.get("outcome") != "claimed":
+            raise DurableSessionAdmissionError(
+                f"background logical turn cannot be claimed: {claim.get('outcome')}"
+            )
+        attempt_id = str(claim["attempt_id"])
+        model_started = False
+        execution_completed = False
         try:
             user_config = _load_gateway_config()
             model, runtime_kwargs = self._resolve_session_agent_runtime(
@@ -23702,6 +24088,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_config=user_config,
             )
             if not runtime_kwargs.get("api_key"):
+                await state.fail_logical_turn(
+                    logical_turn_id,
+                    attempt_id,
+                    "no provider credentials configured",
+                    retryable=False,
+                )
                 await adapter.send(
                     source.chat_id,
                     f"❌ Background task {task_id} failed: no provider credentials configured.",
@@ -23785,6 +24177,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 finally:
                     self._cleanup_agent_resources(agent)
 
+            assert await state.mark_logical_turn_started(
+                logical_turn_id, attempt_id
+            )
+            model_started = True
             result = await self._run_in_executor_with_context(run_sync)
 
             response = result.get("final_response", "") if result else ""
@@ -23800,88 +24196,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     result.get("messages", []),
                 )
 
-            # Extract media files from the response
-            if response:
-                media_files, response = adapter.extract_media(response)
-                from gateway.platforms.base import BasePlatformAdapter
-                media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
-                images, text_content = adapter.extract_images(response)
+            await state.complete_logical_turn(
+                logical_turn_id,
+                attempt_id,
+                {
+                    "completed": True,
+                    "response": response,
+                    "response_present": bool(response),
+                    "task_id": task_id,
+                },
+                delivery_required=True,
+            )
+            execution_completed = True
 
-                preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
-
-                if text_content:
-                    await adapter.send(
-                        chat_id=source.chat_id,
-                        content=header + text_content,
-                        metadata=_thread_metadata,
-                    )
-                elif not images and not media_files:
-                    await adapter.send(
-                        chat_id=source.chat_id,
-                        content=header + "(No response generated)",
-                        metadata=_thread_metadata,
-                    )
-
-                # Send extracted images
-                for image_url, alt_text in (images or []):
-                    try:
-                        await adapter.send_image(
-                            chat_id=source.chat_id,
-                            image_url=image_url,
-                            caption=alt_text,
-                            metadata=_thread_metadata,
-                        )
-                    except Exception:
-                        pass
-
-                # Send media files, routing each by type so a TTS clip
-                # arrives as a voice bubble / a clip as a video rather than
-                # a generic document. Mirrors the streaming + kanban paths.
-                from gateway.platforms.base import (
-                    should_send_media_as_audio as _should_send_media_as_audio,
+            delivery_succeeded = await self._deliver_gateway_background_response(
+                prompt=prompt,
+                response=response,
+                source=source,
+                event_message_id=event_message_id,
+            )
+            if delivery_succeeded:
+                await state.record_logical_turn_transport_accepted(
+                    logical_turn_id, attempt_id
                 )
-                _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
-                _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
-                for media_path, _is_voice in (media_files or []):
-                    _ext = os.path.splitext(media_path)[1].lower()
-                    try:
-                        if _should_send_media_as_audio(source.platform, _ext, _is_voice):
-                            await adapter.send_voice(
-                                chat_id=source.chat_id,
-                                audio_path=media_path,
-                                metadata=_thread_metadata,
-                            )
-                        elif _ext in _VIDEO_EXTS:
-                            await adapter.send_video(
-                                chat_id=source.chat_id,
-                                video_path=media_path,
-                                metadata=_thread_metadata,
-                            )
-                        elif _ext in _IMAGE_EXTS:
-                            await adapter.send_image_file(
-                                chat_id=source.chat_id,
-                                image_path=media_path,
-                                metadata=_thread_metadata,
-                            )
-                        else:
-                            await adapter.send_document(
-                                chat_id=source.chat_id,
-                                file_path=media_path,
-                                metadata=_thread_metadata,
-                            )
-                    except Exception:
-                        pass
+                await state.acknowledge_logical_turn_delivery(
+                    logical_turn_id, attempt_id
+                )
             else:
-                preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                await adapter.send(
-                    chat_id=source.chat_id,
-                    content=f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)',
-                    metadata=_thread_metadata,
+                await state.fail_logical_turn_delivery(
+                    logical_turn_id,
+                    attempt_id,
+                    "background result delivery was not fully acknowledged",
                 )
 
         except Exception as e:
             logger.exception("Background task %s failed", task_id)
+            if execution_completed:
+                await state.fail_logical_turn_delivery(
+                    logical_turn_id,
+                    attempt_id,
+                    str(e),
+                )
+            else:
+                await state.fail_logical_turn(
+                    logical_turn_id,
+                    attempt_id,
+                    str(e),
+                    retryable=not model_started,
+                )
             try:
                 await adapter.send(
                     chat_id=source.chat_id,

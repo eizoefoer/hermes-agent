@@ -8394,6 +8394,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         limit: int = 100,
         include_transport_accepted: bool = False,
         session_id: Optional[str] = None,
+        event_types: Optional[Iterable[str]] = None,
     ) -> List[Dict[str, Any]]:
         states = ["pending", "delivering"]
         if include_transport_accepted:
@@ -8401,6 +8402,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         placeholders = ", ".join("?" for _ in states)
         clauses = ["state = 'completed'", f"delivery_state IN ({placeholders})"]
         params: List[Any] = list(states)
+        selected_types = tuple(
+            dict.fromkeys(str(value) for value in (event_types or ()))
+        )
+        if selected_types:
+            type_placeholders = ", ".join("?" for _ in selected_types)
+            clauses.append(
+                "COALESCE(json_extract(payload_json, '$.event_type'), '') "
+                f"IN ({type_placeholders})"
+            )
+            params.extend(selected_types)
         if session_id is not None:
             clauses.append("session_id = ?")
             params.append(session_id)

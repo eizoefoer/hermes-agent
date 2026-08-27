@@ -227,6 +227,39 @@ def test_ready_filter_is_applied_before_limit(tmp_path):
     ]
 
 
+def test_pending_delivery_filter_is_applied_before_limit(tmp_path):
+    db = _db(tmp_path)
+
+    def _complete(source_identity, event_type):
+        turn = db.admit_session_event(
+            session_id="session-a",
+            session_key="agent:test",
+            source_identity=source_identity,
+            event_type=event_type,
+        )
+        claim = db.claim_logical_turn(turn["logical_turn_id"], owner=source_identity)
+        assert db.mark_logical_turn_started(
+            turn["logical_turn_id"], claim["attempt_id"]
+        )
+        return db.complete_logical_turn(
+            turn["logical_turn_id"],
+            claim["attempt_id"],
+            {"response": source_identity},
+            delivery_required=True,
+        )
+
+    for index in range(5):
+        _complete(f"foreign:{index}", "foreign-producer")
+    target = _complete("target:delivery", "target-producer")
+
+    pending = db.list_pending_logical_turn_deliveries(
+        limit=1, event_types=("target-producer",)
+    )
+    assert [row["logical_turn_id"] for row in pending] == [
+        target["logical_turn_id"]
+    ]
+
+
 def test_compression_lineage_uses_one_conversation_lease(tmp_path):
     db = SessionDB(tmp_path / "state.db")
     db.create_session("root", source="test")
