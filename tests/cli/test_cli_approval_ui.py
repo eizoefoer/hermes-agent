@@ -31,7 +31,7 @@ def _make_cli_stub():
     return cli
 
 
-def _make_background_cli_stub():
+def _make_background_cli_stub(tmp_path=None):
     cli = _make_cli_stub()
     cli._background_task_counter = 0
     cli._background_tasks = {}
@@ -48,7 +48,13 @@ def _make_background_cli_stub():
     })
     cli.max_turns = 90
     cli.enabled_toolsets = []
-    cli._session_db = None
+    if tmp_path is not None:
+        from hermes_state import SessionDB
+        cli._session_db = SessionDB(tmp_path / "state.db")
+        cli.session_id = "cli-approval-background"
+        cli._session_db.create_session(cli.session_id, "cli")
+    else:
+        cli._session_db = None
     cli.reasoning_config = {}
     cli.service_tier = None
     cli._providers_only = None
@@ -213,7 +219,7 @@ class TestCliApprovalUi:
         # Command got truncated with a marker.
         assert "(command truncated" in rendered
 
-    def test_background_task_registers_thread_local_approval_callbacks(self):
+    def test_background_task_registers_thread_local_approval_callbacks(self, tmp_path):
         """Background /btw tasks must use the prompt_toolkit approval UI.
 
         The foreground chat path registers dangerous-command callbacks inside
@@ -222,7 +228,7 @@ class TestCliApprovalUi:
         fell back to raw input() in a background thread and timed out under
         prompt_toolkit.
         """
-        cli = _make_background_cli_stub()
+        cli = _make_background_cli_stub(tmp_path)
         seen = {}
 
         class FakeAgent:
@@ -593,4 +599,3 @@ class TestClearOverlaysForInterrupt:
 
         assert not t.is_alive(), "worker thread never unblocked"
         assert result["value"] == "deny"
-
