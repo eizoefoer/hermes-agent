@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 import base64
+from contextlib import suppress
 import contextvars
 import json
 import logging
 import os
+import uuid
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -677,6 +679,101 @@ class HermesACPAgent(acp.Agent):
         """Store the client connection for sending session updates."""
         self._conn = conn
         logger.info("ACP client connected")
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._drain_acp_logical_turns())
+
+    async def _drain_acp_logical_turns(self, *, limit: int = 32) -> int:
+        """Boundedly re-submit accepted ACP turns after process replacement."""
+        db = self.session_manager._get_db()
+        if db is None or not all(
+            callable(getattr(db, method, None))
+            for method in (
+                "reconcile_logical_turns",
+                "list_ready_logical_turns",
+                "get_session_turn_lease",
+            )
+        ):
+            return 0
+        await asyncio.to_thread(db.reconcile_logical_turns)
+        turns = await asyncio.to_thread(
+            db.list_ready_logical_turns,
+            limit=limit,
+            event_types=("acp-prompt",),
+        )
+        launched = 0
+        for turn in turns:
+            if await asyncio.to_thread(db.get_session_turn_lease, turn["session_id"]):
+                continue
+            payload = turn.get("payload") or {}
+            text = str(payload.get("user_text") or "")
+            task = asyncio.create_task(
+                self.prompt(
+                    prompt=[TextContentBlock(type="text", text=text)],
+                    session_id=turn["session_id"],
+                    _logical_turn_source_identity=turn["source_identity"],
+                    _recovered_user_content=payload.get("user_content"),
+                )
+            )
+            task.add_done_callback(
+                lambda completed, turn_id=turn["logical_turn_id"]: logger.debug(
+                    "Recovered ACP turn %s finished (cancelled=%s)",
+                    turn_id,
+                    completed.cancelled(),
+                )
+            )
+            launched += 1
+        if self._conn is not None:
+            deliveries = await asyncio.to_thread(
+                db.list_pending_logical_turn_deliveries,
+                limit=limit,
+                include_transport_accepted=True,
+                event_types=("acp-prompt",),
+            )
+            for turn in deliveries:
+                attempt_id = str(turn.get("current_attempt_id") or "")
+                if not attempt_id:
+                    continue
+                if turn.get("delivery_state") == "transport_accepted":
+                    await asyncio.to_thread(
+                        db.acknowledge_logical_turn_delivery,
+                        turn["logical_turn_id"],
+                        attempt_id,
+                    )
+                    launched += 1
+                    continue
+                result = turn.get("result") or {}
+                agent_result = result.get("agent_result") or {}
+                final_response = str(agent_result.get("final_response") or "")
+                if not final_response:
+                    continue
+                try:
+                    await self._conn.session_update(
+                        turn["session_id"],
+                        acp.update_agent_message_text(final_response),
+                    )
+                except Exception as exc:
+                    await asyncio.to_thread(
+                        db.fail_logical_turn_delivery,
+                        turn["logical_turn_id"],
+                        attempt_id,
+                        str(exc),
+                    )
+                    continue
+                await asyncio.to_thread(
+                    db.record_logical_turn_transport_accepted,
+                    turn["logical_turn_id"],
+                    attempt_id,
+                )
+                await asyncio.to_thread(
+                    db.acknowledge_logical_turn_delivery,
+                    turn["logical_turn_id"],
+                    attempt_id,
+                )
+                launched += 1
+        return launched
 
 
     def _session_modes(self, state: SessionState) -> SessionModeState:
@@ -1801,6 +1898,8 @@ class HermesACPAgent(acp.Agent):
 
         user_text = _extract_text(prompt).strip()
         user_content = _content_blocks_to_openai_user_content(prompt)
+        if "_recovered_user_content" in kwargs:
+            user_content = kwargs["_recovered_user_content"]
         text_only_prompt = all(isinstance(block, TextContentBlock) for block in prompt)
         has_content = bool(user_text) or (
             isinstance(user_content, list) and bool(user_content)
@@ -1820,12 +1919,27 @@ class HermesACPAgent(acp.Agent):
         #      silently append to state.queued_prompts and respond with
         #      "No active turn — queued for the next turn", which looks like
         #      /queue even though the user never typed /queue.
-        if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/steer"):
+        force_new_turn = False
+        if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/queue"):
+            queued_text = user_text.split(maxsplit=1)[1].strip() if len(user_text.split(maxsplit=1)) > 1 else ""
+            if not queued_text:
+                if self._conn:
+                    await self._conn.session_update(
+                        session_id,
+                        acp.update_agent_message_text("Usage: /queue <prompt>"),
+                    )
+                return PromptResponse(stop_reason="end_turn")
+            user_text = queued_text
+            user_content = queued_text
+            force_new_turn = True
+        elif text_only_prompt and isinstance(user_content, str) and user_text.startswith("/steer"):
             steer_text = user_text.split(maxsplit=1)[1].strip() if len(user_text.split(maxsplit=1)) > 1 else ""
             interrupted_prompt = ""
             rewrite_idle = False
             with state.runtime_lock:
-                if not state.is_running and steer_text:
+                if state.is_running and steer_text:
+                    rewrite_idle = True
+                elif not state.is_running and steer_text:
                     if state.interrupted_prompt_text:
                         interrupted_prompt = state.interrupted_prompt_text
                         state.interrupted_prompt_text = ""
@@ -1875,12 +1989,24 @@ class HermesACPAgent(acp.Agent):
                 return PromptResponse(stop_reason="end_turn")
 
         # If the client sends another regular text prompt while this ACP session
-        # is running, route it through the core active-turn redirect. Rich media
-        # and older runtimes retain the proven next-turn queue fallback.
+        # is running, route it through the core active-turn redirect. Anything
+        # that requires a new turn is durably admitted below; process-local
+        # ``is_running`` is only an injection hint, never ownership authority.
+        db = self.session_manager._get_db()
+        if db is None or not all(
+            callable(getattr(db, method, None))
+            for method in (
+                "admit_session_event",
+                "claim_logical_turn",
+                "get_session_turn_lease",
+            )
+        ):
+            logger.error("ACP persistent admission unavailable for %s", session_id)
+            return PromptResponse(stop_reason="refusal")
+        durable_lease = await asyncio.to_thread(db.get_session_turn_lease, session_id)
         redirected = False
-        queued_depth: int | None = None
         with state.runtime_lock:
-            if state.is_running:
+            if state.is_running and durable_lease and not force_new_turn:
                 if (
                     text_only_prompt
                     and isinstance(user_content, str)
@@ -1900,14 +2026,14 @@ class HermesACPAgent(acp.Agent):
                             session_id,
                             exc_info=True,
                         )
-                if not redirected:
-                    queued_text = user_text or "[Image attachment]"
-                    state.queued_prompts.append(queued_text)
-                    queued_depth = len(state.queued_prompts)
-            else:
-                state.is_running = True
-                state.current_prompt_text = user_text or "[Image attachment]"
-
+            elif state.is_running and not durable_lease:
+                logger.warning(
+                    "ACP local running state disagreed with durable ownership for %s; "
+                    "reconciling the local cache",
+                    session_id,
+                )
+                state.is_running = False
+                state.current_prompt_text = ""
         if redirected:
             if self._conn:
                 update = acp.update_agent_message_text(
@@ -1915,13 +2041,62 @@ class HermesACPAgent(acp.Agent):
                 )
                 await self._conn.session_update(session_id, update)
             return PromptResponse(stop_reason="end_turn")
-        if queued_depth is not None:
-            if self._conn:
-                update = acp.update_agent_message_text(
-                    f"Queued for the next turn. ({queued_depth} queued)"
-                )
-                await self._conn.session_update(session_id, update)
+        source_identity = str(
+            kwargs.get("_logical_turn_source_identity")
+            or kwargs.get("request_id")
+            or kwargs.get("event_id")
+            or f"acp-occurrence:{uuid.uuid4().hex}"
+        )
+        durable_source_identity = (
+            source_identity if source_identity.startswith("acp:")
+            else f"acp:{source_identity}"
+        )
+        durable_turn = await asyncio.to_thread(
+            db.admit_session_event,
+            session_id=session_id,
+            session_key=session_id,
+            source_identity=durable_source_identity,
+            event_type="acp-prompt",
+            payload={
+                "user_text": user_text or "[Image attachment]",
+                "user_content": user_content,
+                "recovery_policy": "manual_reconcile",
+            },
+        )
+        claim = await asyncio.to_thread(
+            db.claim_logical_turn,
+            durable_turn["logical_turn_id"],
+            owner=f"acp:{os.getpid()}",
+            pid=os.getpid(),
+            ttl_seconds=1800.0,
+        )
+        if claim.get("outcome") == "terminal":
             return PromptResponse(stop_reason="end_turn")
+        if claim.get("outcome") != "claimed":
+            if self._conn:
+                await self._conn.session_update(
+                    session_id,
+                    acp.update_agent_message_text(
+                        "Queued durably for the next turn."
+                    ),
+                )
+            return PromptResponse(stop_reason="end_turn")
+        logical_turn_id = durable_turn["logical_turn_id"]
+        attempt_id = claim["attempt_id"]
+        if not await asyncio.to_thread(
+            db.mark_logical_turn_started, logical_turn_id, attempt_id
+        ):
+            await asyncio.to_thread(
+                db.fail_logical_turn,
+                logical_turn_id,
+                attempt_id,
+                "could not start ACP logical turn",
+                retryable=True,
+            )
+            return PromptResponse(stop_reason="refusal")
+        with state.runtime_lock:
+            state.is_running = True
+            state.current_prompt_text = user_text or "[Image attachment]"
 
         logger.info("Prompt on session %s: %s", session_id, user_text[:100])
 
@@ -2075,7 +2250,9 @@ class HermesACPAgent(acp.Agent):
                 result = agent.run_conversation(
                     user_message=user_content,
                     conversation_history=state.history,
-                    task_id=session_id,
+                    # ACP conversation identity is not task identity.  A real
+                    # Kanban/task-backed producer must supply its own task ID.
+                    task_id=None,
                     persist_user_message=user_text or "[Image attachment]",
                 )
                 return result
@@ -2110,6 +2287,19 @@ class HermesACPAgent(acp.Agent):
                     except Exception:
                         logger.debug("Could not clear ACP session context", exc_info=True)
 
+        async def _heartbeat_acp_turn() -> None:
+            while True:
+                await asyncio.sleep(30.0)
+                renewed = await asyncio.to_thread(
+                    db.heartbeat_logical_turn,
+                    logical_turn_id,
+                    attempt_id,
+                    ttl_seconds=1800.0,
+                )
+                if not renewed:
+                    return
+
+        heartbeat_task = asyncio.create_task(_heartbeat_acp_turn())
         try:
             # Snapshot the internal Hermes DB session id before the turn so we
             # can detect a compression-driven session rotation afterwards. The
@@ -2124,10 +2314,29 @@ class HermesACPAgent(acp.Agent):
             result = await loop.run_in_executor(_executor, ctx.run, _run_agent)
         except Exception:
             logger.exception("Executor error for session %s", session_id)
+            await asyncio.to_thread(
+                db.fail_logical_turn,
+                logical_turn_id,
+                attempt_id,
+                "ACP executor failed",
+                retryable=False,
+            )
             with state.runtime_lock:
                 state.is_running = False
                 state.current_prompt_text = ""
             return PromptResponse(stop_reason="end_turn")
+        finally:
+            heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
+
+        await asyncio.to_thread(
+            db.complete_logical_turn,
+            logical_turn_id,
+            attempt_id,
+            {"agent_result": result},
+            delivery_required=bool(conn),
+        )
 
         if result.get("messages"):
             state.history = result["messages"]
@@ -2179,7 +2388,33 @@ class HermesACPAgent(acp.Agent):
             # finished (e.g. transform_llm_output) — otherwise the appended /
             # rewritten text never reaches the client.
             update = acp.update_agent_message_text(final_response)
-            await conn.session_update(session_id, update)
+            try:
+                await conn.session_update(session_id, update)
+            except Exception as exc:
+                await asyncio.to_thread(
+                    db.fail_logical_turn_delivery,
+                    logical_turn_id,
+                    attempt_id,
+                    str(exc),
+                )
+                logger.warning(
+                    "ACP final delivery failed for logical turn %s",
+                    logical_turn_id,
+                    exc_info=True,
+                )
+                conn = None
+
+        if conn:
+            await asyncio.to_thread(
+                db.record_logical_turn_transport_accepted,
+                logical_turn_id,
+                attempt_id,
+            )
+            await asyncio.to_thread(
+                db.acknowledge_logical_turn_delivery,
+                logical_turn_id,
+                attempt_id,
+            )
 
         # Mark this turn idle before draining queued work so recursive prompt()
         # calls can acquire the session. Queued turns are intentionally run as
@@ -2188,20 +2423,10 @@ class HermesACPAgent(acp.Agent):
             state.is_running = False
             state.current_prompt_text = ""
 
-        while True:
-            with state.runtime_lock:
-                if not state.queued_prompts:
-                    break
-                next_prompt = state.queued_prompts.pop(0)
-            if conn:
-                await conn.session_update(
-                    session_id,
-                    acp.update_user_message_text(next_prompt),
-                )
-            await self.prompt(
-                prompt=[TextContentBlock(type="text", text=next_prompt)],
-                session_id=session_id,
-            )
+        # Durable FIFO replaces the old process-local queued_prompts recursion.
+        # Dispatch one eligible successor; its own completion repeats the
+        # process without synchronously waiting against the parent turn.
+        await self._drain_acp_logical_turns(limit=1)
 
         usage = None
         if any(result.get(key) is not None for key in ("prompt_tokens", "completion_tokens", "total_tokens")):
