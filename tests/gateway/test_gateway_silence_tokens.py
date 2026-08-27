@@ -34,6 +34,7 @@ def _event():
 
 def _runner(monkeypatch, tmp_path):
     runner = gateway_run.GatewayRunner(GatewayConfig())
+    runner._allow_ephemeral_gateway_admission_for_tests = True
     runner.adapters = {}
     runner._running_agents = {}
     runner._running_agents_ts = {}

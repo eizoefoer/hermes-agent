@@ -7934,7 +7934,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             turn = self._logical_turn_row(row)
             if turn is None:
                 return {"outcome": "missing", "turn": None, "lease": None}
-            if turn["state"] in {"completed", "unrecoverable", "cancelled"}:
+            if turn["state"] in {
+                "completed",
+                "unrecoverable",
+                "cancelled",
+                "blocked",
+            }:
                 return {"outcome": "terminal", "turn": turn, "lease": None}
 
             conversation_id = self._session_turn_lease_key_on_conn(
@@ -8254,23 +8259,52 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return self._execute_write(_do)
 
     def reconcile_logical_turns(self) -> int:
-        """Retry active attempts only after their durable lease is absent/expired."""
+        """Reconcile active attempts only after their durable lease is absent.
+
+        A claimed turn has not entered model/tool execution and is therefore
+        safe to retry.  Executing work is ambiguous after process loss: only
+        producers that persisted an explicit ``auto_retry`` recovery policy
+        may be replayed automatically.  All other executing turns become
+        blocked for producer-specific effect reconciliation instead of being
+        blindly executed twice.
+        """
         now = time.time()
 
         def _do(conn):
             conn.execute(
                 "DELETE FROM session_turn_leases WHERE expires_at <= ?", (now,)
             )
-            cursor = conn.execute(
+            claimed = conn.execute(
                 "UPDATE logical_turns SET state = 'retry', updated_at = ?, "
                 "error = COALESCE(error, 'reconciled after missing lease') "
-                "WHERE state IN ('claimed', 'executing') AND NOT EXISTS ("
+                "WHERE state = 'claimed' AND NOT EXISTS ("
                 "SELECT 1 FROM session_turn_leases lease "
                 "WHERE lease.conversation_id = logical_turns.lease_conversation_id "
                 "AND lease.holder = logical_turns.lease_holder)",
                 (now,),
             )
-            return cursor.rowcount
+            retrying = conn.execute(
+                "UPDATE logical_turns SET state = 'retry', updated_at = ?, "
+                "error = COALESCE(error, 'reconciled auto-retry after missing lease') "
+                "WHERE state = 'executing' "
+                "AND COALESCE(json_extract(payload_json, '$.recovery_policy'), '') "
+                "= 'auto_retry' AND NOT EXISTS ("
+                "SELECT 1 FROM session_turn_leases lease "
+                "WHERE lease.conversation_id = logical_turns.lease_conversation_id "
+                "AND lease.holder = logical_turns.lease_holder)",
+                (now,),
+            )
+            blocked = conn.execute(
+                "UPDATE logical_turns SET state = 'blocked', updated_at = ?, "
+                "error = COALESCE(error, "
+                "'execution lease disappeared; effect reconciliation required') "
+                "WHERE state = 'executing' AND NOT EXISTS ("
+                "SELECT 1 FROM session_turn_leases lease "
+                "WHERE lease.conversation_id = logical_turns.lease_conversation_id "
+                "AND lease.holder = logical_turns.lease_holder)",
+                (now,),
+            )
+            return claimed.rowcount + retrying.rowcount + blocked.rowcount
 
         return int(self._execute_write(_do) or 0)
 

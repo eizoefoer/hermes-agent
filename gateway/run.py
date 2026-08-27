@@ -41,6 +41,7 @@ import signal
 import threading
 import time
 import traceback
+import uuid
 from collections import OrderedDict
 from contextvars import Context, copy_context
 from pathlib import Path
@@ -115,6 +116,40 @@ _STALL_NOTIFY_SEND_TIMEOUT_SECONDS = 15.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
+
+_GATEWAY_LOGICAL_TURN_EVENT_TYPES = (
+    "gateway-inbound",
+    "gateway-internal",
+    "gateway-queued",
+    "gateway-goal-continuation",
+    "gateway-heartbeat",
+    "gateway-loop-wakeup",
+    "gateway-background-completion",
+    "gateway-delegation-completion",
+    "gateway-recovered-event",
+)
+_GATEWAY_LOGICAL_TURN_LEASE_TTL_SECONDS = 300.0
+_GATEWAY_LOGICAL_TURN_HEARTBEAT_SECONDS = 60.0
+_GATEWAY_LOGICAL_TURN_DRAIN_LIMIT = 100
+
+
+class DurableSessionAdmissionError(RuntimeError):
+    """Persistent gateway work could not enter the durable admission path."""
+
+
+class DurableSessionTurnQueued(RuntimeError):
+    """Accepted work is durable but another turn currently owns the session."""
+
+    def __init__(self, session_id: str, logical_turn_id: str):
+        self.session_id = session_id
+        self.logical_turn_id = logical_turn_id
+        super().__init__(
+            f"logical turn {logical_turn_id} queued for busy session {session_id}"
+        )
+
+
+class DurableSessionTurnAlreadyCompleted(RuntimeError):
+    """A replay mapped to a terminal logical turn and must not execute again."""
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
@@ -10229,8 +10264,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
             if self._queue_during_drain_enabled(effective_mode):
-                self._queue_or_replace_pending_event(session_key, event)
-                message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                persisted = await self._persist_busy_gateway_event(
+                    event, session_key
+                )
+                if persisted:
+                    self._queue_or_replace_pending_event(session_key, event)
+                message = (
+                    f"⏳ Gateway {self._status_action_gerund()} — queued durably "
+                    "for the next turn after it comes back."
+                    if persisted
+                    else "⛔ Gateway could not persist this turn; it was not queued."
+                )
             else:
                 message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
 
@@ -10340,10 +10384,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # payload text, so queue those through the gateway FIFO to keep their
         # security metadata separate from pending user input.
         if getattr(event, "internal", False) and not event.allow_gateway_control:
-            self._queue_or_replace_pending_event(session_key, event)
+            if await self._persist_busy_gateway_event(event, session_key):
+                self._queue_or_replace_pending_event(session_key, event)
             return True
         if getattr(event, "internal", False):
-            return False
+            if await self._persist_busy_gateway_event(event, session_key):
+                self._queue_or_replace_pending_event(session_key, event)
+            return True
 
         _busy_state = self._peek_session_state(session_key)
         running_agent = _busy_state.turn.agent if _busy_state else None
@@ -10354,7 +10401,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and busy_text_mode == "queue"
             and effective_mode != "steer"
         ):
-            return False
+            if await self._persist_busy_gateway_event(event, session_key):
+                self._queue_or_replace_pending_event(session_key, event)
+            return True
 
         # Steer mode: inject mid-run via running_agent.steer() instead of
         # queueing + interrupting.  If the agent isn't running yet
@@ -10457,7 +10506,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # turn in arrival order while still preserving photo-burst / album
         # merge semantics for media.
         if not steered and not redirected:
-            self._queue_or_replace_pending_event(session_key, event)
+            if await self._persist_busy_gateway_event(event, session_key):
+                self._queue_or_replace_pending_event(session_key, event)
 
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"
@@ -12313,6 +12363,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
+                session_event_id=f"resume-pending:{entry.session_id}",
+                session_event_type="gateway-recovered-event",
             )
             task = asyncio.create_task(
                 self._run_startup_resume_event(adapter, event, entry.session_key)
@@ -13331,6 +13383,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._schedule_resume_pending_sessions()
         await self._finish_startup_restore()
 
+        # Reconcile and dispatch accepted queued/retry gateway turns from the
+        # durable ledger.  This is the authoritative process-replacement path;
+        # adapter pending maps remain local delivery optimisations only.
+        self._spawn_supervised(
+            self._gateway_logical_turn_watcher,
+            "gateway_logical_turn_watcher",
+        )
+
         # Surface state.db init failures to the user's messaging platforms
         # so they know persistence is broken before losing data (#88235).
         await self._send_session_db_warning_notifications()
@@ -13831,6 +13891,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             text=synthetic_text,
             source=dest_source,
             internal=True,
+            session_event_id=f"handoff:{cli_session_id}:{session_key}",
+            session_event_type="gateway-recovered-event",
         )
 
         logger.info(
@@ -16593,32 +16655,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         has_media = bool(getattr(event, "media_urls", None))
         if not queued_text and not has_media:
             return "Usage: /queue <prompt>"
+        queued_event = dataclasses.replace(
+            event,
+            text=queued_text,
+            message_type=event.message_type if has_media else MessageType.TEXT,
+            session_event_type="gateway-queued",
+        )
+        if not await self._persist_busy_gateway_event(queued_event, quick_key):
+            return "⛔ Durable session storage is unavailable; the turn was not queued."
         adapter = self._adapter_for_source(source)
-        if adapter:
-            queued_event = MessageEvent(
-                text=queued_text,
-                message_type=event.message_type if has_media else MessageType.TEXT,
-                source=event.source,
-                raw_message=event.raw_message,
-                message_id=event.message_id,
-                media_urls=list(getattr(event, "media_urls", []) or []),
-                media_types=list(getattr(event, "media_types", []) or []),
-                reply_to_message_id=event.reply_to_message_id,
-                reply_to_text=event.reply_to_text,
-                reply_to_author_id=event.reply_to_author_id,
-                reply_to_author_name=event.reply_to_author_name,
-                reply_to_is_own_message=event.reply_to_is_own_message,
-                auto_skill=event.auto_skill,
-                channel_prompt=event.channel_prompt,
-                channel_context=event.channel_context,
-                internal=event.internal,
-                timestamp=event.timestamp,
-            )
+        if adapter is not None:
             self._enqueue_fifo(quick_key, queued_event, adapter)
-        depth = self._queue_depth(quick_key, adapter=self._adapter_for_source(source))
-        if depth <= 1:
-            return "Queued for the next turn."
-        return f"Queued for the next turn. ({depth} queued)"
+        return "Queued for the next turn."
 
     async def _busy_steer_command(self, event: MessageEvent, quick_key: str, source):
         # /steer <prompt> — inject mid-run after the next tool call.
@@ -16633,17 +16681,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         running_agent = _steer_state.turn.agent if _steer_state else None
         if running_agent is _AGENT_PENDING_SENTINEL:
             # Agent hasn't started yet — queue as turn-boundary fallback.
-            adapter = self._adapter_for_source(source)
-            if adapter:
-                queued_event = MessageEvent(
-                    text=steer_text,
-                    message_type=MessageType.TEXT,
-                    source=event.source,
-                    message_id=event.message_id,
-                    channel_prompt=event.channel_prompt,
-                    channel_context=event.channel_context,
-                )
-                self._enqueue_fifo(quick_key, queued_event, adapter)
+            queued_event = dataclasses.replace(
+                event,
+                text=steer_text,
+                message_type=MessageType.TEXT,
+                session_event_type="gateway-queued",
+            )
+            if await self._persist_busy_gateway_event(queued_event, quick_key):
+                adapter = self._adapter_for_source(source)
+                if adapter is not None:
+                    self._enqueue_fifo(quick_key, queued_event, adapter)
             return "Agent still starting — /steer queued for the next turn."
         if running_agent and hasattr(running_agent, "steer"):
             try:
@@ -16656,17 +16703,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return f"⏩ Steer queued — arrives after the next tool call: '{preview}'"
             return "Steer rejected (empty payload)."
         # Running agent is missing or lacks steer() — fall back to queue.
-        adapter = self._adapter_for_source(source)
-        if adapter:
-            queued_event = MessageEvent(
-                text=steer_text,
-                message_type=MessageType.TEXT,
-                source=event.source,
-                message_id=event.message_id,
-                channel_prompt=event.channel_prompt,
-                channel_context=event.channel_context,
-            )
-            self._enqueue_fifo(quick_key, queued_event, adapter)
+        queued_event = dataclasses.replace(
+            event,
+            text=steer_text,
+            message_type=MessageType.TEXT,
+            session_event_type="gateway-queued",
+        )
+        if await self._persist_busy_gateway_event(queued_event, quick_key):
+            adapter = self._adapter_for_source(source)
+            if adapter is not None:
+                self._enqueue_fifo(quick_key, queued_event, adapter)
         return "No active agent — /steer queued for the next turn."
 
     async def _busy_goal_command(self, event: MessageEvent, quick_key: str, source):
@@ -17295,7 +17341,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
                 adapter = self._adapter_for_source(source)
-                if adapter:
+                if adapter and await self._persist_busy_gateway_event(
+                    event, _quick_key
+                ):
                     merge_pending_message_event(adapter._pending_messages, _quick_key, event)
                 return None
 
@@ -17318,7 +17366,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _quick_key,
                 )
                 adapter = self._adapter_for_source(source)
-                if adapter:
+                if adapter and await self._persist_busy_gateway_event(
+                    event, _quick_key
+                ):
                     if effective_busy_input_mode == "queue":
                         self._enqueue_fifo(_quick_key, event, adapter)
                     else:
@@ -17342,7 +17392,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Queue the message so it will be picked up after the
                 # agent starts.
                 adapter = self._adapter_for_source(source)
-                if adapter:
+                if adapter and await self._persist_busy_gateway_event(
+                    event, _quick_key
+                ):
                     merge_pending_message_event(
                         adapter._pending_messages,
                         _quick_key,
@@ -17355,7 +17407,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     effective_busy_input_mode
                 )
                 if queue_during_drain:
-                    self._queue_or_replace_pending_event(_quick_key, event)
+                    if await self._persist_busy_gateway_event(event, _quick_key):
+                        self._queue_or_replace_pending_event(_quick_key, event)
                 return (
                     f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
                     if queue_during_drain
@@ -17363,7 +17416,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             if effective_busy_input_mode == "queue":
                 logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
-                self._queue_or_replace_pending_event(_quick_key, event)
+                if await self._persist_busy_gateway_event(event, _quick_key):
+                    self._queue_or_replace_pending_event(_quick_key, event)
                 return None
             if effective_busy_input_mode == "steer":
                 # Steer mode: inject text into the running agent mid-run via
@@ -17387,7 +17441,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug("PRIORITY steer for session %s", _quick_key)
                     return None
                 logger.debug("PRIORITY steer-fallback-to-queue for session %s", _quick_key)
-                self._queue_or_replace_pending_event(_quick_key, event)
+                if await self._persist_busy_gateway_event(event, _quick_key):
+                    self._queue_or_replace_pending_event(_quick_key, event)
                 return None
             # #30170 — Subagent protection (PRIORITY path). Same rationale
             # as ``_handle_active_session_busy_message``: an interrupt
@@ -17403,7 +17458,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "because the running agent has active subagents (#30170)",
                     _quick_key,
                 )
-                self._queue_or_replace_pending_event(_quick_key, event)
+                if await self._persist_busy_gateway_event(event, _quick_key):
+                    self._queue_or_replace_pending_event(_quick_key, event)
                 return None
             # #56391 — Compression protection (PRIORITY path). Same
             # rationale as ``_handle_active_session_busy_message``: context
@@ -17419,7 +17475,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "because context compression is in flight (#56391)",
                     _quick_key,
                 )
-                self._queue_or_replace_pending_event(_quick_key, event)
+                if await self._persist_busy_gateway_event(event, _quick_key):
+                    self._queue_or_replace_pending_event(_quick_key, event)
                 return None
             # Text-only corrections redirect the live turn (preserving
             # displayed context) when the runtime supports it; media/voice and
@@ -17443,6 +17500,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc,
                     )
             logger.debug("PRIORITY interrupt for session %s", _quick_key)
+            if await self._persist_busy_gateway_event(event, _quick_key):
+                self._queue_or_replace_pending_event(_quick_key, event)
             _interrupt_text = event.text
             _media_urls = getattr(event, "media_urls", None) or []
             if self._pending_event_audio_paths(event):
@@ -18237,6 +18296,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _agent_result = await self._handle_message_with_agent(
                     event, source, _quick_key, _run_generation
                 )
+            except DurableSessionTurnQueued as exc:
+                logger.info(
+                    "Durably queued turn for busy session: session=%s turn=%s",
+                    exc.session_id,
+                    exc.logical_turn_id,
+                )
+                return "⏳ This session is busy. Your message is safely queued for the next turn."
+            except DurableSessionTurnAlreadyCompleted:
+                logger.info(
+                    "Ignoring replay of completed durable gateway occurrence: turn=%s",
+                    getattr(event, "_logical_turn_id", None),
+                )
+                return None
+            except DurableSessionAdmissionError as exc:
+                logger.error("Durable gateway admission failed: %s", exc)
+                return (
+                    "⛔ Durable session storage is unavailable, so this message "
+                    "was not executed. Please retry after storage recovers."
+                )
             except TurnLeaseTimeoutError as exc:
                 # This is a rejected message, not a completed agent turn. Return
                 # before the /goal judge below so it cannot consume the resend
@@ -18262,7 +18340,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             except Exception as _goal_exc:
                 logger.debug("post-turn hook failed: %s", _goal_exc)
+            await self._complete_gateway_logical_turn(event, _agent_result)
             return _agent_result
+        except asyncio.CancelledError:
+            await self._fail_gateway_logical_turn(
+                event,
+                "gateway turn cancelled before terminal completion",
+                retryable=False,
+            )
+            raise
+        except BaseException as exc:
+            await self._fail_gateway_logical_turn(event, exc, retryable=False)
+            raise
         finally:
             # MoA one-shot restore must run on EVERY exit path, not just
             # success. The restore data lives on the per-turn event object
@@ -19038,6 +19127,484 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    @staticmethod
+    def _gateway_event_type(event: MessageEvent) -> str:
+        explicit = str(getattr(event, "session_event_type", None) or "").strip()
+        if explicit:
+            return explicit
+        return "gateway-internal" if getattr(event, "internal", False) else "gateway-inbound"
+
+    @staticmethod
+    def _gateway_event_source_identity(event: MessageEvent) -> tuple[str, bool]:
+        """Return the accepted occurrence identity and its authority status.
+
+        Transport replay keys win.  Internal/synthetic message IDs are reply
+        anchors, not occurrence identities.  When no authoritative key exists,
+        MessageEvent's acceptance-time occurrence is used and later persisted.
+        """
+        durable_identity = getattr(event, "_durable_source_identity", None)
+        if durable_identity:
+            return str(durable_identity), bool(
+                getattr(event, "_source_identity_authoritative", False)
+            )
+        source = event.source
+        platform = getattr(getattr(source, "platform", None), "value", "unknown")
+        event_type = GatewayRunner._gateway_event_type(event)
+        event_id = getattr(event, "session_event_id", None)
+        update_id = getattr(event, "platform_update_id", None)
+        message_id = getattr(event, "message_id", None)
+        if event_id:
+            return f"{platform}:event:{event_type}:{event_id}", True
+        if update_id is not None:
+            return f"{platform}:update:{source.chat_id}:{update_id}", True
+        if message_id and not getattr(event, "internal", False):
+            thread_id = getattr(source, "thread_id", None) or ""
+            return (
+                f"{platform}:message:{source.chat_id}:{thread_id}:{message_id}",
+                True,
+            )
+        occurrence_id = str(getattr(event, "occurrence_id", None) or uuid.uuid4().hex)
+        event.occurrence_id = occurrence_id
+        return f"{platform}:occurrence:{occurrence_id}", False
+
+    @staticmethod
+    def _gateway_logical_turn_payload(
+        event: MessageEvent,
+        *,
+        source_identity_authoritative: bool,
+    ) -> Dict[str, Any]:
+        source = event.source
+        timestamp = getattr(event, "timestamp", None)
+        if hasattr(timestamp, "isoformat"):
+            timestamp = timestamp.isoformat()
+        message_type = getattr(event, "message_type", MessageType.TEXT)
+        message_type_value = getattr(message_type, "value", str(message_type))
+        metadata = dict(getattr(event, "metadata", None) or {})
+        recovery_policy = str(
+            metadata.get("logical_turn_recovery_policy") or "manual_reconcile"
+        )
+        return {
+            "event_type": GatewayRunner._gateway_event_type(event),
+            "text": event.text,
+            "message_type": message_type_value,
+            "message_id": getattr(event, "message_id", None),
+            "reply_to_message_id": getattr(event, "reply_to_message_id", None),
+            "reply_to_text": getattr(event, "reply_to_text", None),
+            "reply_to_author_id": getattr(event, "reply_to_author_id", None),
+            "reply_to_author_name": getattr(event, "reply_to_author_name", None),
+            "reply_to_is_own_message": bool(
+                getattr(event, "reply_to_is_own_message", False)
+            ),
+            "platform_update_id": getattr(event, "platform_update_id", None),
+            "internal": bool(getattr(event, "internal", False)),
+            "allow_gateway_control": bool(
+                getattr(event, "allow_gateway_control", True)
+            ),
+            "session_event_id": getattr(event, "session_event_id", None),
+            "occurrence_id": getattr(event, "occurrence_id", None),
+            "source_identity_authoritative": source_identity_authoritative,
+            "session_event_type": GatewayRunner._gateway_event_type(event),
+            "source": source.to_dict() if hasattr(source, "to_dict") else {},
+            "media_urls": list(getattr(event, "media_urls", None) or []),
+            "media_types": list(getattr(event, "media_types", None) or []),
+            "auto_skill": getattr(event, "auto_skill", None),
+            "channel_prompt": getattr(event, "channel_prompt", None),
+            "channel_context": getattr(event, "channel_context", None),
+            "metadata": metadata,
+            "timestamp": timestamp,
+            "delegation_id": getattr(event, "delegation_id", None),
+            "barrier_id": getattr(event, "barrier_id", None),
+            "parent_logical_turn_id": getattr(
+                event, "parent_logical_turn_id", None
+            ),
+            "recovery_policy": recovery_policy,
+        }
+
+    async def admit_session_event(
+        self,
+        event: MessageEvent,
+        session_entry: SessionEntry,
+        *,
+        claim: bool = True,
+    ) -> Dict[str, Any]:
+        """Canonical durable gateway admission facade for a new session turn."""
+        if getattr(self, "_allow_ephemeral_gateway_admission_for_tests", False):
+            # Explicit compatibility mode for unit tests that isolate deep
+            # agent/transcript behavior with non-persistent fakes.  Real
+            # GatewayRunner construction never sets this flag.
+            logical_turn_id = f"ephemeral-test-{uuid.uuid4().hex}"
+            attempt_id = f"ephemeral-test-{uuid.uuid4().hex}"
+            setattr(event, "_logical_turn_id", logical_turn_id)
+            setattr(event, "_logical_attempt_id", attempt_id)
+            setattr(event, "_ephemeral_gateway_admission_for_test", True)
+            return {
+                "outcome": "claimed",
+                "attempt_id": attempt_id,
+                "turn": {"logical_turn_id": logical_turn_id},
+                "lease": None,
+            }
+        state = self._session_db
+        if state is None:
+            raise DurableSessionAdmissionError(
+                "SessionDB is unavailable; refusing unmanaged persistent gateway work"
+            )
+        source = event.source
+        platform = getattr(getattr(source, "platform", None), "value", "gateway")
+        if not await state.get_session(session_entry.session_id):
+            await state.create_session(
+                session_entry.session_id,
+                platform,
+                user_id=getattr(source, "user_id", None),
+            )
+        source_identity, authoritative = self._gateway_event_source_identity(event)
+        admitted = await state.admit_session_event(
+            session_id=session_entry.session_id,
+            session_key=session_entry.session_key,
+            source_identity=source_identity,
+            event_type=self._gateway_event_type(event),
+            payload=self._gateway_logical_turn_payload(
+                event, source_identity_authoritative=authoritative
+            ),
+            task_id=getattr(event, "task_id", None),
+            goal_id=getattr(event, "goal_id", None),
+            branch=getattr(event, "branch", None),
+            worktree=getattr(event, "worktree", None),
+        )
+        setattr(event, "_logical_turn_id", admitted["logical_turn_id"])
+        setattr(event, "_logical_turn_db", state)
+        setattr(event, "_durable_source_identity", source_identity)
+        setattr(event, "_source_identity_authoritative", authoritative)
+        if admitted.get("duplicate") and admitted.get("state") == "completed":
+            return {"outcome": "duplicate-completed", "turn": admitted}
+        if not claim:
+            return {"outcome": "queued", "turn": admitted}
+        claimed = await state.claim_logical_turn(
+            admitted["logical_turn_id"],
+            owner=f"gateway:{os.getpid()}",
+            pid=os.getpid(),
+            ttl_seconds=_GATEWAY_LOGICAL_TURN_LEASE_TTL_SECONDS,
+        )
+        if claimed.get("outcome") == "claimed":
+            setattr(event, "_logical_attempt_id", claimed["attempt_id"])
+            setattr(event, "_logical_turn_lease", claimed.get("lease"))
+            self._start_gateway_logical_turn_heartbeat(event)
+        return claimed
+
+    async def _admit_busy_gateway_event(
+        self, event: MessageEvent, session_key: str
+    ) -> Dict[str, Any]:
+        """Persist a same-session next turn without waiting on its owner."""
+        entry = await self.async_session_store.lookup_by_session_key(session_key)
+        if entry is None:
+            entry = await self.async_session_store.get_or_create_session(
+                event.source,
+                touch_activity=not bool(getattr(event, "internal", False)),
+            )
+        return await self.admit_session_event(event, entry, claim=False)
+
+    async def _persist_busy_gateway_event(
+        self, event: MessageEvent, session_key: str
+    ) -> bool:
+        """Fail closed while accepting a next turn behind active work."""
+        try:
+            await self._admit_busy_gateway_event(event, session_key)
+            return True
+        except Exception as exc:
+            logger.error(
+                "Refusing process-local-only busy work: session=%s error=%s",
+                session_key,
+                exc,
+                exc_info=True,
+            )
+            adapter = self._adapter_for_source(event.source)
+            if adapter is not None:
+                try:
+                    await adapter._send_with_retry(
+                        chat_id=event.source.chat_id,
+                        content=(
+                            "⛔ Durable session storage is unavailable, so this "
+                            "message was not queued or executed. Please retry after "
+                            "storage recovers."
+                        ),
+                        reply_to=self._reply_anchor_for_event(event),
+                        metadata=self._thread_metadata_for_source(
+                            event.source, self._reply_anchor_for_event(event)
+                        ),
+                    )
+                except Exception:
+                    logger.debug(
+                        "Could not send durable-admission failure notice",
+                        exc_info=True,
+                    )
+            return False
+
+    def _start_gateway_logical_turn_heartbeat(self, event: MessageEvent) -> None:
+        if getattr(event, "_logical_turn_heartbeat_task", None) is not None:
+            return
+
+        async def _heartbeat() -> None:
+            while True:
+                await asyncio.sleep(_GATEWAY_LOGICAL_TURN_HEARTBEAT_SECONDS)
+                db = getattr(event, "_logical_turn_db", None)
+                turn_id = getattr(event, "_logical_turn_id", None)
+                attempt_id = getattr(event, "_logical_attempt_id", None)
+                if db is None or not turn_id or not attempt_id:
+                    return
+                if not await db.heartbeat_logical_turn(
+                    turn_id,
+                    attempt_id,
+                    ttl_seconds=_GATEWAY_LOGICAL_TURN_LEASE_TTL_SECONDS,
+                ):
+                    logger.error(
+                        "Durable logical-turn heartbeat lost ownership: "
+                        "session=%s turn=%s attempt=%s",
+                        self._session_key_for_source(event.source),
+                        turn_id,
+                        attempt_id,
+                    )
+                    return
+
+        task = asyncio.create_task(_heartbeat())
+        setattr(event, "_logical_turn_heartbeat_task", task)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _stop_gateway_logical_turn_heartbeat(self, event: MessageEvent) -> None:
+        task = getattr(event, "_logical_turn_heartbeat_task", None)
+        setattr(event, "_logical_turn_heartbeat_task", None)
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def _complete_gateway_logical_turn(
+        self, event: MessageEvent, result: Any
+    ) -> None:
+        db = getattr(event, "_logical_turn_db", None)
+        turn_id = getattr(event, "_logical_turn_id", None)
+        attempt_id = getattr(event, "_logical_attempt_id", None)
+        if db is None or not turn_id or not attempt_id:
+            return
+        await self._stop_gateway_logical_turn_heartbeat(event)
+        if isinstance(result, dict) and (
+            result.get("failed")
+            or result.get("error")
+            or result.get("interrupted")
+        ):
+            await db.fail_logical_turn(
+                turn_id,
+                attempt_id,
+                str(result.get("error") or "gateway execution did not complete"),
+                retryable=False,
+            )
+            return
+        response = self._final_text_for_post_turn_hooks(result, event)
+        delivery_required = bool(response.strip())
+        await db.complete_logical_turn(
+            turn_id,
+            attempt_id,
+            {
+                "completed": True,
+                "response": response,
+                "response_present": delivery_required,
+            },
+            delivery_required=delivery_required,
+        )
+        if delivery_required:
+            setattr(
+                event,
+                "_logical_turn_delivery_callback",
+                self._record_gateway_turn_delivery,
+            )
+
+    async def _fail_gateway_logical_turn(
+        self,
+        event: MessageEvent,
+        error: BaseException | str,
+        *,
+        retryable: bool = False,
+    ) -> None:
+        db = getattr(event, "_logical_turn_db", None)
+        turn_id = getattr(event, "_logical_turn_id", None)
+        attempt_id = getattr(event, "_logical_attempt_id", None)
+        if db is None or not turn_id or not attempt_id:
+            return
+        await self._stop_gateway_logical_turn_heartbeat(event)
+        await db.fail_logical_turn(
+            turn_id,
+            attempt_id,
+            str(error),
+            retryable=retryable,
+        )
+
+    async def _record_gateway_turn_delivery(
+        self,
+        event: MessageEvent,
+        succeeded: bool,
+        error: Optional[str] = None,
+    ) -> None:
+        db = getattr(event, "_logical_turn_db", None)
+        turn_id = getattr(event, "_logical_turn_id", None)
+        attempt_id = getattr(event, "_logical_attempt_id", None)
+        if db is None or not turn_id or not attempt_id:
+            return
+        await db.begin_logical_turn_delivery(turn_id, attempt_id)
+        if succeeded:
+            await db.acknowledge_logical_turn_delivery(turn_id, attempt_id)
+        else:
+            await db.fail_logical_turn_delivery(
+                turn_id,
+                attempt_id,
+                error or "no successful delivery acknowledgement",
+            )
+
+    @staticmethod
+    def _message_event_from_logical_turn(turn: Dict[str, Any]) -> Optional[MessageEvent]:
+        """Restore one accepted event without minting a new occurrence."""
+        payload = turn.get("payload") or {}
+        source_data = payload.get("source") or {}
+        if not source_data:
+            return None
+        try:
+            source = SessionSource.from_dict(source_data)
+            raw_message_type = str(payload.get("message_type") or "text")
+            try:
+                message_type = MessageType(raw_message_type)
+            except ValueError:
+                message_type = MessageType.TEXT
+            raw_timestamp = payload.get("timestamp")
+            try:
+                timestamp = datetime.fromisoformat(raw_timestamp) if raw_timestamp else datetime.now()
+            except (TypeError, ValueError):
+                timestamp = datetime.now()
+            event = MessageEvent(
+                text=str(payload.get("text") or ""),
+                message_type=message_type,
+                source=source,
+                message_id=payload.get("message_id"),
+                platform_update_id=payload.get("platform_update_id"),
+                media_urls=list(payload.get("media_urls") or []),
+                media_types=list(payload.get("media_types") or []),
+                reply_to_message_id=payload.get("reply_to_message_id"),
+                reply_to_text=payload.get("reply_to_text"),
+                reply_to_author_id=payload.get("reply_to_author_id"),
+                reply_to_author_name=payload.get("reply_to_author_name"),
+                reply_to_is_own_message=bool(
+                    payload.get("reply_to_is_own_message", False)
+                ),
+                auto_skill=payload.get("auto_skill"),
+                channel_prompt=payload.get("channel_prompt"),
+                channel_context=payload.get("channel_context"),
+                internal=bool(payload.get("internal")),
+                metadata=dict(payload.get("metadata") or {}),
+                session_event_id=payload.get("session_event_id"),
+                occurrence_id=str(payload.get("occurrence_id") or ""),
+                session_event_type=(
+                    payload.get("session_event_type") or payload.get("event_type")
+                ),
+                task_id=turn.get("task_id"),
+                goal_id=turn.get("goal_id"),
+                delegation_id=payload.get("delegation_id"),
+                barrier_id=payload.get("barrier_id"),
+                parent_logical_turn_id=payload.get("parent_logical_turn_id"),
+                branch=turn.get("branch"),
+                worktree=turn.get("worktree"),
+                timestamp=timestamp,
+                allow_gateway_control=bool(
+                    payload.get("allow_gateway_control", True)
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "Could not rehydrate durable gateway turn %s",
+                turn.get("logical_turn_id"),
+                exc_info=True,
+            )
+            return None
+        setattr(event, "_durable_source_identity", turn.get("source_identity"))
+        setattr(
+            event,
+            "_source_identity_authoritative",
+            bool(payload.get("source_identity_authoritative", False)),
+        )
+        setattr(event, "_logical_turn_id", turn.get("logical_turn_id"))
+        return event
+
+    async def _drain_gateway_logical_turn_scope(self) -> int:
+        db = self._session_db
+        if db is None:
+            return 0
+        await db.reconcile_logical_turns()
+        turns = await db.list_ready_logical_turns(
+            limit=_GATEWAY_LOGICAL_TURN_DRAIN_LIMIT,
+            event_types=_GATEWAY_LOGICAL_TURN_EVENT_TYPES,
+        )
+        dispatched = 0
+        dispatching = getattr(self, "_gateway_logical_turn_dispatching", None)
+        if dispatching is None:
+            dispatching = {}
+            self._gateway_logical_turn_dispatching = dispatching
+        now = time.monotonic()
+        for logical_turn_id, started_at in list(dispatching.items()):
+            if now - started_at > 30.0:
+                dispatching.pop(logical_turn_id, None)
+        for turn in turns:
+            logical_turn_id = str(turn["logical_turn_id"])
+            if logical_turn_id in dispatching:
+                continue
+            if await db.get_session_turn_lease(turn["session_id"]):
+                continue
+            event = self._message_event_from_logical_turn(turn)
+            if event is None:
+                continue
+            adapter = self._adapter_for_source(event.source)
+            if adapter is None:
+                continue
+            session_key = self._session_key_for_source(event.source)
+            if session_key in getattr(adapter, "_active_sessions", {}):
+                continue
+            dispatching[logical_turn_id] = now
+            try:
+                await adapter.handle_message(event)
+                dispatched += 1
+            except Exception:
+                dispatching.pop(logical_turn_id, None)
+                logger.warning(
+                    "Durable gateway turn dispatch failed: turn=%s session=%s",
+                    logical_turn_id,
+                    turn.get("session_key"),
+                    exc_info=True,
+                )
+        return dispatched
+
+    async def _gateway_logical_turn_watcher(self) -> None:
+        """Bounded startup/live dispatcher for accepted gateway work."""
+        from hermes_constants import get_hermes_home
+
+        while self._running:
+            homes = [Path(get_hermes_home())]
+            if getattr(self.config, "multiplex_profiles", False):
+                homes.extend(home for _name, home in _multiplex_profile_homes(self.config))
+            seen: set[Path] = set()
+            for home in homes:
+                resolved = Path(home).resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                try:
+                    with _profile_runtime_scope(resolved):
+                        await self._drain_gateway_logical_turn_scope()
+                except Exception:
+                    logger.warning(
+                        "Durable gateway logical-turn recovery pass failed for %s",
+                        resolved,
+                        exc_info=True,
+                    )
+            await asyncio.sleep(1.0)
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -19176,6 +19743,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await asyncio.to_thread(self._record_telegram_topic_binding, source, session_entry)
                 except Exception:
                     logger.debug("Failed to record Telegram topic binding", exc_info=True)
+
+        # Durable admission is the accepted-work boundary.  It happens after
+        # final session resolution (including topic and delegation pinning),
+        # but before hooks, transcript mutation, or model/tool execution.
+        admission = await self.admit_session_event(event, session_entry)
+        admission_outcome = admission.get("outcome")
+        if admission_outcome == "duplicate-completed":
+            raise DurableSessionTurnAlreadyCompleted(
+                str(admission["turn"]["logical_turn_id"])
+            )
+        if admission_outcome == "busy":
+            raise DurableSessionTurnQueued(
+                session_entry.session_id,
+                str(getattr(event, "_logical_turn_id", "")),
+            )
+        if admission_outcome == "terminal":
+            raise DurableSessionTurnAlreadyCompleted(
+                str(getattr(event, "_logical_turn_id", ""))
+            )
+        if admission_outcome != "claimed":
+            raise DurableSessionAdmissionError(
+                f"unexpected durable admission outcome: {admission_outcome!r}"
+            )
         # Capture and immediately consume was_auto_reset so it does not
         # re-fire on subsequent messages — preventing the cleanup from
         # wiping model/reasoning overrides set between turns (Closes #48031).
@@ -19379,47 +19969,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as e:
                 logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
 
-        # ── Turn lease (#64934) ────────────────────────────────────────
-        # Session resolution is FINAL here (get_or_create → async-delegation
-        # pinning → topic tip-walk switch_session are all above). Serialize
-        # the [load history → run → flush] region per resolved SESSION_ID:
-        # when a second routing key is mapped to this same session_id, its
-        # turn waits here for the previous turn's flush instead of loading a
-        # stale history base and interleaving transcript writes. Same-key
-        # messages never reach this point mid-turn (adapter + runner guards
-        # hold them), so the lock is uncontended outside the alias-key route.
-        # Fail-closed on timeout: never enter the transcript region without a
-        # lease. Outer dispatch returns a bounded rejection/resend notice rather
-        # than recreating the exact concurrent-turn corruption this lease exists
-        # to prevent. Released in _handle_message's finally via
-        # _release_turn_lease — granted per (routing key, run generation) so a
-        # stale unwind can't release a newer turn's lease.
-        _lease_registry = getattr(self, "_turn_leases", None)
-        if _lease_registry is not None:
-            try:
-                _lease_token = await _lease_registry.acquire(
-                    session_entry.session_id,
-                    owner_key=_quick_key,
-                    generation=run_generation,
-                    timeout=_float_env(
-                        "HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT
-                    ),
+        # The SessionDB logical-turn claim already owns the authoritative
+        # cross-process session lease.  The old SessionTurnLeaseRegistry is a
+        # process-local alias cache and must not create a second wait/ownership
+        # decision for durably admitted work.
+        if not getattr(event, "_ephemeral_gateway_admission_for_test", False):
+            logical_turn_id = getattr(event, "_logical_turn_id", None)
+            logical_attempt_id = getattr(event, "_logical_attempt_id", None)
+            logical_turn_db = getattr(event, "_logical_turn_db", None)
+            if (
+                logical_turn_db is None
+                or not logical_turn_id
+                or not logical_attempt_id
+                or not await logical_turn_db.mark_logical_turn_started(
+                    logical_turn_id, logical_attempt_id
                 )
-            except TurnLeaseTimeoutError:
-                # The broad session-context cleanup finally starts later in this
-                # method. Restore the tokens here before propagating the rejection
-                # to outer dispatch, or this early exit leaks task-local identity.
+            ):
                 self._clear_session_env(_session_env_tokens)
-                raise
-            if _lease_token is not None:
-                _lease_state = self._session_state(_quick_key).turn
-                _lease_state.lease_token = _lease_token
-                _lease_state.lease_generation = run_generation
+                raise DurableSessionAdmissionError(
+                    "durable logical turn lost ownership before execution"
+                )
 
-        # A turn only becomes durable recovery work after it owns (or has
-        # explicitly degraded past) the per-session lease.  Marking before the
-        # await above would falsely recover an alias-routed message that never
-        # began processing if the gateway died while it was still waiting.
         await self._mark_durable_active_turn(event, session_entry.session_key)
 
         # Load conversation history from transcript
@@ -21647,8 +22217,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             source=source,
                             message_id=None,
                             channel_prompt=None,
+                            internal=True,
+                            allow_gateway_control=False,
+                            session_event_id=(
+                                f"heartbeat:{session_id}:"
+                                f"{mgr.state.fire_count if mgr.state else 0}"
+                            ),
+                            session_event_type="gateway-heartbeat",
                         )
-                        self._enqueue_fifo(quick_key, hb_event, adapter)
+                        entry = await self.async_session_store.lookup_by_session_key(
+                            quick_key
+                        )
+                        if entry is None:
+                            continue
+                        await self.admit_session_event(
+                            hb_event,
+                            entry,
+                            claim=False,
+                        )
+                        await adapter.handle_message(hb_event)
                     except Exception as exc:
                         logger.debug("heartbeat poll for %s failed: %s", quick_key, exc)
 
@@ -21737,6 +22324,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_entry: Any,
         source: Any,
         final_response: str,
+        event: Any = None,
     ) -> None:
         """Run the goal judge after a gateway turn and, if still active,
         enqueue a continuation prompt for the same session.
@@ -21810,22 +22398,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not prompt or source is None:
             return
 
-        # Enqueue via the adapter's FIFO so a user message already in
-        # flight preempts the continuation naturally.
+        # This is a new reasoning turn, not an injection into the current
+        # model loop. Persist it behind the current SessionDB lease; never
+        # synchronously wait on the same session from this post-turn hook.
         try:
+            parent_turn_id = getattr(event, "_logical_turn_id", None)
+            cont_event = MessageEvent(
+                text=prompt,
+                message_type=MessageType.TEXT,
+                source=source,
+                message_id=None,
+                channel_prompt=None,
+                internal=True,
+                allow_gateway_control=False,
+                session_event_id=(
+                    f"goal-after-turn:{parent_turn_id}"
+                    if parent_turn_id
+                    else None
+                ),
+                session_event_type="gateway-goal-continuation",
+                task_id=getattr(event, "task_id", None),
+                goal_id=getattr(event, "goal_id", None),
+                parent_logical_turn_id=parent_turn_id,
+                branch=getattr(event, "branch", None),
+                worktree=getattr(event, "worktree", None),
+            )
+            await self.admit_session_event(
+                cont_event,
+                session_entry,
+                claim=False,
+            )
             adapter = self._adapter_for_source(source)
-            _quick_key = self._session_key_for_source(source)
-            if adapter and _quick_key:
-                cont_event = MessageEvent(
-                    text=prompt,
-                    message_type=MessageType.TEXT,
-                    source=source,
-                    message_id=None,
-                    channel_prompt=None,
-                )
-                self._enqueue_fifo(_quick_key, cont_event, adapter)
+            if adapter is not None:
+                self._enqueue_fifo(session_entry.session_key, cont_event, adapter)
         except Exception as exc:
-            logger.debug("goal continuation: enqueue failed: %s", exc)
+            logger.error(
+                "goal continuation: durable admission failed: %s",
+                exc,
+                exc_info=True,
+            )
 
     async def _run_post_turn_hooks(
         self,
@@ -21855,6 +22466,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_entry=session_entry,
                     source=source,
                     final_response=final_text,
+                    event=event,
                 )
             except Exception as exc:
                 logger.debug("goal continuation hook failed: %s", exc)
@@ -22018,11 +22630,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             message_type=MessageType.TEXT,
                             source=source,
                             internal=True,
+                            session_event_id=(
+                                f"loop:{sid}:"
+                                f"{mgr.state.ticks_fired if mgr.state else 0}"
+                            ),
+                            session_event_type="gateway-loop-wakeup",
                         )
                         logger.info(
                             "loop wakeup #%s — injecting for %s chat=%s thread=%s",
                             mgr.state.ticks_fired if mgr.state else "?",
                             platform_name, source.chat_id, source.thread_id,
+                        )
+                        entry = await self.async_session_store.lookup_by_session_key(
+                            session_key
+                        )
+                        if entry is None:
+                            raise RuntimeError(
+                                f"loop session route missing for {session_key}"
+                            )
+                        await self.admit_session_event(
+                            synth_event,
+                            entry,
+                            claim=False,
                         )
                         await adapter.handle_message(synth_event)
                         # Slash-command loops dispatch through the command
@@ -25420,7 +26049,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
-                message_id=str(evt.get("message_id") or "").strip() or None,
+                message_id=None,
+                reply_to_message_id=(
+                    str(evt.get("message_id") or "").strip() or None
+                ),
+                session_event_id=(
+                    str(evt.get("event_id") or "").strip() or None
+                ),
+                session_event_type="gateway-background-completion",
                 metadata=metadata,
             )
             logger.info(

@@ -75,6 +75,9 @@ def _make_runner():
     runner.pairing_store = MagicMock()
     runner.pairing_store.is_approved.return_value = True
     runner._is_user_authorized = lambda _source: True
+    # Busy-ack/FIFO behavior is isolated here; durable admission has separate
+    # real-SessionDB integration coverage.
+    runner._persist_busy_gateway_event = AsyncMock(return_value=True)
     return runner, _AGENT_PENDING_SENTINEL
 
 
@@ -469,5 +472,4 @@ class TestLongRunningNotificationOwnership:
         assert runner._should_emit_long_running_notification(
             "sess", original_agent, executor_task=None
         ) is False
-
 

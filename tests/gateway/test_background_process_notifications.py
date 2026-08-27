@@ -289,7 +289,9 @@ async def test_inject_watch_notification_carries_message_id_reply_anchor(monkeyp
 
     adapter.handle_message.assert_awaited_once()
     synth_event = adapter.handle_message.await_args.args[0]
-    assert synth_event.message_id == "777"
+    assert synth_event.message_id is None
+    assert synth_event.reply_to_message_id == "777"
+    assert synth_event.session_event_id is None
     assert synth_event.source.thread_id == "24296"
 
 

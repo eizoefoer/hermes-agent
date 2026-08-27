@@ -105,6 +105,7 @@ def test_expired_attempt_reconciles_to_same_turn_with_new_attempt(tmp_path):
         session_key="agent:test",
         source_identity="occurrence:retry",
         event_type="gateway-message",
+        payload={"recovery_policy": "auto_retry"},
     )
     first = db.claim_logical_turn(
         admitted["logical_turn_id"], owner="worker-a", ttl_seconds=0.05
@@ -122,6 +123,52 @@ def test_expired_attempt_reconciles_to_same_turn_with_new_attempt(tmp_path):
     assert second["attempt_id"] != first["attempt_id"]
     assert second["turn"]["logical_turn_id"] == admitted["logical_turn_id"]
     assert second["turn"]["attempt_count"] == 2
+
+
+def test_expired_executing_attempt_blocks_without_safe_retry_policy(tmp_path):
+    db = _db(tmp_path)
+    admitted = db.admit_session_event(
+        session_id="session-a",
+        session_key="agent:test",
+        source_identity="occurrence:ambiguous",
+        event_type="gateway-message",
+    )
+    claimed = db.claim_logical_turn(
+        admitted["logical_turn_id"], owner="worker-a", ttl_seconds=0.05
+    )
+    assert db.mark_logical_turn_started(
+        admitted["logical_turn_id"], claimed["attempt_id"]
+    )
+    time.sleep(0.12)
+
+    assert db.reconcile_logical_turns() == 1
+    blocked = db.get_logical_turn(admitted["logical_turn_id"])
+    assert blocked["state"] == "blocked"
+    assert "effect reconciliation required" in blocked["error"]
+    assert db.claim_logical_turn(
+        admitted["logical_turn_id"], owner="worker-b"
+    )["outcome"] == "terminal"
+
+
+def test_expired_claimed_attempt_is_safe_to_retry_before_execution(tmp_path):
+    db = _db(tmp_path)
+    admitted = db.admit_session_event(
+        session_id="session-a",
+        session_key="agent:test",
+        source_identity="occurrence:claimed-only",
+        event_type="gateway-message",
+    )
+    first = db.claim_logical_turn(
+        admitted["logical_turn_id"], owner="worker-a", ttl_seconds=0.05
+    )
+    time.sleep(0.12)
+
+    assert db.reconcile_logical_turns() == 1
+    second = db.claim_logical_turn(
+        admitted["logical_turn_id"], owner="worker-b", ttl_seconds=30
+    )
+    assert second["outcome"] == "claimed"
+    assert second["attempt_id"] != first["attempt_id"]
 
 
 def test_terminal_execution_is_immutable_and_delivery_is_separate(tmp_path):
