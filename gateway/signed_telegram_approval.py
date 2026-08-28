@@ -556,7 +556,15 @@ def _resume_github_workflow(request: dict[str, Any]) -> ResumeResult:
     command = ["gh", "workflow", "run", payload["workflow"], "--repo", request["repository"], "--ref", payload.get("ref", "main")]
     for key, value in payload.get("inputs", {}).items():
         command.extend(["-f", f"{key}={value}"])
-    subprocess.run(command, check=True, capture_output=True, text=True, timeout=30)
+    subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
     return ResumeResult(request["task_id"], True, "workflow_queued", f"Work resumed for task {request['task_id']}.")
 
 

@@ -9,7 +9,8 @@ you are about to push:
     python3 scripts/audit_pr_attribution.py --fix      # create mapping files
 
 Logic (kept in sync with contributor-check.yml):
-  - scans ``git log $(git merge-base origin/main HEAD)..HEAD --format=%ae``
+  - scans commits from the actual PR base (``GITHUB_BASE_REF``), falling back
+    to ``origin/main`` for local non-PR runs
   - skips teknium/bot emails and ``<id>+<login>@users.noreply.github.com``
     (CI auto-resolves those)
   - everything else must have ``contributors/emails/<email>`` or a legacy
@@ -26,6 +27,7 @@ Logic (kept in sync with contributor-check.yml):
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -56,7 +58,8 @@ def run(*args: str, check: bool = True) -> str:
 
 
 def new_emails() -> list[str]:
-    base = run("git", "merge-base", "origin/main", "HEAD")
+    base_branch = os.environ.get("GITHUB_BASE_REF") or "main"
+    base = run("git", "merge-base", f"origin/{base_branch}", "HEAD")
     log = run("git", "log", f"{base}..HEAD", "--format=%ae", "--no-merges", check=False)
     return sorted({e for e in log.splitlines() if e.strip()})
 
