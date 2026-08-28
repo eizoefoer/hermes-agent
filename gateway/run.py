@@ -19636,7 +19636,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
             session_key = self._session_key_for_source(event.source)
             if session_key in getattr(adapter, "_active_sessions", {}):
-                continue
+                healer = getattr(adapter, "_heal_stale_session_lock", None)
+                healed = bool(callable(healer) and healer(session_key))
+                if not healed:
+                    logger.warning(
+                        "Gateway local-active/durable-owner disagreement: "
+                        "session=%s turn=%s; dispatching accepted work to the "
+                        "adapter FIFO because local state is not ownership",
+                        session_key,
+                        logical_turn_id,
+                    )
             dispatching[logical_turn_id] = now
             try:
                 await adapter.handle_message(event)
@@ -22557,9 +22566,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await self._warm_goals_session_db("heartbeat poll")
                 for quick_key, (source, session_id) in list(watch.items()):
                     try:
-                        # Busy sessions coalesce their tick to the next idle poll.
-                        if quick_key in self._running_agents:
-                            continue
                         from hermes_cli.heartbeat import HeartbeatManager
 
                         mgr = HeartbeatManager(session_id=session_id)
@@ -22974,8 +22980,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         session_key = self._session_key_for_source(source)
                     except Exception:
                         session_key = None
-                    if session_key and session_key in self._running_agents:
-                        continue  # busy — stays due, next scan retries
                     if goal_blocks_loop_tick(sid):
                         continue
 

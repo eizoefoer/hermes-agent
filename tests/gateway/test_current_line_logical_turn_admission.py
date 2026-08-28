@@ -210,6 +210,42 @@ async def test_startup_drain_rehydrates_same_occurrence_and_skips_terminal(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_startup_drain_does_not_treat_local_active_cache_as_ownership(tmp_path):
+    runner, db, entry = _runner(tmp_path)
+    event = MessageEvent(
+        text="recover despite stale local cache",
+        source=_source(),
+        internal=True,
+        session_event_type="gateway-recovered-event",
+    )
+    admitted = await runner.admit_session_event(event, entry, claim=False)
+
+    class Adapter:
+        def __init__(self):
+            self._active_sessions = {entry.session_key: object()}
+            self.events = []
+
+        def _heal_stale_session_lock(self, _session_key):
+            return False
+
+        async def handle_message(self, recovered):
+            self.events.append(recovered)
+
+    adapter = Adapter()
+    runner._adapter_for_source = lambda _source: adapter
+    runner._session_key_for_source = lambda _source: entry.session_key
+    runner._gateway_logical_turn_dispatching = {}
+
+    assert db.get_session_turn_lease(entry.session_id) is None
+    assert await runner._drain_gateway_logical_turn_scope() == 1
+    assert len(adapter.events) == 1
+    assert (
+        adapter.events[0]._logical_turn_id
+        == admitted["turn"]["logical_turn_id"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_persistent_gateway_admission_fails_closed_without_sessiondb(tmp_path):
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._session_db = None
