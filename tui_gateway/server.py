@@ -8747,6 +8747,11 @@ def _admit_tui_turn(
     payload: dict | None = None,
 ) -> dict:
     """Use the shared SessionDB ledger as TUI turn ownership authority."""
+    # Legacy unit doubles opt into explicitly ephemeral execution.  Check this
+    # before resolving the process-global database so those tests cannot leave
+    # durable rows or leases behind.  Production never sets this flag.
+    if os.environ.get("HERMES_TUI_TEST_EPHEMERAL") == "1":
+        return {"outcome": "unmanaged", "logical_turn_id": None}
     with _session_db(session) as db:
         required = (
             "get_session",
@@ -8758,8 +8763,6 @@ def _admit_tui_turn(
             "fail_logical_turn",
         )
         if db is None or not all(callable(getattr(db, name, None)) for name in required):
-            if os.environ.get("HERMES_TUI_TEST_EPHEMERAL") == "1":
-                return {"outcome": "unmanaged", "logical_turn_id": None}
             raise RuntimeError(
                 "canonical SessionDB admission is unavailable; refusing unmanaged persistent TUI work"
             )

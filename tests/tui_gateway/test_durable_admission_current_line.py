@@ -4,8 +4,15 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from hermes_state import SessionDB
 from tui_gateway import server
+
+
+@pytest.fixture(autouse=True)
+def _durable_tui_mode(monkeypatch):
+    monkeypatch.delenv("HERMES_TUI_TEST_EPHEMERAL", raising=False)
 
 
 def _session(key: str) -> dict:

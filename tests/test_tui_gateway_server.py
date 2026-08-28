@@ -20571,6 +20571,21 @@ def test_prompt_submit_consecutive_rewinds_with_returned_survivor_row_ids(
     original_row_ids = [m["_row_id"] for m in msgs]
 
     sess = _session(history=[dict(m) for m in msgs], session_key=session_key)
+    sess["agent"].run_conversation = lambda prompt, **kwargs: {
+        "final_response": "ok",
+    }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, **_kwargs):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+        def join(self, timeout=None):
+            return None
+
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
     sid = "real-db-consec-rewind-sid"
     server._sessions[sid] = sess
     monkeypatch.setattr(server, "_get_db", lambda: db)
