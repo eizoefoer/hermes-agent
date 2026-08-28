@@ -313,4 +313,3 @@ def test_telegram_compatibility_fast_path_is_logically_once(tmp_path):
     assert replay.local_resolution_count == 0
     assert local_resolutions == [("telegram:chat:legacy", "once")]
     assert replay.continuation.state == "completed"
-

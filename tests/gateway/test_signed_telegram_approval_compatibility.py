@@ -170,4 +170,3 @@ def test_phase1_continuation_store_remains_separate(tmp_path):
 
     assert request.request_id == "phase1-request"
     assert continuation_store.get_request(request.request_id) == request
-

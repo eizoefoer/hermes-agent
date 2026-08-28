@@ -132,4 +132,3 @@ class TelegramApprovalService:
                 continuation.session_key, continuation.decision
             )
         return TelegramApprovalOutcome(continuation, False, count)
-

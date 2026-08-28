@@ -81,7 +81,6 @@ def test_recovery_drains_queued_cron_turn_through_same_logical_identity(
     assert recovered["attempt_count"] == 1
     assert db.get_session_turn_lease("cron_job-1_exec-1") is None
     db.close()
-
     # A later drain cannot reopen terminal model execution.
     assert scheduler.recover_cron_logical_turns(limit=2) == 0
     assert executions == ["exec-1"]
@@ -170,4 +169,3 @@ def test_delivery_recovery_never_reruns_completed_cron_execution(
     assert turn["state"] == "completed"
     assert turn["delivery_state"] == "transport_accepted"
     db.close()
-
