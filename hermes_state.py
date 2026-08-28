@@ -107,9 +107,15 @@ _PREACQUIRED_LOGICAL_TURN_LEASES: ContextVar[Dict[str, Dict[str, Any]]] = (
 )
 
 
-def _remember_preacquired_logical_turn_lease(
+def bind_preacquired_logical_turn_lease(
     session_id: str, lease: Mapping[str, Any]
 ) -> None:
+    """Bind a logical-turn lease for the next AIAgent turn in this context.
+
+    Manual worker threads must call this explicitly because Python does not
+    inherit ContextVars into ``threading.Thread``. The consumer still verifies
+    the holder against SessionDB, so this hint cannot manufacture ownership.
+    """
     leases = dict(_PREACQUIRED_LOGICAL_TURN_LEASES.get())
     leases[str(session_id)] = dict(lease)
     _PREACQUIRED_LOGICAL_TURN_LEASES.set(leases)
@@ -8034,7 +8040,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         result = self._execute_write(_do)
         if result.get("outcome") == "claimed" and result.get("lease"):
-            _remember_preacquired_logical_turn_lease(
+            bind_preacquired_logical_turn_lease(
                 str((result.get("turn") or {}).get("session_id") or ""),
                 result["lease"],
             )

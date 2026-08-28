@@ -2411,6 +2411,15 @@ class CLICommandsMixin:
         turn_route = self._resolve_turn_agent_config(prompt)
 
         def run_background():
+            # ``threading.Thread`` does not inherit the admission ContextVar.
+            # Re-bind this child's already-claimed holder in the worker; the
+            # AIAgent prologue verifies it against SessionDB before reuse.
+            from hermes_state import bind_preacquired_logical_turn_lease
+
+            if child_claim.get("lease"):
+                bind_preacquired_logical_turn_lease(
+                    child_session_id, child_claim["lease"]
+                )
             set_sudo_password_callback(self._sudo_password_callback)
             set_approval_callback(self._approval_callback)
             try:

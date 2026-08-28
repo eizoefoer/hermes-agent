@@ -1420,6 +1420,12 @@ def _(rid, params: dict) -> dict:
         session_tokens = _set_session_context(task_id, cwd=_session_cwd(session))
         try:
             from run_agent import AIAgent
+            from hermes_state import bind_preacquired_logical_turn_lease
+
+            if child_claim.get("lease"):
+                bind_preacquired_logical_turn_lease(
+                    task_id, child_claim["lease"]
+                )
 
             # Bug #50233: ephemeral agent threads don't inherit the session's
             # HERMES_HOME override (the ContextVar set on the session-create

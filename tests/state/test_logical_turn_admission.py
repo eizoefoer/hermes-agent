@@ -4,14 +4,47 @@ from __future__ import annotations
 
 import time
 import sqlite3
+import threading
 
-from hermes_state import SessionDB
+from hermes_state import (
+    SessionDB,
+    bind_preacquired_logical_turn_lease,
+    consume_preacquired_logical_turn_lease,
+)
 
 
 def _db(tmp_path) -> SessionDB:
     db = SessionDB(tmp_path / "state.db")
     db.create_session("session-a", source="test")
     return db
+
+
+def test_manual_worker_must_explicitly_bind_preacquired_lease(tmp_path):
+    db = _db(tmp_path)
+    turn = db.admit_session_event(
+        session_id="session-a",
+        session_key="agent:test",
+        source_identity="manual-thread-event",
+        event_type="test",
+    )
+    claim = db.claim_logical_turn(
+        turn["logical_turn_id"], owner="test:parent", pid=123
+    )
+    observed = []
+
+    def worker():
+        observed.append(consume_preacquired_logical_turn_lease("session-a"))
+        bind_preacquired_logical_turn_lease("session-a", claim["lease"])
+        observed.append(consume_preacquired_logical_turn_lease("session-a"))
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert observed[0] is None
+    assert observed[1]["holder"] == claim["lease"]["holder"]
+    assert db.get_session_turn_lease("session-a")["holder"] == claim["lease"]["holder"]
+    assert consume_preacquired_logical_turn_lease("session-a") is not None
 
 
 def test_admission_is_idempotent_for_one_authoritative_source(tmp_path):
