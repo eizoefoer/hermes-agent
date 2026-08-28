@@ -5060,6 +5060,34 @@ class _BoundedCronSessionDB:
         return _bounded
 
 
+def _adapt_explicit_ephemeral_cron_test_db(session_db) -> None:
+    """Install a non-durable protocol only under explicit test opt-in.
+
+    Current upstream cron tests historically use lightweight SessionDB mocks
+    to exercise unrelated model/config behavior. Production never enables
+    this switch and therefore continues to fail closed when the canonical
+    logical-turn contract is missing.
+    """
+    if os.getenv("HERMES_EXPLICIT_EPHEMERAL_CRON_TEST_MODE") != "1":
+        return
+    if callable(getattr(type(session_db), "admit_session_event", None)):
+        return
+    turn_id = f"ephemeral-cron-test-{uuid.uuid4().hex}"
+    attempt_id = f"ephemeral-cron-attempt-{uuid.uuid4().hex}"
+    session_db.ensure_session = lambda *_args, **_kwargs: None
+    session_db.admit_session_event = lambda **_kwargs: {
+        "logical_turn_id": turn_id
+    }
+    session_db.claim_logical_turn = lambda *_args, **_kwargs: {
+        "outcome": "claimed",
+        "attempt_id": attempt_id,
+    }
+    session_db.mark_logical_turn_started = lambda *_args, **_kwargs: True
+    session_db.heartbeat_logical_turn = lambda *_args, **_kwargs: True
+    session_db.complete_logical_turn = lambda *_args, **_kwargs: None
+    session_db.fail_logical_turn = lambda *_args, **_kwargs: None
+
+
 def run_job(
     job: dict,
     *,
@@ -5365,13 +5393,15 @@ def run_job(
             _session_db = SessionDB()
     except concurrent.futures.TimeoutError:
         logger.error(
-            "Job '%s': SessionDB init did not return within %.0fs — proceeding "
-            "without a session store for this run instead of blocking it "
-            "forever",
+            "Job '%s': SessionDB init did not return within %.0fs — persistent "
+            "cron reasoning will fail closed rather than execute unmanaged",
             job.get("id", "?"), _session_db_timeout,
         )
     except Exception as e:
         logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
+
+    if _session_db is not None:
+        _adapt_explicit_ephemeral_cron_test_db(_session_db)
 
     # Wake-gate: if this job has a pre-check script, run it BEFORE building
     # the prompt so a ``{"wakeAgent": false}`` response can short-circuit
@@ -5427,12 +5457,17 @@ def run_job(
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
-    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    _cron_execution_id = str(job.get("execution_id") or uuid.uuid4().hex).strip()
+    job["execution_id"] = _cron_execution_id
+    _cron_session_id = f"cron_{job_id}_{_cron_execution_id}"
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
 
     agent = None
+    _logical_turn_id = ""
+    _logical_attempt_id = ""
+    _logical_model_started = False
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
@@ -6058,6 +6093,52 @@ def run_job(
                 job_id, _mcp_exc,
             )
 
+        if _session_db is None:
+            raise RuntimeError(
+                "Persistent cron reasoning requires the canonical SessionDB; "
+                "refusing unmanaged model execution"
+            )
+        _session_db.ensure_session(_cron_session_id, source="cron")
+        _logical_turn = _session_db.admit_session_event(
+            session_id=_cron_session_id,
+            session_key=_cron_session_id,
+            source_identity=f"cron-execution:{_cron_execution_id}",
+            event_type="cron-execution",
+            payload={
+                "job_id": job_id,
+                "execution_id": _cron_execution_id,
+                "prompt": prompt,
+                "recovery_policy": "manual_reconcile",
+                # Cron's execution ledger is the authoritative occurrence;
+                # retain the accepted job inputs so a replacement scheduler
+                # can execute a queued/claimed-before-start turn without
+                # requiring the original in-memory dispatch object.
+                "job_snapshot": json.loads(json.dumps(job, default=str)),
+            },
+            task_id=job_id,
+        )
+        _logical_turn_id = _logical_turn["logical_turn_id"]
+        _logical_claim = _session_db.claim_logical_turn(
+            _logical_turn_id,
+            owner=f"cron:{os.getpid()}",
+            pid=os.getpid(),
+            ttl_seconds=1800.0,
+        )
+        if _logical_claim.get("outcome") == "terminal":
+            _stored = (_logical_claim.get("turn") or {}).get("result") or {}
+            return (
+                bool(_stored.get("success")),
+                str(_stored.get("output") or ""),
+                str(_stored.get("final_response") or ""),
+                _stored.get("error"),
+            )
+        if _logical_claim.get("outcome") != "claimed":
+            raise RuntimeError(
+                "Cron reasoning is durably queued behind existing ownership: "
+                f"{_logical_turn_id}"
+            )
+        _logical_attempt_id = _logical_claim["attempt_id"]
+
         agent = AIAgent(
             model=model,
             api_key=runtime.get("api_key"),
@@ -6124,6 +6205,7 @@ def run_job(
             str(_run_claim.get("by") or "") if isinstance(_run_claim, dict) else ""
         )
         _last_claim_heartbeat = time.monotonic()
+        _last_logical_heartbeat = time.monotonic()
 
         def _abort_if_fire_claim_lost() -> None:
             if cancel_event is None or not cancel_event.is_set():
@@ -6135,10 +6217,23 @@ def run_job(
             )
 
         def _heartbeat_run_claim_if_due():
-            nonlocal _last_claim_heartbeat
+            nonlocal _last_claim_heartbeat, _last_logical_heartbeat
+            _mono = time.monotonic()
+            if _mono - _last_logical_heartbeat >= 60.0:
+                _last_logical_heartbeat = _mono
+                if not _session_db.heartbeat_logical_turn(
+                    _logical_turn_id,
+                    _logical_attempt_id,
+                    ttl_seconds=1800.0,
+                ):
+                    request_hard_interrupt(
+                        agent, "Cron logical-turn lease ownership was lost"
+                    )
+                    raise RuntimeError(
+                        f"Cron logical-turn ownership lost: {_logical_turn_id}"
+                    )
             if not _is_oneshot or not _run_claim_owner:
                 return
-            _mono = time.monotonic()
             if _mono - _last_claim_heartbeat < _RUN_CLAIM_HEARTBEAT_SECONDS:
                 return
             _last_claim_heartbeat = _mono
@@ -6157,6 +6252,13 @@ def run_job(
         # Tag this fire and time the run_conversation call for the usage_audit.jsonl entry.
         _audit_fire_id = uuid.uuid4().hex
         _audit_t_start = time.monotonic()
+        if not _session_db.mark_logical_turn_started(
+            _logical_turn_id, _logical_attempt_id
+        ):
+            raise RuntimeError(
+                f"Could not start cron logical turn {_logical_turn_id}"
+            )
+        _logical_model_started = True
         _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
         _inactivity_timeout = False
         try:
@@ -6350,6 +6452,21 @@ def run_job(
         
         logger.info("Job '%s' completed successfully", job_name)
 
+        _session_db.complete_logical_turn(
+            _logical_turn_id,
+            _logical_attempt_id,
+            {
+                "success": True,
+                "output": output,
+                "final_response": final_response,
+                "error": None,
+                "execution_id": _cron_execution_id,
+            },
+            delivery_required=bool(final_response.strip()),
+        )
+        job["_logical_turn_id"] = _logical_turn_id
+        job["_logical_attempt_id"] = _logical_attempt_id
+
         # Emit one JSONL line per fire for usage audit.
         _audit_duration_ms = int((time.monotonic() - _audit_t_start) * 1000)
         _audit_response_silent = _is_cron_silence_response(final_response or "")
@@ -6370,6 +6487,20 @@ def run_job(
 
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
+        if _session_db is not None and _logical_turn_id and _logical_attempt_id:
+            try:
+                _session_db.fail_logical_turn(
+                    _logical_turn_id,
+                    _logical_attempt_id,
+                    error_msg,
+                    retryable=not _logical_model_started,
+                )
+            except Exception:
+                logger.debug(
+                    "Job '%s': failed to close cron logical turn",
+                    job_id,
+                    exc_info=True,
+                )
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
         # Best-effort audit write on failure path. _audit_fire_id
         # may be unset if the exception fired before submit() — guard
@@ -6766,6 +6897,11 @@ def _run_one_job_body(
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
+    # The cron execution ledger is the scheduler's authoritative occurrence.
+    # Carry it into run_job so the logical turn/session identity is stable
+    # across replay instead of being derived from wall-clock time.
+    job = dict(job)
+    job["execution_id"] = execution_id
     delivery_attempted = False
     delivery_error = None
     try:
@@ -7094,6 +7230,33 @@ def _run_one_job_body(
             delivery_outcome = "delivered"
         else:
             delivery_outcome = "suppressed"
+        _logical_turn_id = str(job.get("_logical_turn_id") or "")
+        _logical_attempt_id = str(job.get("_logical_attempt_id") or "")
+        if _logical_turn_id and _logical_attempt_id:
+            try:
+                from hermes_state import SessionDB
+
+                _delivery_db = SessionDB()
+                try:
+                    if delivery_error:
+                        _delivery_db.fail_logical_turn_delivery(
+                            _logical_turn_id,
+                            _logical_attempt_id,
+                            delivery_error,
+                        )
+                    else:
+                        _delivery_db.record_logical_turn_transport_accepted(
+                            _logical_turn_id,
+                            _logical_attempt_id,
+                        )
+                finally:
+                    _delivery_db.close()
+            except Exception:
+                logger.debug(
+                    "Job '%s': failed to record logical-turn delivery state",
+                    job["id"],
+                    exc_info=True,
+                )
         finish_execution(
             execution_id,
             success=success,
@@ -7260,6 +7423,107 @@ _DEAD_OWNER_REAP_INTERVAL_SECONDS = 300.0
 _last_dead_owner_reap_at: Optional[float] = None
 
 
+def recover_cron_logical_turns(
+    *, adapters=None, loop=None, limit: int = 4
+) -> int:
+    """Bounded production drain for accepted cron reasoning and delivery.
+
+    Eligibility is filtered to ``cron-execution`` in SQLite before LIMIT. A
+    claimed turn whose process vanished is safe to reclaim because model/tool
+    execution never started. Ambiguous executing turns remain blocked by the
+    shared reconciliation policy and are deliberately not replayed here.
+    """
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    recovered = 0
+    try:
+        db.reconcile_logical_turns()
+
+        # Delivery recovery is independent of reasoning recovery. Replaying a
+        # completed response must never reopen the model execution.
+        for turn in db.list_pending_logical_turn_deliveries(
+            limit=max(1, int(limit)), event_types=("cron-execution",)
+        ):
+            payload = turn.get("payload") or {}
+            result = turn.get("result") or {}
+            job = payload.get("job_snapshot")
+            if not isinstance(job, dict):
+                logger.error(
+                    "Cron logical turn %s cannot recover delivery: missing job snapshot",
+                    turn.get("logical_turn_id"),
+                )
+                continue
+            response = str(result.get("final_response") or "")
+            attempt_id = str(turn.get("current_attempt_id") or "")
+            if not response.strip() or _is_cron_silence_response(response):
+                db.record_logical_turn_transport_accepted(
+                    turn["logical_turn_id"], attempt_id
+                )
+                recovered += 1
+                continue
+            db.begin_logical_turn_delivery(turn["logical_turn_id"], attempt_id)
+            error = _deliver_result(job, response, adapters=adapters, loop=loop)
+            if error:
+                db.fail_logical_turn_delivery(
+                    turn["logical_turn_id"], attempt_id, error
+                )
+            else:
+                db.record_logical_turn_transport_accepted(
+                    turn["logical_turn_id"], attempt_id
+                )
+                recovered += 1
+
+        for turn in db.list_ready_logical_turns(
+            limit=max(1, int(limit)), event_types=("cron-execution",)
+        ):
+            payload = turn.get("payload") or {}
+            job = payload.get("job_snapshot")
+            if not isinstance(job, dict):
+                logger.error(
+                    "Cron logical turn %s cannot recover execution: missing job snapshot",
+                    turn.get("logical_turn_id"),
+                )
+                continue
+            job = dict(job)
+            job["execution_id"] = payload.get("execution_id")
+            success, output, response, error = run_job(job)
+            if output:
+                save_job_output(str(job.get("id") or payload.get("job_id")), output)
+            # run_job may observe a genuine live owner and leave the turn
+            # queued. That is contention, not a failed recovered execution.
+            refreshed = db.get_logical_turn(turn["logical_turn_id"])
+            if not refreshed or refreshed.get("state") != "completed":
+                continue
+            attempt_id = str(refreshed.get("current_attempt_id") or "")
+            if response.strip() and not _is_cron_silence_response(response):
+                db.begin_logical_turn_delivery(turn["logical_turn_id"], attempt_id)
+                delivery_error = _deliver_result(
+                    job, response, adapters=adapters, loop=loop
+                )
+                if delivery_error:
+                    db.fail_logical_turn_delivery(
+                        turn["logical_turn_id"], attempt_id, delivery_error
+                    )
+                else:
+                    db.record_logical_turn_transport_accepted(
+                        turn["logical_turn_id"], attempt_id
+                    )
+            else:
+                db.record_logical_turn_transport_accepted(
+                    turn["logical_turn_id"], attempt_id
+                )
+            recovered += 1
+            if not success:
+                logger.warning(
+                    "Recovered cron logical turn %s finished unsuccessfully: %s",
+                    turn["logical_turn_id"], error,
+                )
+    finally:
+        db.close()
+    return recovered
+
+
 def tick(
     verbose: bool = True,
     adapters=None,
@@ -7377,6 +7641,14 @@ def tick(
             except Exception as _reap_exc:
                 logger.debug("Dead-owner execution reclaim failed: %s", _reap_exc)
 
+        try:
+            recovered_logical_turns = recover_cron_logical_turns(
+                adapters=adapters, loop=loop
+            )
+        except Exception as recovery_exc:
+            recovered_logical_turns = 0
+            logger.exception("Cron logical-turn recovery failed: %s", recovery_exc)
+
         due_jobs = get_due_jobs()
 
         # Bound the in-flight set BEFORE the dedup guard is consulted, so a
@@ -7416,7 +7688,7 @@ def tick(
                 _kill_orphaned_mcp_children()
             except Exception as _e:
                 logger.debug("Post-tick MCP orphan cleanup failed: %s", _e)
-            return 0
+            return recovered_logical_turns
 
         if verbose:
             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
@@ -7664,7 +7936,7 @@ def tick(
                     logger.error("Cron job future failed: %s", exc)
                     _results.append(False)
             _sweep_mcp_orphans()
-            return sum(_results)
+            return recovered_logical_turns + sum(_results)
 
         # Async (gateway ticker) mode: don't block.  Sweep orphans via a
         # done-callback fired after the LAST dispatched job completes, so the
@@ -7689,7 +7961,7 @@ def tick(
             # Nothing dispatched (all skipped / no due jobs) — sweep inline.
             _sweep_mcp_orphans()
 
-        return sum(_results)
+        return recovered_logical_turns + sum(_results)
     finally:
         if fcntl:
             try:

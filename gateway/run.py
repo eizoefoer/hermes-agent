@@ -6189,17 +6189,15 @@ class TurnRunner:
                             "permanent_pattern_keys": list(
                                 approval_data.get("permanent_pattern_keys") or []
                             ),
-                            "task_id": getattr(event, "task_id", None),
-                            "goal_id": getattr(event, "goal_id", None),
+                            "task_id": ctx.task_id,
+                            "goal_id": ctx.goal_id,
                             "approval_user_id": str(
                                 getattr(event.source, "user_id", None)
                                 or ctx._status_chat_id
                             ),
-                            "branch": getattr(event, "branch", None),
-                            "worktree": getattr(event, "worktree", None),
-                            "parent_logical_turn_id": getattr(
-                                event, "_logical_turn_id", None
-                            ),
+                            "branch": ctx.branch,
+                            "worktree": ctx.worktree,
+                            "parent_logical_turn_id": ctx.parent_logical_turn_id,
                             "process_local_fast_path": True,
                         },
                         # This fresh identifier is persisted before Telegram
@@ -6467,7 +6465,7 @@ class TurnRunner:
                 # A conversation session is not a task.  Only producers with
                 # an authoritative durable task may correlate model execution
                 # to one; ordinary gateway chat keeps this unset.
-                "task_id": getattr(event, "task_id", None),
+                "task_id": ctx.task_id,
             }
             if _persist_user_message_override is not None:
                 _conversation_kwargs["persist_user_message"] = _persist_user_message_override
@@ -21372,6 +21370,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
+                task_id=getattr(event, "task_id", None),
+                goal_id=getattr(event, "goal_id", None),
+                branch=getattr(event, "branch", None),
+                worktree=getattr(event, "worktree", None),
+                parent_logical_turn_id=getattr(
+                    event, "parent_logical_turn_id", None
+                ),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -29511,6 +29516,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        task_id: Optional[str] = None,
+        goal_id: Optional[str] = None,
+        branch: Optional[str] = None,
+        worktree: Optional[str] = None,
+        parent_logical_turn_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -29531,6 +29541,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                task_id=task_id, goal_id=goal_id, branch=branch,
+                worktree=worktree,
+                parent_logical_turn_id=parent_logical_turn_id,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -29544,6 +29557,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                task_id=task_id, goal_id=goal_id, branch=branch,
+                worktree=worktree,
+                parent_logical_turn_id=parent_logical_turn_id,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -29687,6 +29703,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        task_id: Optional[str] = None,
+        goal_id: Optional[str] = None,
+        branch: Optional[str] = None,
+        worktree: Optional[str] = None,
+        parent_logical_turn_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -29996,6 +30017,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
+            task_id=task_id,
+            goal_id=goal_id,
+            branch=branch,
+            worktree=worktree,
+            parent_logical_turn_id=parent_logical_turn_id,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to
@@ -31227,6 +31253,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    task_id=task_id,
+                    goal_id=goal_id,
+                    branch=branch,
+                    worktree=worktree,
+                    parent_logical_turn_id=parent_logical_turn_id,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

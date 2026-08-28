@@ -33,6 +33,7 @@ import uuid
 import weakref
 from collections import deque
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
@@ -94,6 +95,34 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _PREVIEW_SCAFFOLD_WINDOW,
     _PREVIEW_SCAFFOLDED_SQL,
 )
+
+
+# A process-local handoff hint, never ownership authority. Canonical admission
+# claims the durable lease before invoking AIAgent; run_conversation consumes
+# this hint only after verifying the exact holder still exists in SessionDB.
+# Keeping it ContextVar-scoped prevents unrelated concurrent sessions in the
+# same gateway process from reusing one another's lease.
+_PREACQUIRED_LOGICAL_TURN_LEASES: ContextVar[Dict[str, Dict[str, Any]]] = (
+    ContextVar("preacquired_logical_turn_leases", default={})
+)
+
+
+def _remember_preacquired_logical_turn_lease(
+    session_id: str, lease: Mapping[str, Any]
+) -> None:
+    leases = dict(_PREACQUIRED_LOGICAL_TURN_LEASES.get())
+    leases[str(session_id)] = dict(lease)
+    _PREACQUIRED_LOGICAL_TURN_LEASES.set(leases)
+
+
+def consume_preacquired_logical_turn_lease(
+    session_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Consume a same-context lease handoff for ``session_id`` once."""
+    leases = dict(_PREACQUIRED_LOGICAL_TURN_LEASES.get())
+    lease = leases.pop(str(session_id), None)
+    _PREACQUIRED_LOGICAL_TURN_LEASES.set(leases)
+    return dict(lease) if lease else None
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_schema import SessionSchemaMixin
 from hermes_state_search import SessionSearchMixin
@@ -8003,7 +8032,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 },
             }
 
-        return self._execute_write(_do)
+        result = self._execute_write(_do)
+        if result.get("outcome") == "claimed" and result.get("lease"):
+            _remember_preacquired_logical_turn_lease(
+                str((result.get("turn") or {}).get("session_id") or ""),
+                result["lease"],
+            )
+        return result
 
     def mark_logical_turn_started(
         self, logical_turn_id: str, attempt_id: str
