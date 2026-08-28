@@ -56,7 +56,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, TypeVar
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, Tuple, TypeVar
 
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _BRANCH_CHILD_SQL,
@@ -8101,6 +8101,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         event_types: Optional[Iterable[str]] = None,
         event_type_prefixes: Optional[Iterable[str]] = None,
         session_id: Optional[str] = None,
+        payload_equals: Optional[Mapping[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Return only eligible rows, applying producer filters before LIMIT."""
         selected_types = tuple(dict.fromkeys(str(v) for v in (event_types or ())))
@@ -8123,6 +8124,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if session_id is not None:
             clauses.append("session_id = ?")
             params.append(str(session_id))
+        for key, value in (payload_equals or {}).items():
+            safe_key = str(key).replace('"', '""')
+            clauses.append(f"json_extract(payload_json, '$.\"{safe_key}\"') = ?")
+            params.append(value)
         params.append(max(1, int(limit)))
         with self._read_ctx() as conn:
             rows = conn.execute(

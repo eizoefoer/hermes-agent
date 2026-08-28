@@ -2126,6 +2126,7 @@ def _compute_host_turn_frame(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     display_kind: str | None = None,
+    logical_turn_id: str | None = None,
 ) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
@@ -2153,6 +2154,7 @@ def _compute_host_turn_frame(
         "source": _session_source(session),
         "attached_images": attached_images,
         "queued_prompt_generation": queued_prompt_generation,
+        "logical_turn_id": logical_turn_id,
     }
 
 
@@ -2231,6 +2233,7 @@ def _submit_prompt_to_compute_host(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     display_kind: str | None = None,
+    logical_turn_id: str | None = None,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(
@@ -2241,6 +2244,7 @@ def _submit_prompt_to_compute_host(
         image_paths=image_paths,
         queued_prompt_generation=queued_prompt_generation,
         display_kind=display_kind,
+        logical_turn_id=logical_turn_id,
     )
 
     def _complete(done: dict) -> None:
@@ -7911,6 +7915,16 @@ def _init_session(
     _notify_session_boundary("on_session_reset", key, _session_source(_sessions.get(sid, {})))
     _emit("session.info", sid, _session_info(agent, _sessions.get(sid, {})))
     _schedule_mcp_late_refresh(sid, agent)
+    if os.environ.get("HERMES_TUI_TEST_EPHEMERAL") != "1":
+        def _recover_session_work() -> None:
+            _rehydrate_tui_session_work(sid, _sessions[sid])
+            _recover_tui_background_children(sid, _sessions[sid])
+
+        threading.Thread(
+            target=_recover_session_work,
+            daemon=True,
+            name=f"tui-turn-recovery-{sid[:8]}",
+        ).start()
 
 
 def _new_session_key() -> str:
@@ -8669,6 +8683,7 @@ def _enqueue_prompt(
     text: Any,
     transport: Any,
     image_paths: list[str] | None = None,
+    logical_turn_id: str | None = None,
 ) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
@@ -8695,11 +8710,14 @@ def _enqueue_prompt(
         if original and text.strip() == original:
             return
     queued = {"text": text, "transport": transport}
+    if logical_turn_id:
+        queued["logical_turn_id"] = logical_turn_id
     if image_paths:
         queued["image_paths"] = image_paths
     existing = session.get("queued_prompt")
     if (
-        existing
+        not logical_turn_id
+        and existing
         and isinstance(existing.get("text"), str)
         and isinstance(text, str)
         and not existing.get("image_paths")
@@ -8713,6 +8731,280 @@ def _enqueue_prompt(
         session.setdefault("queued_prompts", []).append(queued)
         return
     session["queued_prompt"] = queued
+
+
+def _admit_tui_turn(
+    sid: str,
+    session: dict,
+    text: Any,
+    *,
+    event_type: str = "tui-prompt",
+    source_identity: str | None = None,
+    logical_turn_id: str | None = None,
+    claim: bool = True,
+    task_id: str | None = None,
+    goal_id: str | None = None,
+    payload: dict | None = None,
+) -> dict:
+    """Use the shared SessionDB ledger as TUI turn ownership authority."""
+    with _session_db(session) as db:
+        required = (
+            "get_session",
+            "create_session",
+            "admit_session_event",
+            "claim_logical_turn",
+            "mark_logical_turn_started",
+            "complete_logical_turn",
+            "fail_logical_turn",
+        )
+        if db is None or not all(callable(getattr(db, name, None)) for name in required):
+            if os.environ.get("HERMES_TUI_TEST_EPHEMERAL") == "1":
+                return {"outcome": "unmanaged", "logical_turn_id": None}
+            raise RuntimeError(
+                "canonical SessionDB admission is unavailable; refusing unmanaged persistent TUI work"
+            )
+        session_id = str(session.get("session_key") or sid)
+        if not db.get_session(session_id):
+            db.create_session(session_id, "tui")
+        if logical_turn_id:
+            admitted = {"logical_turn_id": logical_turn_id}
+        else:
+            admitted = db.admit_session_event(
+                session_id=session_id,
+                session_key=f"tui:{session_id}",
+                source_identity=source_identity or f"tui:{event_type}:{uuid.uuid4().hex}",
+                event_type=event_type,
+                payload={"text": text, "ui_session_id": sid, **(payload or {})},
+                task_id=task_id,
+                goal_id=goal_id,
+            )
+        if not claim:
+            return {"outcome": "admitted", "logical_turn_id": admitted["logical_turn_id"]}
+        claim = db.claim_logical_turn(
+            admitted["logical_turn_id"],
+            owner=f"tui:{os.getpid()}",
+            pid=os.getpid(),
+            ttl_seconds=1800.0,
+        )
+        claim["logical_turn_id"] = admitted["logical_turn_id"]
+        if claim.get("outcome") == "claimed":
+            db.mark_logical_turn_started(admitted["logical_turn_id"], claim["attempt_id"])
+            heartbeat_stop = threading.Event()
+
+            def _heartbeat() -> None:
+                while not heartbeat_stop.wait(30.0):
+                    with _session_db(session) as heartbeat_db:
+                        if heartbeat_db is None or not heartbeat_db.heartbeat_logical_turn(
+                            admitted["logical_turn_id"],
+                            claim["attempt_id"],
+                            ttl_seconds=1800.0,
+                        ):
+                            return
+
+            _RealThread(
+                target=_heartbeat,
+                daemon=True,
+                name=f"tui-turn-heartbeat-{admitted['logical_turn_id'][:8]}",
+            ).start()
+            claim["_heartbeat_stop"] = heartbeat_stop
+        return claim
+
+
+def _finish_tui_turn(
+    session: dict,
+    claim: dict | None,
+    result: Any,
+    *,
+    delivery_succeeded: bool | None = None,
+) -> None:
+    if not claim or claim.get("outcome") != "claimed":
+        return
+    heartbeat_stop = claim.get("_heartbeat_stop")
+    if heartbeat_stop is not None:
+        heartbeat_stop.set()
+    with _session_db(session) as db:
+        if db is None:
+            return
+        if isinstance(result, dict) and (result.get("failed") or result.get("error")):
+            db.fail_logical_turn(
+                claim["logical_turn_id"], claim["attempt_id"],
+                str(result.get("error") or "TUI execution failed"), retryable=False,
+            )
+        else:
+            response = result.get("final_response") if isinstance(result, dict) else result
+            completion_result = dict(result) if isinstance(result, dict) else {}
+            completion_result.update(
+                {"response": response, "response_present": bool(response)}
+            )
+            completed = db.complete_logical_turn(
+                claim["logical_turn_id"], claim["attempt_id"],
+                completion_result,
+                delivery_required=bool(response),
+            )
+            if (
+                completed
+                and completed.get("delivery_state") == "pending"
+                and delivery_succeeded is not None
+            ):
+                if delivery_succeeded:
+                    db.record_logical_turn_transport_accepted(
+                        claim["logical_turn_id"], claim["attempt_id"]
+                    )
+                else:
+                    db.fail_logical_turn_delivery(
+                        claim["logical_turn_id"], claim["attempt_id"],
+                        "TUI completion frame was not accepted",
+                    )
+
+
+_TUI_LOGICAL_EVENT_TYPES = (
+    "tui-prompt",
+    "tui-recovered",
+    "tui-goal-continuation",
+    "tui-background-completion",
+    "tui-background-child",
+    "tui-loop-tick",
+    "tui-kanban-notification",
+)
+
+
+def _rehydrate_tui_session_work(sid: str, session: dict, *, limit: int = 32) -> int:
+    """Restore delivery and queued execution from the shared durable ledger."""
+    session_id = str(session.get("session_key") or sid)
+    restored = 0
+    with _session_db(session) as db:
+        if db is None:
+            return 0
+        db.reconcile_logical_turns()
+        for turn in db.list_pending_logical_turn_deliveries(
+            limit=limit,
+            include_transport_accepted=True,
+            session_id=session_id,
+            event_types=_TUI_LOGICAL_EVENT_TYPES,
+        ):
+            result = turn.get("result") or {}
+            response = result.get("response")
+            if response is not None:
+                db.begin_logical_turn_delivery(
+                    turn["logical_turn_id"], turn["current_attempt_id"]
+                )
+                _emit(
+                    "message.complete",
+                    sid,
+                    {"text": response, "status": "complete", "recovered": True},
+                )
+                db.acknowledge_logical_turn_delivery(
+                    turn["logical_turn_id"], turn["current_attempt_id"]
+                )
+                restored += 1
+        ready = db.list_ready_logical_turns(
+            limit=max(1, limit - restored),
+            event_types=_TUI_LOGICAL_EVENT_TYPES,
+            session_id=session_id,
+        )
+    with session["history_lock"]:
+        known = {
+            str(item.get("logical_turn_id"))
+            for item in ([session.get("queued_prompt")] + list(session.get("queued_prompts") or []))
+            if isinstance(item, dict) and item.get("logical_turn_id")
+        }
+        for turn in ready:
+            if turn["logical_turn_id"] in known:
+                continue
+            payload = turn.get("payload") or {}
+            _enqueue_prompt(
+                session,
+                payload.get("text", ""),
+                session.get("transport"),
+                logical_turn_id=turn["logical_turn_id"],
+            )
+            restored += 1
+    if ready and not session.get("running"):
+        _drain_queued_prompt(f"tui-recovery-{uuid.uuid4().hex}", sid, session)
+    return restored
+
+
+def _recover_tui_background_children(
+    sid: str, session: dict, *, limit: int = 16
+) -> int:
+    """Launch queued independent TUI child sessions for this durable parent."""
+    parent_key = str(session.get("session_key") or sid)
+    parent_agent = session.get("agent")
+    if parent_agent is None:
+        return 0
+    with _session_db(session) as db:
+        if db is None:
+            return 0
+        db.reconcile_logical_turns()
+        ready = db.list_ready_logical_turns(
+            limit=limit,
+            event_types=("tui-background-child",),
+            payload_equals={"parent_session_id": parent_key},
+        )
+    launched = 0
+    for turn in ready:
+        child_key = str(turn.get("session_id") or "")
+        payload = turn.get("payload") or {}
+        text = payload.get("text", "")
+        task_id = str(turn.get("task_id") or payload.get("background_task_id") or "")
+        child_session = {
+            "session_key": child_key,
+            "profile_home": session.get("profile_home"),
+            "cwd": _session_cwd(session),
+        }
+        claim = _admit_tui_turn(
+            child_key,
+            child_session,
+            text,
+            logical_turn_id=turn["logical_turn_id"],
+            event_type="tui-background-child",
+        )
+        if claim.get("outcome") != "claimed":
+            continue
+
+        def _run_child(
+            child_claim=claim,
+            child_record=child_session,
+            prompt=text,
+            durable_task=task_id,
+        ) -> None:
+            tokens = _set_session_context(durable_task, cwd=_session_cwd(session))
+            try:
+                from run_agent import AIAgent
+
+                result = AIAgent(
+                    **_background_agent_kwargs(parent_agent, durable_task)
+                ).run_conversation(user_message=prompt, task_id=durable_task)
+                _finish_tui_turn(
+                    child_record, child_claim, result, delivery_succeeded=True
+                )
+                _emit(
+                    "background.complete",
+                    sid,
+                    {
+                        "task_id": durable_task,
+                        "text": result.get("final_response", "")
+                        if isinstance(result, dict)
+                        else str(result),
+                        "recovered": True,
+                    },
+                )
+            except Exception as exc:
+                _finish_tui_turn(
+                    child_record,
+                    child_claim,
+                    {"failed": True, "error": str(exc)},
+                )
+            finally:
+                _clear_session_context(tokens)
+
+        threading.Thread(
+            target=_run_child,
+            daemon=True,
+            name=f"tui-bg-recovery-{turn['logical_turn_id'][:8]}",
+        ).start()
+        launched += 1
+    return launched
 
 
 def _sanitize_queued_entry_vs_inflight_user(
@@ -8900,12 +9192,32 @@ def _handle_busy_submit(
     # Queue before asking the live turn to stop. In particular, never call a
     # provider or compute-host method while holding history_lock: an interrupt
     # can wait behind the very operation it is trying to cancel.
+    durable = _admit_tui_turn(sid, session, text)
+    durable_turn_id = durable.get("logical_turn_id")
+    if durable.get("outcome") not in {"busy", "queued", "unmanaged"}:
+        # A valid live session lease should make this row queued.  If it did
+        # not, do not create a second local execution path.
+        if durable.get("outcome") == "claimed":
+            with _session_db(session) as db:
+                if db is not None:
+                    db.fail_logical_turn(
+                        durable_turn_id, durable["attempt_id"],
+                        "TUI busy-state disagreed with durable ownership", retryable=True,
+                    )
+            # Preserve the accepted retry row and the local wake-up envelope;
+            # the local flag is diagnostic evidence, not permission for this
+            # newly claimed turn to execute concurrently.
+        else:
+            return _ok(rid, {"status": "queued", "logical_turn_id": durable_turn_id})
     with session["history_lock"]:
         if not session.get("running"):
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
-        _enqueue_prompt(session, text, transport, image_paths=image_paths)
+        _enqueue_prompt(
+            session, text, transport, image_paths=image_paths,
+            logical_turn_id=durable_turn_id,
+        )
         session["last_active"] = time.time()
 
     # Attachments need a separate model invocation. Queue them without
@@ -8976,10 +9288,13 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
+                    logical_turn_id=queued.get("logical_turn_id"),
                 )
             else:
                 resp = _submit_prompt_to_compute_host(
-                    rid, sid, session, queued["text"], queued_prompt_generation=queue_generation
+                    rid, sid, session, queued["text"],
+                    queued_prompt_generation=queue_generation,
+                    logical_turn_id=queued.get("logical_turn_id"),
                 )
             if resp.get("error"):
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
@@ -8997,6 +9312,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
+                    logical_turn_id=queued.get("logical_turn_id"),
                 )
             else:
                 _run_prompt_submit(
@@ -9005,6 +9321,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     session,
                     queued["text"],
                     queued_prompt_generation=queue_generation,
+                    logical_turn_id=queued.get("logical_turn_id"),
                 )
     except Exception as exc:
         print(
@@ -10522,6 +10839,24 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
     return (evt_sid, evt_type)
 
 
+def _tui_notification_source_identity(evt: dict) -> str:
+    """Return an authoritative ID or persist one acceptance occurrence on evt."""
+    authoritative = (
+        evt.get("event_id")
+        or evt.get("notification_id")
+        or (evt.get("delegation_id") if evt.get("type") == "async_delegation" else None)
+    )
+    if authoritative:
+        return f"tui:{evt.get('type', 'completion')}:{authoritative}"
+    if evt.get("type") == "completion" and evt.get("session_id"):
+        return f"tui:process-completion:{evt['session_id']}"
+    occurrence = evt.get("_hermes_occurrence_id")
+    if not occurrence:
+        occurrence = uuid.uuid4().hex
+        evt["_hermes_occurrence_id"] = occurrence
+    return f"tui:{evt.get('type', 'notification')}:{occurrence}"
+
+
 # Mirror gateway/kanban_watchers.py TERMINAL_KINDS: claim silent kinds too so
 # the cursor advances past them and they can't wedge a later completed/blocked
 # event behind an unclaimed row.
@@ -10568,6 +10903,10 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
         return
 
     tick_no = mgr.state.ticks_fired if mgr.state else "?"
+    loop_source = (
+        f"tui:loop:{sid_key}:{int((mgr.state.created_at if mgr.state else 0) * 1000)}:"
+        f"{tick_no}"
+    )
     rid = f"__loop__{int(time.time() * 1000)}"
     try:
         _emit(
@@ -10604,7 +10943,12 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
                             return
                         session["running"] = True
                     _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, payload["message"])
+                    _run_prompt_submit(
+                        rid, sid, session, payload["message"],
+                        event_type="tui-loop-tick",
+                        source_identity=loop_source,
+                        event_payload={"loop_tick": tick_no},
+                    )
                     return
             except Exception:
                 pass
@@ -10613,7 +10957,12 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
                 _emit("status.update", sid, {"kind": "loop", "text": decision["message"]})
             return
         _emit("message.start", sid)
-        _run_prompt_submit(rid, sid, session, wakeup)
+        _run_prompt_submit(
+            rid, sid, session, wakeup,
+            event_type="tui-loop-tick",
+            source_identity=loop_source,
+            event_payload={"loop_tick": tick_no},
+        )
     except Exception as exc:
         print(
             f"[tui_gateway] loop wakeup dispatch failed: "
@@ -10763,6 +11112,9 @@ def _collect_kanban_notifications(session: dict) -> list:
                     text = _format_kanban_event_text(sub, task, ev, slug)
                     if text:
                         texts.append(text)
+                        session.setdefault("_kanban_text_task_ids", {})[text] = sub.get(
+                            "task_id"
+                        )
                 # Unsubscribe only on archive. ``done`` is reversible in
                 # review/controller flows, so retaining the subscription lets
                 # a later reopen notify the same originating TUI/Desktop
@@ -10836,22 +11188,47 @@ def _notification_poller_loop(
             if _kanban_texts:
                 for _kb_text in _kanban_texts:
                     _emit("status.update", sid, {"kind": "process", "text": _kb_text})
-                # Events are cursor-claimed (never re-queued), so buffer them
-                # until the session is idle instead of dropping the agent turn.
-                session.setdefault("_kanban_pending", []).extend(_kanban_texts)
+                    # The Kanban cursor claim is the producer boundary. Persist
+                    # the resulting reasoning event immediately, before any
+                    # process-local pending buffer can be lost.
+                    _kb_task_id = (
+                        session.get("_kanban_text_task_ids", {}).pop(_kb_text, None)
+                    )
+                    admitted = _admit_tui_turn(
+                        sid,
+                        session,
+                        _kb_text,
+                        event_type="tui-kanban-notification",
+                        claim=False,
+                        task_id=_kb_task_id,
+                        payload={"kanban_task_id": _kb_task_id},
+                    )
+                    session.setdefault("_kanban_pending", []).append(
+                        {
+                            "text": _kb_text,
+                            "logical_turn_id": admitted.get("logical_turn_id"),
+                        }
+                    )
             _pending = session.get("_kanban_pending") or []
             if _pending:
-                _batch: list = []
+                _next_event = None
                 with session["history_lock"]:
                     if not session.get("running"):
                         session["running"] = True
-                        _batch = list(_pending)
-                        session["_kanban_pending"] = []
-                if _batch:
+                        _next_event = _pending.pop(0)
+                        session["_kanban_pending"] = _pending
+                if _next_event:
                     rid = f"__notif__{int(time.time() * 1000)}"
                     try:
                         _emit("message.start", sid)
-                        _run_prompt_submit(rid, sid, session, "\n".join(_batch))
+                        _run_prompt_submit(
+                            rid,
+                            sid,
+                            session,
+                            _next_event["text"],
+                            event_type="tui-kanban-notification",
+                            logical_turn_id=_next_event.get("logical_turn_id"),
+                        )
                     except Exception as exc:
                         print(
                             f"[tui_gateway] kanban notification dispatch failed: "
@@ -10945,9 +11322,17 @@ def _notification_poller_loop(
                     text,
                     display_kind="async_delegation_complete",
                     display_metadata=_async_delegation_display_metadata(evt),
+                    event_type="tui-background-completion",
+                    source_identity=_tui_notification_source_identity(evt),
+                    event_payload={"delegation_id": evt.get("delegation_id")},
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                _run_prompt_submit(
+                    rid, sid, session, text,
+                    event_type="tui-background-completion",
+                    source_identity=_tui_notification_source_identity(evt),
+                    event_payload={"process_id": evt.get("session_id")},
+                )
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -11023,9 +11408,17 @@ def _notification_poller_loop(
                     text,
                     display_kind="async_delegation_complete",
                     display_metadata=_async_delegation_display_metadata(evt),
+                    event_type="tui-background-completion",
+                    source_identity=_tui_notification_source_identity(evt),
+                    event_payload={"delegation_id": evt.get("delegation_id")},
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                _run_prompt_submit(
+                    rid, sid, session, text,
+                    event_type="tui-background-completion",
+                    source_identity=_tui_notification_source_identity(evt),
+                    event_payload={"process_id": evt.get("session_id")},
+                )
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -11363,7 +11756,29 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    logical_turn_id: str | None = None,
+    logical_turn_claim: dict | None = None,
+    event_type: str = "tui-prompt",
+    source_identity: str | None = None,
+    task_id: str | None = None,
+    goal_id: str | None = None,
+    event_payload: dict | None = None,
 ) -> bool:
+    logical_turn_claim = logical_turn_claim or _admit_tui_turn(
+        sid, session, text,
+        event_type="tui-recovered" if logical_turn_id else event_type,
+        source_identity=source_identity,
+        logical_turn_id=logical_turn_id,
+        task_id=task_id,
+        goal_id=goal_id,
+        payload=event_payload,
+    )
+    if logical_turn_claim.get("outcome") == "terminal":
+        return True
+    if logical_turn_claim.get("outcome") not in {"claimed", "unmanaged"}:
+        with session["history_lock"]:
+            session["running"] = False
+        return False
     with session["history_lock"]:
         if session.get("_closing"):
             session["running"] = False
@@ -11427,6 +11842,7 @@ def _run_prompt_submit(
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         secret_token = None
         goal_followup = None  # set by the post-turn goal hook below
+        goal_followup_source = None
         result = None  # turn outcome; read after the finally for leftover /steer
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
         thinking_started = False  # ambient thinking sound armed for this turn
@@ -11691,7 +12107,12 @@ def _run_prompt_submit(
             except (TypeError, ValueError):
                 _run_params = {}
             if "task_id" in _run_params:
-                run_kwargs["task_id"] = session["session_key"]
+                # A persistent conversation session is not a task identity.
+                # Task-backed producers pass a real authoritative task id via
+                # their own execution context; ordinary TUI turns remain NULL.
+                run_kwargs["task_id"] = (
+                    (logical_turn_claim.get("turn") or {}).get("task_id")
+                )
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
@@ -12028,6 +12449,11 @@ def _run_prompt_submit(
                                 cont_prompt = decision.get("continuation_prompt") or ""
                                 if cont_prompt:
                                     goal_followup = cont_prompt
+                                    goal_followup_source = (
+                                        f"tui:goal:{sid_key}:"
+                                        f"{int(goal_mgr.state.created_at * 1000)}:"
+                                        f"{int(goal_mgr.state.turns_used)}"
+                                    )
                 except Exception as _goal_exc:
                     print(
                         f"[tui_gateway] goal continuation hook failed: "
@@ -12202,6 +12628,9 @@ def _run_prompt_submit(
                 session["last_active"] = time.time()
                 if not turn_error_retained:
                     _clear_inflight_turn(session)
+            _finish_tui_turn(
+                session, logical_turn_claim, result, delivery_succeeded=True
+            )
             # Closing bookend of the "tui prompt accepted" record above —
             # fires on every path (success, returned error, exception,
             # interrupt), so one accepted prompt always produces exactly one
@@ -12265,7 +12694,22 @@ def _run_prompt_submit(
                 session["running"] = True
             try:
                 _emit("message.start", sid)
-                _run_prompt_submit(rid, sid, session, goal_followup)
+                _run_prompt_submit(
+                    rid,
+                    sid,
+                    session,
+                    goal_followup,
+                    event_type="tui-goal-continuation",
+                    source_identity=goal_followup_source,
+                    event_payload={
+                        "goal_created_at": getattr(goal_mgr.state, "created_at", None)
+                        if "goal_mgr" in locals()
+                        else None,
+                        "goal_iteration": getattr(goal_mgr.state, "turns_used", None)
+                        if "goal_mgr" in locals()
+                        else None,
+                    },
+                )
             except Exception as _cont_exc:
                 print(
                     f"[tui_gateway] goal continuation dispatch failed: "
@@ -12311,7 +12755,18 @@ def _run_prompt_submit(
                     continue
                 try:
                     _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
+                    _run_prompt_submit(
+                        rid,
+                        sid,
+                        session,
+                        synth,
+                        event_type="tui-background-completion",
+                        source_identity=_tui_notification_source_identity(_evt),
+                        event_payload={
+                            "delegation_id": _evt.get("delegation_id"),
+                            "process_id": _evt.get("session_id"),
+                        },
+                    )
                     complete_event_delivery(_evt, _claim)
                 except Exception as _n_exc:
                     release_event_delivery(_evt, _claim)
