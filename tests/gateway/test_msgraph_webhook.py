@@ -7,6 +7,7 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig, _apply_env_overrides
 from gateway.platforms.msgraph_webhook import AIOHTTP_AVAILABLE, MSGraphWebhookAdapter
+from gateway.run import GatewayRunner
 
 
 def _make_adapter(**extra_overrides) -> MSGraphWebhookAdapter:
@@ -141,7 +142,54 @@ class TestMSGraphNotifications:
         assert notification["id"] == "notif-1"
         assert event.source.platform == Platform.MSGRAPH_WEBHOOK
         assert event.source.chat_type == "webhook"
-        assert event.message_id == "id:notif-1"
+        assert event.message_id is None
+        assert event.session_event_id == "id:notif-1"
+
+    def test_identical_no_id_notifications_get_distinct_acceptance_occurrences(self):
+        adapter = _make_adapter()
+        notification = {
+            "subscriptionId": "sub-1",
+            "changeType": "updated",
+            "resource": "communications/onlineMeetings/meeting-1",
+            "clientState": "expected-client-state",
+        }
+        first = adapter._build_message_event(dict(notification), None)
+        second = adapter._build_message_event(dict(notification), None)
+
+        first_identity, first_authoritative = (
+            GatewayRunner._gateway_event_source_identity(first)
+        )
+        second_identity, second_authoritative = (
+            GatewayRunner._gateway_event_source_identity(second)
+        )
+
+        assert first.message_id is None
+        assert second.message_id is None
+        assert first_identity != second_identity
+        assert first_authoritative is False
+        assert second_authoritative is False
+        assert GatewayRunner._gateway_event_source_identity(first)[0] == first_identity
+
+    def test_graph_notification_id_remains_authoritative(self):
+        adapter = _make_adapter()
+        notification = {
+            "id": "notif-1",
+            "subscriptionId": "sub-1",
+            "resource": "communications/onlineMeetings/meeting-1",
+        }
+        first = adapter._build_message_event(notification, "id:notif-1")
+        replay = adapter._build_message_event(notification, "id:notif-1")
+
+        first_identity, first_authoritative = (
+            GatewayRunner._gateway_event_source_identity(first)
+        )
+        replay_identity, replay_authoritative = (
+            GatewayRunner._gateway_event_source_identity(replay)
+        )
+
+        assert first_identity == replay_identity
+        assert first_authoritative is True
+        assert replay_authoritative is True
 
     @pytest.mark.anyio
     async def test_oversized_notification_rejected_by_content_length(self):
@@ -260,5 +308,4 @@ class TestMSGraphSourceIPAllowlist:
             _FakeRequest(json_payload=payload, remote="203.0.113.99")
         )
         assert resp.status == 403
-
 
