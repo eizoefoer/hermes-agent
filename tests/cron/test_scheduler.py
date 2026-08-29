@@ -863,12 +863,16 @@ class TestRunJobSessionPersistence:
                 return {"final_response": "ok"}
 
         class FakeFuture:
-            def result(self):
-                return {"final_response": "ok"}
+            def __init__(self, value):
+                self.value = value
 
-        fake_future = FakeFuture()
+            def result(self, *args, **kwargs):
+                return self.value
+
+        fake_future = FakeFuture({"final_response": "ok"})
+        fake_db_future = FakeFuture(fake_db)
         fake_pool = MagicMock()
-        fake_pool.submit.return_value = fake_future
+        fake_pool.submit.side_effect = [fake_db_future, fake_future]
         wait_results = [(set(), set()), ({fake_future}, set())]
         monotonic_ticks = itertools.count(step=61.0)
         monkeypatch.setenv("HERMES_CRON_TIMEOUT", timeout_value)

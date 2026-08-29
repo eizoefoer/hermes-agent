@@ -8651,6 +8651,7 @@ class AIAgent:
         relay_lease = None
         relay_turn = None
         durable_turn_lease = None
+        preacquired_durable_turn_lease = None
         durable_turn_lease_stop = None
         durable_turn_lease_thread = None
         durable_turn_lease_activity_lock = threading.Lock()
@@ -8716,9 +8717,47 @@ class AIAgent:
                         exc_info=True,
                     )
                     _durable_session_exists = True
+            if _turn_db is not None and session_id:
+                try:
+                    from hermes_state import consume_preacquired_logical_turn_lease
+
+                    _preacquired = consume_preacquired_logical_turn_lease(session_id)
+                    if _preacquired:
+                        _live_lease = _turn_db.get_session_turn_lease(session_id)
+                        if (
+                            not _live_lease
+                            or _live_lease.get("holder") != _preacquired.get("holder")
+                        ):
+                            raise RuntimeError(
+                                "pre-acquired logical-turn lease is no longer authoritative"
+                            )
+                        preacquired_durable_turn_lease = str(
+                            _preacquired["holder"]
+                        )
+                        self._active_session_turn_lease_holder = (
+                            preacquired_durable_turn_lease
+                        )
+                        self._active_session_turn_lease_ttl_seconds = max(
+                            0.1,
+                            float(_preacquired.get("expires_at") or 0.0)
+                            - time.time(),
+                        )
+                except RuntimeError:
+                    raise
+                except Exception:
+                    logger.error(
+                        "Failed to verify pre-acquired logical-turn lease for %s",
+                        session_id,
+                        exc_info=True,
+                    )
+                    raise RuntimeError(
+                        "could not verify pre-acquired logical-turn ownership"
+                    )
+
             if (
                 _turn_db is not None
                 and session_id
+                and preacquired_durable_turn_lease is None
                 and not getattr(self, "_persist_disabled", False)
                 # A fresh session id is process-unique and has no durable
                 # transcript to race over. More importantly, subagent/new-turn
@@ -9061,6 +9100,17 @@ class AIAgent:
                         ):
                             self._active_session_turn_lease_holder = None
                             self._active_session_turn_lease_ttl_seconds = None
+                    elif (
+                        preacquired_durable_turn_lease is not None
+                        and getattr(
+                            self, "_active_session_turn_lease_holder", None
+                        )
+                        == preacquired_durable_turn_lease
+                    ):
+                        # The admitting producer owns release/completion for a
+                        # logical-turn lease. run_conversation only borrowed it.
+                        self._active_session_turn_lease_holder = None
+                        self._active_session_turn_lease_ttl_seconds = None
                     # Always clear mid-turn labels when the turn exits — including
                     # interrupted early returns that skip finalize_turn. Keep ts.
                     try:
