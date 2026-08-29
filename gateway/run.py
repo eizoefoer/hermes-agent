@@ -27369,6 +27369,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         is not a transactional boundary: a process crash after adapter
         acceptance can still cause durable at-least-once replay.
         """
+        authoritative_event_id = str(evt.get("event_id") or "").strip()
+        accepted_occurrence_id = str(evt.get("occurrence_id") or "").strip()
+        if not authoritative_event_id and not accepted_occurrence_id:
+            accepted_occurrence_id = uuid.uuid4().hex
+            evt["occurrence_id"] = accepted_occurrence_id
+
         source = await asyncio.to_thread(self._build_process_event_source, evt)
         if not source:
             # API-server-originated sessions bind a RAW session key (the
@@ -27393,7 +27399,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "session %s via self-post",
                             raw_sid,
                         )
-                        await deliver_wake(adapter, text=synth_text, session_id=raw_sid)
+                        await deliver_wake(
+                            adapter,
+                            text=synth_text,
+                            session_id=raw_sid,
+                            source_event_id=authoritative_event_id or None,
+                            occurrence_id=accepted_occurrence_id or None,
+                        )
                         return True
                     except Exception as e:
                         logger.warning(
@@ -27460,7 +27472,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "%s via self-post",
                     raw_sid,
                 )
-                await deliver_wake(adapter, text=synth_text, session_id=raw_sid)
+                await deliver_wake(
+                    adapter,
+                    text=synth_text,
+                    session_id=raw_sid,
+                    source_event_id=authoritative_event_id or None,
+                    occurrence_id=accepted_occurrence_id or None,
+                )
                 return True
             except Exception as e:
                 logger.warning(
@@ -27484,8 +27502,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     str(evt.get("message_id") or "").strip() or None
                 ),
                 session_event_id=(
-                    str(evt.get("event_id") or "").strip() or None
+                    authoritative_event_id or None
                 ),
+                occurrence_id=accepted_occurrence_id or uuid.uuid4().hex,
                 session_event_type="gateway-background-completion",
                 metadata=metadata,
             )

@@ -533,8 +533,12 @@ async def test_inject_watch_notification_raw_session_key_self_posts(monkeypatch,
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
-        posts.append({"text": text, "session_id": session_id})
+    async def fake_self_post(adapter, *, text, session_id, idempotency_key):
+        posts.append({
+            "text": text,
+            "session_id": session_id,
+            "idempotency_key": idempotency_key,
+        })
 
     import gateway.wake as wake_mod
     monkeypatch.setattr(wake_mod, "_self_post_chat_completion", fake_self_post)
@@ -547,9 +551,10 @@ async def test_inject_watch_notification_raw_session_key_self_posts(monkeypatch,
 
     assert result is True
     api_adapter.handle_message.assert_not_awaited()
-    assert posts == [
-        {"text": "[SYSTEM: subagent finished]", "session_id": "raw-hq-session-id"}
-    ]
+    assert posts[0]["text"] == "[SYSTEM: subagent finished]"
+    assert posts[0]["session_id"] == "raw-hq-session-id"
+    assert posts[0]["idempotency_key"].startswith("hermes-wake:occurrence:")
+    assert evt["occurrence_id"] in posts[0]["idempotency_key"]
 
 
 @pytest.mark.asyncio
@@ -566,8 +571,8 @@ async def test_inject_watch_notification_origin_session_id_wins(monkeypatch, tmp
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
-        posts.append(session_id)
+    async def fake_self_post(adapter, *, text, session_id, idempotency_key):
+        posts.append((session_id, idempotency_key))
 
     import gateway.wake as wake_mod
     monkeypatch.setattr(wake_mod, "_self_post_chat_completion", fake_self_post)
@@ -579,7 +584,66 @@ async def test_inject_watch_notification_origin_session_id_wins(monkeypatch, tmp
     }
     result = await runner._inject_watch_notification("[SYSTEM: done]", evt)
     assert result is True
-    assert posts == ["raw-origin-sid"]
+    assert posts[0][0] == "raw-origin-sid"
+    assert posts[0][1].startswith("hermes-wake:occurrence:")
+
+
+@pytest.mark.asyncio
+async def test_inject_watch_notification_reuses_accepted_occurrence_on_retry(
+    monkeypatch, tmp_path
+):
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner.adapters[Platform.API_SERVER] = SimpleNamespace(
+        supports_async_delivery=False,
+        _host="127.0.0.1",
+        _port=8642,
+        _api_key="k",
+        _model_name="m",
+    )
+    identities = []
+
+    async def fake_self_post(adapter, *, text, session_id, idempotency_key):
+        identities.append(idempotency_key)
+
+    import gateway.wake as wake_mod
+
+    monkeypatch.setattr(wake_mod, "_self_post_chat_completion", fake_self_post)
+    evt = {"session_id": "proc", "session_key": "raw-session"}
+
+    assert await runner._inject_watch_notification("same text", evt) is True
+    assert await runner._inject_watch_notification("same text", evt) is True
+    assert len(set(identities)) == 1
+    assert evt["occurrence_id"] in identities[0]
+
+
+@pytest.mark.asyncio
+async def test_inject_watch_notification_forwards_authoritative_event_id(
+    monkeypatch, tmp_path
+):
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner.adapters[Platform.API_SERVER] = SimpleNamespace(
+        supports_async_delivery=False,
+        _host="127.0.0.1",
+        _port=8642,
+        _api_key="k",
+        _model_name="m",
+    )
+    identities = []
+
+    async def fake_self_post(adapter, *, text, session_id, idempotency_key):
+        identities.append(idempotency_key)
+
+    import gateway.wake as wake_mod
+
+    monkeypatch.setattr(wake_mod, "_self_post_chat_completion", fake_self_post)
+    evt = {
+        "session_id": "proc",
+        "session_key": "raw-session",
+        "event_id": "process-event-17",
+    }
+
+    assert await runner._inject_watch_notification("same text", evt) is True
+    assert identities == ["hermes-wake:source:process-event-17"]
 
 
 def test_gateway_drain_retains_and_formats_overflow_events():
