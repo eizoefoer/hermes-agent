@@ -23,11 +23,40 @@ Flow:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import os
+import uuid
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+_FEISHU_COMMENT_EVENT_TYPE = "feishu-comment"
+_FEISHU_COMMENT_RECOVERY_LIMIT = 16
+
+
+def _comment_source_identity(parsed: Dict[str, Any]) -> str:
+    """Return the authoritative replay identity for one Feishu notice.
+
+    Feishu's event ID is preferred.  Older payloads omit it but still expose
+    the newly-created reply/comment object ID.  Content is deliberately never
+    used as occurrence identity.
+    """
+    if parsed.get("event_id"):
+        return f"feishu-comment:event:{parsed['event_id']}"
+    if parsed.get("reply_id"):
+        return f"feishu-comment:reply:{parsed['reply_id']}"
+    if parsed.get("comment_id"):
+        return f"feishu-comment:comment:{parsed['comment_id']}"
+    return f"feishu-comment:occurrence:{uuid.uuid4().hex}"
+
+
+def _get_comment_session_db():
+    from hermes_state import SessionDB
+
+    return SessionDB()
 
 # ---------------------------------------------------------------------------
 # Lark SDK helpers (lazy-imported)
@@ -1044,7 +1073,12 @@ def _save_session_history(key: str, messages: List[Dict[str, Any]]) -> None:
         logger.info("[Feishu-Comment] Session saved: %s (%d messages)", key, len(cleaned))
 
 
-def _run_comment_agent(prompt: str, client: Any, session_key: str = "") -> str:
+def _run_comment_agent(
+    prompt: str,
+    client: Any,
+    session_key: str,
+    session_db: Any,
+) -> str:
     """Create an AIAgent with feishu tools and run the prompt.
 
     If *session_key* is provided, loads/saves conversation history for
@@ -1065,8 +1099,10 @@ def _run_comment_agent(prompt: str, client: Any, session_key: str = "") -> str:
         logger.info("[Feishu-Comment] _run_comment_agent: model=%s provider=%s base_url=%s",
                     model, runtime_kwargs.get("provider"), (runtime_kwargs.get("base_url") or "")[:50])
 
-        # Load session history for cross-card memory
-        history = _load_session_history(session_key) if session_key else []
+        # SessionDB is authoritative across process replacement.  The legacy
+        # in-memory cache remains only a diagnostic/hot mirror and is never a
+        # conversation source for persistent execution.
+        history = session_db.get_messages_as_conversation(session_key)
         if history:
             logger.info("[Feishu-Comment] _run_comment_agent: loaded %d history messages from session %s",
                         len(history), session_key)
@@ -1083,6 +1119,10 @@ def _run_comment_agent(prompt: str, client: Any, session_key: str = "") -> str:
             skip_memory=True,
             max_iterations=15,
             enabled_toolsets=["feishu_doc", "feishu_drive"],
+            session_id=session_key,
+            session_db=session_db,
+            platform="feishu_comment",
+            gateway_session_key=session_key,
         )
         logger.info("[Feishu-Comment] _run_comment_agent: calling run_conversation (prompt=%d chars, history=%d)",
                     len(prompt), len(history))
@@ -1093,15 +1133,14 @@ def _run_comment_agent(prompt: str, client: Any, session_key: str = "") -> str:
                     api_calls, len(response), response[:200])
 
         # Save updated history
-        if session_key:
-            new_messages = result.get("messages", [])
-            if new_messages:
-                _save_session_history(session_key, new_messages)
+        new_messages = result.get("messages", [])
+        if new_messages:
+            _save_session_history(session_key, new_messages)
 
         return response
     except Exception as e:
         logger.exception("[Feishu-Comment] _run_comment_agent: agent failed: %s", e)
-        return ""
+        raise
     finally:
         set_doc_client(None)
         set_drive_client(None)
@@ -1117,8 +1156,91 @@ _NO_REPLY_SENTINEL = "NO_REPLY"
 _ALLOWED_NOTICE_TYPES = {"add_comment", "add_reply"}
 
 
+async def recover_feishu_comment_turns(
+    client: Any,
+    *,
+    self_open_id: str = "",
+    session_db: Any = None,
+    limit: int = _FEISHU_COMMENT_RECOVERY_LIMIT,
+) -> int:
+    """Boundedly replay accepted Feishu comment work after replacement."""
+    db = session_db or _get_comment_session_db()
+    db.reconcile_logical_turns()
+    deliveries = db.list_pending_logical_turn_deliveries(
+        limit=limit,
+        event_types=(_FEISHU_COMMENT_EVENT_TYPE,),
+    )
+    for turn in deliveries:
+        payload = turn.get("payload") or {}
+        parsed = payload.get("parsed_event") or {}
+        result = turn.get("result") or {}
+        response = str(result.get("response") or "")
+        attempt_id = str(turn.get("current_attempt_id") or "")
+        if not response or not attempt_id:
+            continue
+        delivered = await deliver_comment_reply(
+            client,
+            str(parsed.get("file_token") or ""),
+            str(parsed.get("file_type") or ""),
+            str(parsed.get("comment_id") or ""),
+            response,
+            bool(result.get("is_whole")),
+        )
+        if delivered:
+            db.record_logical_turn_transport_accepted(
+                turn["logical_turn_id"], attempt_id
+            )
+        else:
+            db.fail_logical_turn_delivery(
+                turn["logical_turn_id"],
+                attempt_id,
+                "Feishu comment delivery recovery failed",
+            )
+    turns = db.list_ready_logical_turns(
+        limit=limit,
+        event_types=(_FEISHU_COMMENT_EVENT_TYPE,),
+    )
+    recovered = 0
+    for turn in turns:
+        payload = turn.get("payload") or {}
+        parsed = payload.get("parsed_event")
+        if not isinstance(parsed, dict):
+            continue
+        event = SimpleNamespace(event=dict(parsed.get("raw_event") or {}))
+        if not event.event:
+            # parse_drive_comment_event consumes this normalized shape too.
+            event.event = {
+                "event_id": parsed.get("event_id", ""),
+                "comment_id": parsed.get("comment_id", ""),
+                "reply_id": parsed.get("reply_id", ""),
+                "is_mentioned": parsed.get("is_mentioned", False),
+                "timestamp": parsed.get("timestamp", ""),
+                "notice_meta": {
+                    "file_token": parsed.get("file_token", ""),
+                    "file_type": parsed.get("file_type", ""),
+                    "notice_type": parsed.get("notice_type", ""),
+                    "from_user_id": {"open_id": parsed.get("from_open_id", "")},
+                    "to_user_id": {"open_id": parsed.get("to_open_id", "")},
+                },
+            }
+        await handle_drive_comment_event(
+            client,
+            event,
+            self_open_id=self_open_id or str(payload.get("self_open_id") or ""),
+            _session_db=db,
+            _drain_recovery=False,
+        )
+        recovered += 1
+    return recovered
+
+
 async def handle_drive_comment_event(
-    client: Any, data: Any, *, self_open_id: str = "",
+    client: Any,
+    data: Any,
+    *,
+    self_open_id: str = "",
+    _session_db: Any = None,
+    _drain_recovery: bool = True,
 ) -> None:
     """Full orchestration for a drive comment event.
 
@@ -1130,6 +1252,13 @@ async def handle_drive_comment_event(
     6. Deliver reply
     """
     logger.info("[Feishu-Comment] ========== handle_drive_comment_event START ==========")
+    db = _session_db or _get_comment_session_db()
+    if _drain_recovery:
+        await recover_feishu_comment_turns(
+            client,
+            self_open_id=self_open_id,
+            session_db=db,
+        )
     parsed = parse_drive_comment_event(data)
     if parsed is None:
         logger.warning("[Feishu-Comment] Dropping malformed drive comment event")
@@ -1183,6 +1312,27 @@ async def handle_drive_comment_event(
         return
 
     logger.info("[Feishu-Comment] Access granted: user=%s policy=%s rule=%s", from_open_id, rule.policy, rule.match_source)
+
+    sess_key = _session_key(file_type, file_token)
+    db.ensure_session(sess_key, source="feishu_comment")
+    admitted = db.admit_session_event(
+        session_id=sess_key,
+        session_key=sess_key,
+        source_identity=_comment_source_identity(parsed),
+        event_type=_FEISHU_COMMENT_EVENT_TYPE,
+        payload={
+            "parsed_event": parsed,
+            "self_open_id": self_open_id,
+            "recovery_policy": "manual_reconcile",
+        },
+    )
+    logical_turn_id = admitted["logical_turn_id"]
+    if admitted.get("state") in {"completed", "unrecoverable", "cancelled"}:
+        logger.info(
+            "[Feishu-Comment] Source event already terminal as logical turn %s",
+            logical_turn_id,
+        )
+        return
     if reply_id:
         asyncio.ensure_future(
             add_comment_reaction(
@@ -1348,10 +1498,69 @@ async def handle_drive_comment_event(
 
     # Step 4: Run agent in a thread (run_conversation is synchronous)
     # Session key groups all comment cards on the same document
-    sess_key = _session_key(file_type, file_token)
+    claim = db.claim_logical_turn(
+        logical_turn_id,
+        owner=f"feishu-comment:{os.getpid()}",
+        pid=os.getpid(),
+        ttl_seconds=1800.0,
+    )
+    if claim.get("outcome") == "terminal":
+        return
+    if claim.get("outcome") != "claimed":
+        logger.info(
+            "[Feishu-Comment] Turn %s durably queued behind active session ownership",
+            logical_turn_id,
+        )
+        return
+    attempt_id = claim["attempt_id"]
+    if not db.mark_logical_turn_started(logical_turn_id, attempt_id):
+        db.fail_logical_turn(
+            logical_turn_id,
+            attempt_id,
+            "could not transition claimed Feishu comment turn to executing",
+            retryable=True,
+        )
+        return
     loop = asyncio.get_running_loop()
-    response = await loop.run_in_executor(
-        None, _run_comment_agent, prompt, client, sess_key,
+    async def _heartbeat_comment_turn() -> None:
+        while True:
+            await asyncio.sleep(30.0)
+            renewed = await asyncio.to_thread(
+                db.heartbeat_logical_turn,
+                logical_turn_id,
+                attempt_id,
+                ttl_seconds=1800.0,
+            )
+            if not renewed:
+                return
+
+    heartbeat_task = asyncio.create_task(_heartbeat_comment_turn())
+    try:
+        response = await loop.run_in_executor(
+            None, _run_comment_agent, prompt, client, sess_key, db,
+        )
+    except Exception as exc:
+        db.fail_logical_turn(
+            logical_turn_id,
+            attempt_id,
+            str(exc),
+            retryable=False,
+        )
+        return
+    finally:
+        heartbeat_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat_task
+
+    completed = db.complete_logical_turn(
+        logical_turn_id,
+        attempt_id,
+        {
+            "response": response,
+            "response_present": bool(response),
+            "is_whole": is_whole,
+        },
+        delivery_required=bool(response and _NO_REPLY_SENTINEL not in response),
     )
 
     if not response or _NO_REPLY_SENTINEL in response:
@@ -1365,8 +1574,12 @@ async def handle_drive_comment_event(
             client, file_token, file_type, comment_id, response, is_whole,
         )
         if success:
+            db.record_logical_turn_transport_accepted(logical_turn_id, attempt_id)
             logger.info("[Feishu-Comment] Reply delivered successfully")
         else:
+            db.fail_logical_turn_delivery(
+                logical_turn_id, attempt_id, "Feishu comment delivery failed"
+            )
             logger.error("[Feishu-Comment] Failed to deliver reply")
 
     # Cleanup: remove OK reaction (best-effort, non-blocking)
