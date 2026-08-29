@@ -20,6 +20,13 @@ def _no_live_builtin_provider_probes(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.models.provider_model_ids", lambda *_a, **_kw: []
     )
+    # A developer may have a real Ollama daemon on localhost. These tests
+    # exercise generic/configured discovery and must not let the native probe
+    # replace their mocked catalog with the host's models.
+    monkeypatch.setattr(
+        "hermes_cli.models.should_use_ollama_native_catalog",
+        lambda *_a, **_kw: False,
+    )
 
 
 # =============================================================================
