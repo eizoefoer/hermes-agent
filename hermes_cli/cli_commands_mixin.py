@@ -48,6 +48,134 @@ class CLICommandsMixin:
     ``HermesCLI`` via the MRO.
     """
 
+    def _recover_cli_background_children(self, *, limit: int = 16) -> list[str]:
+        """Boundedly recover persisted CLI background children at startup.
+
+        The SessionDB ledger is authoritative.  This pass first repairs a
+        recoverable parent whose process died before child admission, then
+        claims eligible child turns and launches the normal child executor.
+        """
+        state = getattr(self, "_session_db", None)
+        if state is None:
+            return []
+        state.reconcile_logical_turns()
+        recovered: list[str] = []
+        budget = max(0, int(limit))
+
+        parents = state.list_ready_logical_turns(
+            limit=budget, event_types=("cli-background-command",)
+        )
+        for parent in parents:
+            if len(recovered) >= budget:
+                break
+            payload = parent.get("payload") or {}
+            task_id = str(payload.get("background_task_id") or "")
+            child_session = str(payload.get("child_session_id") or task_id)
+            prompt = str(payload.get("text") or "")
+            if not task_id or not child_session or not prompt:
+                continue
+            claim = state.claim_logical_turn(
+                parent["logical_turn_id"],
+                owner=f"cli-background-recovery:{os.getpid()}",
+                pid=os.getpid(),
+            )
+            if claim.get("outcome") != "claimed":
+                continue
+            state.mark_logical_turn_started(parent["logical_turn_id"], claim["attempt_id"])
+            if not state.get_session(child_session):
+                state.create_session(child_session, "cli-background")
+            child = state.admit_session_event(
+                session_id=child_session,
+                session_key=f"cli:{child_session}",
+                source_identity=f"cli:background-child:{parent['logical_turn_id']}",
+                event_type="cli-background-child",
+                payload={
+                    "text": prompt,
+                    "parent_session_id": parent.get("session_id"),
+                    "parent_logical_turn_id": parent["logical_turn_id"],
+                    "background_task_id": task_id,
+                },
+                task_id=task_id,
+                worktree=parent.get("worktree"),
+            )
+            state.complete_logical_turn(
+                parent["logical_turn_id"],
+                claim["attempt_id"],
+                {
+                    "task_id": task_id,
+                    "child_session_id": child_session,
+                    "child_logical_turn_id": child["logical_turn_id"],
+                },
+                delivery_required=False,
+            )
+
+        children = state.list_ready_logical_turns(
+            limit=max(0, budget - len(recovered)),
+            event_types=("cli-background-child",),
+        )
+        for child in children:
+            if len(recovered) >= budget:
+                break
+            claim = state.claim_logical_turn(
+                child["logical_turn_id"],
+                owner=f"cli-background-recovery:{os.getpid()}",
+                pid=os.getpid(),
+                ttl_seconds=1800.0,
+            )
+            if claim.get("outcome") != "claimed":
+                continue
+            if not state.mark_logical_turn_started(child["logical_turn_id"], claim["attempt_id"]):
+                state.fail_logical_turn(
+                    child["logical_turn_id"], claim["attempt_id"],
+                    "could not start recovered CLI background child", retryable=True,
+                )
+                continue
+            payload = child.get("payload") or {}
+            prompt = str(payload.get("text") or "")
+            task_id = str(payload.get("background_task_id") or child.get("task_id") or "")
+            if not prompt or not task_id:
+                state.fail_logical_turn(
+                    child["logical_turn_id"], claim["attempt_id"],
+                    "invalid recovered CLI background payload", retryable=False,
+                )
+                continue
+
+            def _execute_recovered(turn=child, turn_claim=claim, text=prompt, durable_task=task_id):
+                from cli import AIAgent
+                try:
+                    route = self._resolve_turn_agent_config(text)
+                    runtime = route["runtime"]
+                    agent = AIAgent(
+                        model=route["model"], api_key=runtime.get("api_key"),
+                        base_url=runtime.get("base_url"), provider=runtime.get("provider"),
+                        api_mode=runtime.get("api_mode"), acp_command=runtime.get("command"),
+                        acp_args=runtime.get("args"), max_tokens=runtime.get("max_tokens"),
+                        max_iterations=self.max_turns, enabled_toolsets=self.enabled_toolsets,
+                        quiet_mode=True, verbose_logging=False,
+                        session_id=turn["session_id"], platform="cli", session_db=state,
+                        reasoning_config=self.reasoning_config, service_tier=self.service_tier,
+                        request_overrides=route.get("request_overrides"),
+                    )
+                    result = agent.run_conversation(user_message=text, task_id=durable_task)
+                    self._finish_cli_logical_turn(
+                        {**turn_claim, "logical_turn_id": turn["logical_turn_id"]}, result
+                    )
+                except Exception as exc:
+                    state.fail_logical_turn(
+                        turn["logical_turn_id"], turn_claim["attempt_id"],
+                        str(exc), retryable=True,
+                    )
+
+            thread = threading.Thread(
+                target=_execute_recovered,
+                daemon=True,
+                name=f"cli-bg-recovery-{child['logical_turn_id'][:8]}",
+            )
+            thread.start()
+            self._background_tasks[task_id] = thread
+            recovered.append(child["logical_turn_id"])
+        return recovered
+
     def _handle_rollback_command(self, command: str):
         """Handle /rollback — list, diff, or restore filesystem checkpoints.
 
@@ -2193,12 +2321,86 @@ class CLICommandsMixin:
             return
 
         prompt = parts[1].strip()
+        if self._session_db is None:
+            _cprint("  Cannot start background task: SessionDB is unavailable.")
+            return
         self._background_task_counter += 1
         task_num = self._background_task_counter
-        task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        parent_session_id = self.session_id
+        supplied = os.environ.get("HERMES_CLI_SOURCE_ID", "").strip()
+        parent_source = supplied or f"cli:background-command:{parent_session_id}:{uuid.uuid4().hex}"
+        stable = uuid.uuid5(uuid.NAMESPACE_URL, parent_source).hex
+        task_id = f"bg_{stable[:20]}"
+        child_session_id = task_id
+        parent_claim = self._admit_cli_logical_turn(
+            prompt,
+            event_type="cli-background-command",
+            source_identity=parent_source,
+            payload={
+                "background_task_id": task_id,
+                "child_session_id": child_session_id,
+            },
+        )
+        if parent_claim.get("outcome") == "terminal":
+            prior = (parent_claim.get("turn") or {}).get("result") or {}
+            _cprint(f"  Background task already started: {prior.get('task_id', task_id)}")
+            return
+        if parent_claim.get("outcome") != "claimed":
+            _cprint("  Background command is already being processed.")
+            return
+
+        if not self._session_db.get_session(child_session_id):
+            self._session_db.create_session(child_session_id, "cli-background")
+        child_source = f"cli:background-child:{parent_claim['logical_turn_id']}"
+        admitted_child = self._session_db.admit_session_event(
+            session_id=child_session_id,
+            session_key=f"cli:{child_session_id}",
+            source_identity=child_source,
+            event_type="cli-background-child",
+            payload={
+                "text": prompt,
+                "parent_session_id": parent_session_id,
+                "parent_logical_turn_id": parent_claim["logical_turn_id"],
+                "background_task_id": task_id,
+            },
+            task_id=task_id,
+            worktree=os.getcwd(),
+        )
+        child_claim = self._session_db.claim_logical_turn(
+            admitted_child["logical_turn_id"],
+            owner=f"cli-background:{os.getpid()}",
+            pid=os.getpid(),
+            ttl_seconds=1800.0,
+        )
+        child_claim["logical_turn_id"] = admitted_child["logical_turn_id"]
+        if child_claim.get("outcome") != "claimed" or not self._session_db.mark_logical_turn_started(
+            admitted_child["logical_turn_id"], child_claim.get("attempt_id")
+        ):
+            self._finish_cli_logical_turn(
+                parent_claim,
+                {"failed": True, "interrupted": True, "error": "background child could not be claimed"},
+            )
+            _cprint("  Cannot start background task: child turn is already owned.")
+            return
+
+        self._finish_cli_logical_turn(
+            parent_claim,
+            {
+                "final_response": "background child admitted",
+                "task_id": task_id,
+                "child_session_id": child_session_id,
+                "child_logical_turn_id": admitted_child["logical_turn_id"],
+            },
+        )
 
         # Make sure we have valid credentials
         if not self._ensure_runtime_credentials():
+            self._session_db.fail_logical_turn(
+                admitted_child["logical_turn_id"],
+                child_claim["attempt_id"],
+                "runtime credentials unavailable",
+                retryable=True,
+            )
             _cprint("  (>_<) Cannot start background task: no valid credentials.")
             return
 
@@ -2209,6 +2411,15 @@ class CLICommandsMixin:
         turn_route = self._resolve_turn_agent_config(prompt)
 
         def run_background():
+            # ``threading.Thread`` does not inherit the admission ContextVar.
+            # Re-bind this child's already-claimed holder in the worker; the
+            # AIAgent prologue verifies it against SessionDB before reuse.
+            from hermes_state import bind_preacquired_logical_turn_lease
+
+            if child_claim.get("lease"):
+                bind_preacquired_logical_turn_lease(
+                    child_session_id, child_claim["lease"]
+                )
             set_sudo_password_callback(self._sudo_password_callback)
             set_approval_callback(self._approval_callback)
             try:
@@ -2229,7 +2440,7 @@ class CLICommandsMixin:
                     enabled_toolsets=self.enabled_toolsets,
                     quiet_mode=True,
                     verbose_logging=False,
-                    session_id=task_id,
+                    session_id=child_session_id,
                     platform="cli",
                     session_db=self._session_db,
                     reasoning_config=self.reasoning_config,
@@ -2260,6 +2471,7 @@ class CLICommandsMixin:
                     user_message=prompt,
                     task_id=task_id,
                 )
+                self._finish_cli_logical_turn(child_claim, result)
 
                 response = result.get("final_response", "") if result else ""
                 if not response and result and result.get("error"):
@@ -2308,6 +2520,9 @@ class CLICommandsMixin:
                     sys.stdout.flush()
 
             except Exception as e:
+                self._finish_cli_logical_turn(
+                    child_claim, {"failed": True, "error": str(e)}
+                )
                 # Same TUI refresh pattern as success path (#2718)
                 if self._app:
                     self._app.invalidate()

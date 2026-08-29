@@ -20,6 +20,12 @@ from tui_gateway import server
 from tui_gateway.transport import bind_transport, reset_transport
 
 
+@pytest.fixture(autouse=True)
+def _explicit_ephemeral_tui_test_mode(monkeypatch):
+    """Legacy unit doubles intentionally run without a persistent SessionDB."""
+    monkeypatch.setenv("HERMES_TUI_TEST_EPHEMERAL", "1")
+
+
 def _dispatch_sync(req: dict, transport=None) -> dict | None:
     """Run one RPC to completion synchronously, regardless of pool routing.
 
@@ -309,7 +315,9 @@ def test_prompt_submit_dispatches_to_compute_host_when_turn_isolation_enabled(mo
         assert fake_supervisor.frames[0]["text"] == "hello"
         assert fake_supervisor.frames[0]["history"] == seed_history
         assert server._sessions["iso-sid"]["history"] == seed_history
-        assert parent_writes == {"ensure_session": 0, "persist_seed": 0}
+        # The serving process now establishes the durable acceptance row
+        # before handing execution ownership to the compute host.
+        assert parent_writes == {"ensure_session": 1, "persist_seed": 0}
         assert server._sessions["iso-sid"]["running"] is True
 
         fake_supervisor.callback(
@@ -6730,7 +6738,7 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_emit", lambda *args, **_kwargs: emitted.append(args))
 
-    def _deliver(_rid, sid, session, text):
+    def _deliver(_rid, sid, session, text, **_kwargs):
         delivered["a" if sid == "sid-a-live-handoff" else "b"].append(text)
         session["running"] = False
 
@@ -6839,7 +6847,7 @@ def test_notification_poller_live_loop_drops_addressed_orphan(
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     server._sessions["sid-live-orphan"] = session
     process_registry._completion_consumed.discard(event["session_id"])
@@ -6880,7 +6888,7 @@ def test_notification_poller_drops_orphaned_events(monkeypatch, routing):
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     monkeypatch.setattr(server, "_get_db", lambda: None)
 
@@ -6946,7 +6954,7 @@ def test_notification_poller_delivers_owned_events(
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     monkeypatch.setattr(server, "_get_db", lambda: _CompressionDB())
 
@@ -17176,7 +17184,7 @@ def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
     turns = []
     emitted = []
 
-    def _fake_run_prompt_submit(rid, sid, session, text):
+    def _fake_run_prompt_submit(rid, sid, session, text, **_kwargs):
         turns.append(text)
         with session["history_lock"]:
             session["running"] = False
@@ -20563,6 +20571,21 @@ def test_prompt_submit_consecutive_rewinds_with_returned_survivor_row_ids(
     original_row_ids = [m["_row_id"] for m in msgs]
 
     sess = _session(history=[dict(m) for m in msgs], session_key=session_key)
+    sess["agent"].run_conversation = lambda prompt, **kwargs: {
+        "final_response": "ok",
+    }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, **_kwargs):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+        def join(self, timeout=None):
+            return None
+
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
     sid = "real-db-consec-rewind-sid"
     server._sessions[sid] = sess
     monkeypatch.setattr(server, "_get_db", lambda: db)
@@ -20615,7 +20638,16 @@ def test_prompt_submit_consecutive_rewinds_with_returned_survivor_row_ids(
             str(original_row_ids[5]): None,
         }
         assert "999999" not in row_id_map
-        sess["running"] = False
+        # Durable ownership remains authoritative until the dispatched turn
+        # reaches its terminal finally; do not clear only the local status flag
+        # and race a second transcript mutation against it.
+        run_thread = sess.get("_run_thread")
+        if run_thread is not None:
+            run_thread.join(timeout=5)
+        deadline = time.time() + 5
+        while db.get_session_turn_lease(session_key) is not None and time.time() < deadline:
+            time.sleep(0.01)
+        assert not sess.get("running")
 
         # Rewind 2a: the STALE pre-rewind id for "second" must fail closed.
         stale_resp = server.handle_request(

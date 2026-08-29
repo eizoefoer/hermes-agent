@@ -35,6 +35,7 @@ def _bootstrap(monkeypatch, tmp_path):
 
     config = GatewayConfig()
     runner = gateway_run.GatewayRunner(config)
+    runner._allow_ephemeral_gateway_admission_for_tests = True
     runner.adapters = {}
     runner._running_agents = {}
     runner._running_agents_ts = {}
@@ -189,5 +190,4 @@ async def test_not_new_messages_skip_db_when_agent_has_session_db(
 
 
 # ── Test 4: normal path (new_messages found) uses skip_db=True ────────
-
 

@@ -85,6 +85,11 @@ class TurnContext:
     session_key: Optional[str] = None
     run_generation: Optional[int] = None
     process_task_id: str = ""
+    task_id: Optional[str] = None
+    goal_id: Optional[str] = None
+    branch: Optional[str] = None
+    worktree: Optional[str] = None
+    parent_logical_turn_id: Optional[str] = None
     process_baseline: frozenset[str] = field(default_factory=frozenset)
     _interrupt_depth: int = 0
     event_message_id: Optional[str] = None

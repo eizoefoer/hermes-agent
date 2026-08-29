@@ -1814,6 +1814,22 @@ class FeishuAdapter(BasePlatformAdapter):
 
             self._loop = asyncio.get_running_loop()
             await self._connect_with_retry()
+            # Drive-comment reasoning is a persisted document session.  Drain
+            # its accepted queued/retry turns on process replacement instead
+            # of waiting for Feishu to redeliver the source notification.
+            try:
+                from plugins.platforms.feishu.feishu_comment import (
+                    recover_feishu_comment_turns,
+                )
+
+                await recover_feishu_comment_turns(
+                    self._client,
+                    self_open_id=self._bot_open_id,
+                )
+            except Exception:
+                logger.exception(
+                    "[Feishu] Durable drive-comment recovery failed during startup"
+                )
             self._mark_connected()
             logger.info("[Feishu] Connected in %s mode (%s)", self._connection_mode, self._domain_name)
             return True

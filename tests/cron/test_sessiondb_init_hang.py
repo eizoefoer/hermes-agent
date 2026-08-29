@@ -39,6 +39,19 @@ _RUNTIME = {
 }
 
 
+def _configure_durable_db(fake_db):
+    """Give a lightweight mock the canonical logical-turn contract."""
+    fake_db.admit_session_event.return_value = {"logical_turn_id": "lt-cron-test"}
+    fake_db.claim_logical_turn.return_value = {
+        "outcome": "claimed",
+        "attempt_id": "attempt-cron-test",
+    }
+    fake_db.mark_logical_turn_started.return_value = True
+    fake_db.heartbeat_logical_turn.return_value = True
+    fake_db.get_compression_tip.return_value = None
+    return fake_db
+
+
 def _session_db_executor(timeouts: list, *, instant_timeout: bool = True):
     """Wrap ``ThreadPoolExecutor`` so SessionDB's ``result(timeout=...)`` is observable.
 
@@ -76,7 +89,7 @@ def _session_db_executor(timeouts: list, *, instant_timeout: bool = True):
 
 class TestSessionDbInitTimeout:
     def test_run_job_does_not_hang_when_sessiondb_init_wedges(self, tmp_path, monkeypatch):
-        """run_job proceeds without a session store when SessionDB init times out."""
+        """run_job fails closed when canonical SessionDB init times out."""
         monkeypatch.setenv("HERMES_CRON_SESSION_DB_TIMEOUT", "0.2")
         job = {"id": "wedged-sessiondb", "name": "test", "prompt": "hello"}
         timeouts: list = []
@@ -104,15 +117,16 @@ class TestSessionDbInitTimeout:
         # Env-resolved bound was passed to Future.result — not the 10s default,
         # and not an unbounded call.
         assert timeouts == [0.2]
-        assert success is True
-        assert final_response == "ok"
-        assert mock_agent_cls.call_args.kwargs["session_db"] is None
+        assert success is False
+        assert final_response == ""
+        assert "refusing unmanaged model execution" in error
+        mock_agent_cls.assert_not_called()
 
     def test_invalid_timeout_env_falls_back_to_default(self, tmp_path, monkeypatch, caplog):
         """A malformed HERMES_CRON_SESSION_DB_TIMEOUT logs a warning and still
         bounds the call (mirrors HERMES_CRON_TIMEOUT's own fallback)."""
         monkeypatch.setenv("HERMES_CRON_SESSION_DB_TIMEOUT", "not-a-number")
-        fake_db = MagicMock()
+        fake_db = _configure_durable_db(MagicMock())
         job = {"id": "bad-timeout-env", "name": "test", "prompt": "hello"}
         timeouts: list = []
 
@@ -181,8 +195,9 @@ class TestSessionDbInitTimeout:
 
         # Config value was passed through — not the 10s default.
         assert timeouts == [0.2]
-        assert success is True
-        assert mock_agent_cls.call_args.kwargs["session_db"] is None
+        assert success is False
+        assert "refusing unmanaged model execution" in error
+        mock_agent_cls.assert_not_called()
 
 
 class TestDispatchGuardReleasedAfterHang:
@@ -201,7 +216,7 @@ class TestDispatchGuardReleasedAfterHang:
             "id": "guard-sessiondb-hang",
             "name": "guard-sessiondb-hang",
             "prompt": "hello",
-            "schedule": "every 5m",
+            "schedule": {"kind": "interval", "interval_seconds": 300},
             "enabled": True,
             "next_run_at": "2020-01-01T00:00:00",
             "deliver": "local",
@@ -224,7 +239,7 @@ class TestDispatchGuardReleasedAfterHang:
                      side_effect=_session_db_executor(timeouts),
                  ), \
                  patch.object(sched, "get_due_jobs", return_value=[job]), \
-                 patch.object(sched, "claim_job_for_fire", return_value=True), \
+                 patch.object(sched, "claim_job_for_fire", return_value=job), \
                  patch.object(sched, "save_job_output", return_value="/tmp/out"), \
                  patch.object(sched, "mark_job_run"), \
                  patch.object(sched, "_deliver_result", return_value=None):
@@ -328,7 +343,9 @@ class TestLateSessionDbClosedAfterTimeout:
 
                 success, output, final_response, error = run_job(job)
                 # run_job returned promptly after the timeout; session_db is None
-                assert success is True
+                assert success is False
+                assert "refusing unmanaged model execution" in error
+                mock_agent_cls.assert_not_called()
 
                 # Release the hanging init so the abandoned worker completes.
                 never_set.set()

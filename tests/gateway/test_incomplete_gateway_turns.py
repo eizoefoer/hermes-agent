@@ -73,6 +73,7 @@ def _make_incomplete_result() -> dict:
 
 def _make_runner(adapter: CaptureSlackAdapter) -> gateway_run.GatewayRunner:
     runner = object.__new__(gateway_run.GatewayRunner)
+    runner._allow_ephemeral_gateway_admission_for_tests = True
     runner.config = GatewayConfig(
         platforms={Platform.SLACK: PlatformConfig(enabled=True, token="fake-token")}
     )

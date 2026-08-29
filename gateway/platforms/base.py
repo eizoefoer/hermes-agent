@@ -2452,6 +2452,25 @@ class MessageEvent:
     # completion notifications) that must bypass user authorization checks.
     internal: bool = False
 
+    # Durable accepted-work identity.  ``session_event_id`` is reserved for an
+    # authoritative producer/transport replay key.  Producers without one get
+    # a fresh Hermes occurrence at acceptance; that value is persisted with
+    # the logical turn and restored verbatim during retry/recovery.
+    session_event_id: Optional[str] = None
+    occurrence_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    session_event_type: Optional[str] = None
+
+    # Optional truthful correlation.  Ordinary conversation leaves these
+    # unset; task/goal identifiers are populated only by producers that own
+    # authoritative durable objects.
+    task_id: Optional[str] = None
+    goal_id: Optional[str] = None
+    delegation_id: Optional[str] = None
+    barrier_id: Optional[str] = None
+    parent_logical_turn_id: Optional[str] = None
+    branch: Optional[str] = None
+    worktree: Optional[str] = None
+
     # Free-form per-event metadata.  Adapters may set platform-specific
     # signals here (e.g. WhatsApp sets ``whatsapp_from_owner=True`` when
     # the bridge is configured to forward owner-typed messages).  Plugins
@@ -6898,6 +6917,33 @@ class BasePlatformAdapter(ABC):
                 event,
                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
             )
+
+            # Model execution is already terminal before transport delivery.
+            # Persist only the strongest acknowledgement the adapter observed;
+            # a failed/missing send remains delivery work and never reopens the
+            # logical turn's model/tool execution.
+            delivery_callback = getattr(
+                event, "_logical_turn_delivery_callback", None
+            )
+            if delivery_callback is not None:
+                try:
+                    callback_result = delivery_callback(
+                        event,
+                        delivery_succeeded,
+                        (
+                            None
+                            if delivery_succeeded
+                            else "no successful delivery acknowledgement"
+                        ),
+                    )
+                    if inspect.isawaitable(callback_result):
+                        await callback_result
+                except Exception:
+                    logger.warning(
+                        "[%s] durable logical-turn delivery record failed",
+                        self.name,
+                        exc_info=True,
+                    )
 
             # The active drain owns debounce state. If a queue-mode timer has
             # not fired yet, force-flush into _pending_messages here and let
