@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -15,6 +15,7 @@ class _PendingAdapter:
 
 def _make_runner():
     runner = object.__new__(GatewayRunner)
+    runner._persist_busy_gateway_event = AsyncMock(return_value=True)
     runner.config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")})
     runner.adapters = {Platform.TELEGRAM: _PendingAdapter()}
     runner._running_agents = {}

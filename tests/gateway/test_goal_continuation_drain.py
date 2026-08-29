@@ -158,6 +158,7 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
     adapter_key = build_session_key(src)
 
     runner = object.__new__(GatewayRunner)
+    runner._allow_ephemeral_gateway_admission_for_tests = True
     from gateway.config import GatewayConfig
 
     runner.config = GatewayConfig(

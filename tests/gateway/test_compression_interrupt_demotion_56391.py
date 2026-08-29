@@ -54,6 +54,7 @@ def _make_event(text: str = "hello", chat_id: str = "123") -> MessageEvent:
 
 def _make_runner(*, session_id: str = "parent-session") -> GatewayRunner:
     runner = object.__new__(GatewayRunner)
+    runner._persist_busy_gateway_event = AsyncMock(return_value=True)
     runner._running_agents = {}
     runner._running_agents_ts = {}
     runner._pending_messages = {}
@@ -153,5 +154,4 @@ class TestBusyHandlerDemotesInterruptForCompression:
         assert "queued" in content.lower()
         assert "/stop" in content
         assert "Interrupting" not in content
-
 

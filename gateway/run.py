@@ -41,6 +41,7 @@ import signal
 import threading
 import time
 import traceback
+import uuid
 from collections import OrderedDict
 from contextvars import Context, copy_context
 from pathlib import Path
@@ -116,6 +117,40 @@ _STALL_NOTIFY_SEND_TIMEOUT_SECONDS = 15.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
+
+_GATEWAY_LOGICAL_TURN_EVENT_TYPES = (
+    "gateway-inbound",
+    "gateway-internal",
+    "gateway-queued",
+    "gateway-goal-continuation",
+    "gateway-heartbeat",
+    "gateway-loop-wakeup",
+    "gateway-background-completion",
+    "gateway-delegation-completion",
+    "gateway-recovered-event",
+)
+_GATEWAY_LOGICAL_TURN_LEASE_TTL_SECONDS = 300.0
+_GATEWAY_LOGICAL_TURN_HEARTBEAT_SECONDS = 60.0
+_GATEWAY_LOGICAL_TURN_DRAIN_LIMIT = 100
+
+
+class DurableSessionAdmissionError(RuntimeError):
+    """Persistent gateway work could not enter the durable admission path."""
+
+
+class DurableSessionTurnQueued(RuntimeError):
+    """Accepted work is durable but another turn currently owns the session."""
+
+    def __init__(self, session_id: str, logical_turn_id: str):
+        self.session_id = session_id
+        self.logical_turn_id = logical_turn_id
+        super().__init__(
+            f"logical turn {logical_turn_id} queued for busy session {session_id}"
+        )
+
+
+class DurableSessionTurnAlreadyCompleted(RuntimeError):
+    """A replay mapped to a terminal logical turn and must not execute again."""
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
@@ -6327,13 +6362,45 @@ class TurnRunner:
             # false positives from MagicMock auto-attribute creation in tests.
             if getattr(type(ctx._status_adapter), "send_exec_approval", None) is not None:
                 try:
+                    approval_metadata = dict(ctx._status_thread_metadata or {})
+                    approval_metadata["approval_continuation"] = {
+                        "kind": "hermes_session",
+                        "payload": {
+                            "session_id": ctx.session_id,
+                            "command": cmd,
+                            "description": desc,
+                            "pattern_key": approval_data.get("pattern_key"),
+                            "pattern_keys": list(
+                                approval_data.get("pattern_keys") or []
+                            ),
+                            "permanent_pattern_keys": list(
+                                approval_data.get("permanent_pattern_keys") or []
+                            ),
+                            "task_id": ctx.task_id,
+                            "goal_id": ctx.goal_id,
+                            "approval_user_id": str(
+                                getattr(event.source, "user_id", None)
+                                or ctx._status_chat_id
+                            ),
+                            "branch": ctx.branch,
+                            "worktree": ctx.worktree,
+                            "parent_logical_turn_id": ctx.parent_logical_turn_id,
+                            "process_local_fast_path": True,
+                        },
+                        # This fresh identifier is persisted before Telegram
+                        # delivery. Replayed callback data resolves the same
+                        # request; later legitimate approvals get a new key.
+                        "idempotency_key": (
+                            f"gateway-approval:{ctx.session_id}:{uuid.uuid4().hex}"
+                        ),
+                    }
                     _approval_fut = safe_schedule_threadsafe(
                         ctx._status_adapter.send_exec_approval(
                             chat_id=ctx._status_chat_id,
                             command=cmd,
                             session_key=_approval_session_key,
                             description=desc,
-                            metadata=ctx._status_thread_metadata,
+                            metadata=approval_metadata,
                             allow_permanent=approval_data.get("allow_permanent", True),
                             allow_session=approval_data.get("allow_session", True),
                             smart_denied=approval_data.get("smart_denied", False),
@@ -6586,7 +6653,10 @@ class TurnRunner:
             )
             _conversation_kwargs = {
                 "conversation_history": agent_history,
-                "task_id": ctx.session_id,
+                # A conversation session is not a task.  Only producers with
+                # an authoritative durable task may correlate model execution
+                # to one; ordinary gateway chat keeps this unset.
+                "task_id": ctx.task_id,
             }
             if _persist_user_message_override is not None:
                 _conversation_kwargs["persist_user_message"] = _persist_user_message_override
@@ -7136,6 +7206,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # process exit; this one is a steady state NAS polls during its
         # request -> poll -> proceed loop.
         self._external_drain_active = False
+        self._approval_continuation_runtimes: Dict[Path, tuple[Any, Any]] = {}
         self._restart_requested = False
         # Set by shutdown_signal_handler when a SIGTERM/SIGINT arrived
         # WITHOUT a planned-stop / takeover marker — i.e. an unexpected
@@ -10442,8 +10513,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
             if self._queue_during_drain_enabled(effective_mode):
-                self._queue_or_replace_pending_event(session_key, event)
-                message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                persisted = await self._persist_busy_gateway_event(
+                    event, session_key
+                )
+                if persisted:
+                    self._queue_or_replace_pending_event(session_key, event)
+                message = (
+                    f"⏳ Gateway {self._status_action_gerund()} — queued durably "
+                    "for the next turn after it comes back."
+                    if persisted
+                    else "⛔ Gateway could not persist this turn; it was not queued."
+                )
             else:
                 message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
 
@@ -10553,10 +10633,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # payload text, so queue those through the gateway FIFO to keep their
         # security metadata separate from pending user input.
         if getattr(event, "internal", False) and not event.allow_gateway_control:
-            self._queue_or_replace_pending_event(session_key, event)
+            if await self._persist_busy_gateway_event(event, session_key):
+                self._queue_or_replace_pending_event(session_key, event)
             return True
         if getattr(event, "internal", False):
-            return False
+            if await self._persist_busy_gateway_event(event, session_key):
+                self._queue_or_replace_pending_event(session_key, event)
+            return True
 
         _busy_state = self._peek_session_state(session_key)
         running_agent = _busy_state.turn.agent if _busy_state else None
@@ -10567,7 +10650,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and busy_text_mode == "queue"
             and effective_mode != "steer"
         ):
-            return False
+            if await self._persist_busy_gateway_event(event, session_key):
+                self._queue_or_replace_pending_event(session_key, event)
+            return True
 
         # Steer mode: inject mid-run via running_agent.steer() instead of
         # queueing + interrupting.  If the agent isn't running yet
@@ -10670,7 +10755,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # turn in arrival order while still preserving photo-burst / album
         # merge semantics for media.
         if not steered and not redirected:
-            self._queue_or_replace_pending_event(session_key, event)
+            if await self._persist_busy_gateway_event(event, session_key):
+                self._queue_or_replace_pending_event(session_key, event)
 
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"
@@ -12646,6 +12732,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
+                session_event_id=f"resume-pending:{entry.session_id}",
+                session_event_type="gateway-recovered-event",
             )
             task = asyncio.create_task(
                 self._run_startup_resume_event(adapter, event, entry.session_key)
@@ -13613,6 +13701,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._install_plugin_message_injector()
         self._update_runtime_status("running")
 
+        self._spawn_supervised(
+            self._approval_continuation_watcher,
+            "approval_continuation_watcher",
+            on_spawn=lambda task: setattr(
+                self, "_approval_continuation_task", task
+            ),
+        )
+
         self._start_loop_heartbeat_task()
 
         # Emit gateway:startup hook
@@ -13684,6 +13780,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # is strictly cheaper and more correct than re-running the whole turn.
         self._schedule_resume_pending_sessions()
         await self._finish_startup_restore()
+
+        # Reconcile and dispatch accepted queued/retry gateway turns from the
+        # durable ledger.  This is the authoritative process-replacement path;
+        # adapter pending maps remain local delivery optimisations only.
+        self._spawn_supervised(
+            self._gateway_logical_turn_watcher,
+            "gateway_logical_turn_watcher",
+        )
 
         # Surface state.db init failures to the user's messaging platforms
         # so they know persistence is broken before losing data (#88235).
@@ -14372,6 +14476,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             text=synthetic_text,
             source=dest_source,
             internal=True,
+            session_event_id=f"handoff:{cli_session_id}:{session_key}",
+            session_event_type="gateway-recovered-event",
         )
 
         logger.info(
@@ -15737,6 +15843,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     continue
                 _task.cancel()
             self._background_tasks.clear()
+
+            _approval_task = getattr(self, "_approval_continuation_task", None)
+            if _approval_task is not None:
+                try:
+                    await _approval_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.debug(
+                        "Approval continuation watcher shutdown failed",
+                        exc_info=True,
+                    )
+                self._approval_continuation_task = None
+
+            for _store, _worker in list(
+                getattr(self, "_approval_continuation_runtimes", {}).values()
+            ):
+                try:
+                    _store.close()
+                except Exception:
+                    logger.debug(
+                        "Approval continuation store close failed",
+                        exc_info=True,
+                    )
+            getattr(self, "_approval_continuation_runtimes", {}).clear()
 
             self.adapters.clear()
             for _session_key in list(self._running_agents):
@@ -17298,32 +17429,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         has_media = bool(getattr(event, "media_urls", None))
         if not queued_text and not has_media:
             return "Usage: /queue <prompt>"
+        queued_event = dataclasses.replace(
+            event,
+            text=queued_text,
+            message_type=event.message_type if has_media else MessageType.TEXT,
+            session_event_type="gateway-queued",
+        )
+        if not await self._persist_busy_gateway_event(queued_event, quick_key):
+            return "⛔ Durable session storage is unavailable; the turn was not queued."
         adapter = self._adapter_for_source(source)
-        if adapter:
-            queued_event = MessageEvent(
-                text=queued_text,
-                message_type=event.message_type if has_media else MessageType.TEXT,
-                source=event.source,
-                raw_message=event.raw_message,
-                message_id=event.message_id,
-                media_urls=list(getattr(event, "media_urls", []) or []),
-                media_types=list(getattr(event, "media_types", []) or []),
-                reply_to_message_id=event.reply_to_message_id,
-                reply_to_text=event.reply_to_text,
-                reply_to_author_id=event.reply_to_author_id,
-                reply_to_author_name=event.reply_to_author_name,
-                reply_to_is_own_message=event.reply_to_is_own_message,
-                auto_skill=event.auto_skill,
-                channel_prompt=event.channel_prompt,
-                channel_context=event.channel_context,
-                internal=event.internal,
-                timestamp=event.timestamp,
-            )
+        if adapter is not None:
             self._enqueue_fifo(quick_key, queued_event, adapter)
-        depth = self._queue_depth(quick_key, adapter=self._adapter_for_source(source))
-        if depth <= 1:
-            return "Queued for the next turn."
-        return f"Queued for the next turn. ({depth} queued)"
+        return "Queued for the next turn."
 
     async def _busy_steer_command(self, event: MessageEvent, quick_key: str, source):
         # /steer <prompt> — inject mid-run after the next tool call.
@@ -17338,17 +17455,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         running_agent = _steer_state.turn.agent if _steer_state else None
         if running_agent is _AGENT_PENDING_SENTINEL:
             # Agent hasn't started yet — queue as turn-boundary fallback.
-            adapter = self._adapter_for_source(source)
-            if adapter:
-                queued_event = MessageEvent(
-                    text=steer_text,
-                    message_type=MessageType.TEXT,
-                    source=event.source,
-                    message_id=event.message_id,
-                    channel_prompt=event.channel_prompt,
-                    channel_context=event.channel_context,
-                )
-                self._enqueue_fifo(quick_key, queued_event, adapter)
+            queued_event = dataclasses.replace(
+                event,
+                text=steer_text,
+                message_type=MessageType.TEXT,
+                session_event_type="gateway-queued",
+            )
+            if await self._persist_busy_gateway_event(queued_event, quick_key):
+                adapter = self._adapter_for_source(source)
+                if adapter is not None:
+                    self._enqueue_fifo(quick_key, queued_event, adapter)
             return "Agent still starting — /steer queued for the next turn."
         if running_agent and hasattr(running_agent, "steer"):
             try:
@@ -17361,17 +17477,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return f"⏩ Steer queued — arrives after the next tool call: '{preview}'"
             return "Steer rejected (empty payload)."
         # Running agent is missing or lacks steer() — fall back to queue.
-        adapter = self._adapter_for_source(source)
-        if adapter:
-            queued_event = MessageEvent(
-                text=steer_text,
-                message_type=MessageType.TEXT,
-                source=event.source,
-                message_id=event.message_id,
-                channel_prompt=event.channel_prompt,
-                channel_context=event.channel_context,
-            )
-            self._enqueue_fifo(quick_key, queued_event, adapter)
+        queued_event = dataclasses.replace(
+            event,
+            text=steer_text,
+            message_type=MessageType.TEXT,
+            session_event_type="gateway-queued",
+        )
+        if await self._persist_busy_gateway_event(queued_event, quick_key):
+            adapter = self._adapter_for_source(source)
+            if adapter is not None:
+                self._enqueue_fifo(quick_key, queued_event, adapter)
         return "No active agent — /steer queued for the next turn."
 
     async def _busy_goal_command(self, event: MessageEvent, quick_key: str, source):
@@ -18000,7 +18115,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
                 adapter = self._adapter_for_source(source)
-                if adapter:
+                if adapter and await self._persist_busy_gateway_event(
+                    event, _quick_key
+                ):
                     merge_pending_message_event(adapter._pending_messages, _quick_key, event)
                 return None
 
@@ -18023,7 +18140,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _quick_key,
                 )
                 adapter = self._adapter_for_source(source)
-                if adapter:
+                if adapter and await self._persist_busy_gateway_event(
+                    event, _quick_key
+                ):
                     if effective_busy_input_mode == "queue":
                         self._enqueue_fifo(_quick_key, event, adapter)
                     else:
@@ -18047,7 +18166,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Queue the message so it will be picked up after the
                 # agent starts.
                 adapter = self._adapter_for_source(source)
-                if adapter:
+                if adapter and await self._persist_busy_gateway_event(
+                    event, _quick_key
+                ):
                     merge_pending_message_event(
                         adapter._pending_messages,
                         _quick_key,
@@ -18060,7 +18181,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     effective_busy_input_mode
                 )
                 if queue_during_drain:
-                    self._queue_or_replace_pending_event(_quick_key, event)
+                    if await self._persist_busy_gateway_event(event, _quick_key):
+                        self._queue_or_replace_pending_event(_quick_key, event)
                 return (
                     f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
                     if queue_during_drain
@@ -18068,7 +18190,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             if effective_busy_input_mode == "queue":
                 logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
-                self._queue_or_replace_pending_event(_quick_key, event)
+                if await self._persist_busy_gateway_event(event, _quick_key):
+                    self._queue_or_replace_pending_event(_quick_key, event)
                 return None
             if effective_busy_input_mode == "steer":
                 # Steer mode: inject text into the running agent mid-run via
@@ -18092,7 +18215,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug("PRIORITY steer for session %s", _quick_key)
                     return None
                 logger.debug("PRIORITY steer-fallback-to-queue for session %s", _quick_key)
-                self._queue_or_replace_pending_event(_quick_key, event)
+                if await self._persist_busy_gateway_event(event, _quick_key):
+                    self._queue_or_replace_pending_event(_quick_key, event)
                 return None
             # #30170 — Subagent protection (PRIORITY path). Same rationale
             # as ``_handle_active_session_busy_message``: an interrupt
@@ -18108,7 +18232,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "because the running agent has active subagents (#30170)",
                     _quick_key,
                 )
-                self._queue_or_replace_pending_event(_quick_key, event)
+                if await self._persist_busy_gateway_event(event, _quick_key):
+                    self._queue_or_replace_pending_event(_quick_key, event)
                 return None
             # #56391 — Compression protection (PRIORITY path). Same
             # rationale as ``_handle_active_session_busy_message``: context
@@ -18124,7 +18249,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "because context compression is in flight (#56391)",
                     _quick_key,
                 )
-                self._queue_or_replace_pending_event(_quick_key, event)
+                if await self._persist_busy_gateway_event(event, _quick_key):
+                    self._queue_or_replace_pending_event(_quick_key, event)
                 return None
             # Text-only corrections redirect the live turn (preserving
             # displayed context) when the runtime supports it; media/voice and
@@ -18148,6 +18274,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc,
                     )
             logger.debug("PRIORITY interrupt for session %s", _quick_key)
+            if await self._persist_busy_gateway_event(event, _quick_key):
+                self._queue_or_replace_pending_event(_quick_key, event)
             _interrupt_text = event.text
             _media_urls = getattr(event, "media_urls", None) or []
             if self._pending_event_audio_paths(event):
@@ -18942,6 +19070,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _agent_result = await self._handle_message_with_agent(
                     event, source, _quick_key, _run_generation
                 )
+            except DurableSessionTurnQueued as exc:
+                logger.info(
+                    "Durably queued turn for busy session: session=%s turn=%s",
+                    exc.session_id,
+                    exc.logical_turn_id,
+                )
+                return "⏳ This session is busy. Your message is safely queued for the next turn."
+            except DurableSessionTurnAlreadyCompleted:
+                logger.info(
+                    "Ignoring replay of completed durable gateway occurrence: turn=%s",
+                    getattr(event, "_logical_turn_id", None),
+                )
+                return None
+            except DurableSessionAdmissionError as exc:
+                logger.error("Durable gateway admission failed: %s", exc)
+                return (
+                    "⛔ Durable session storage is unavailable, so this message "
+                    "was not executed. Please retry after storage recovers."
+                )
             except TurnLeaseTimeoutError as exc:
                 # This is a rejected message, not a completed agent turn. Return
                 # before the /goal judge below so it cannot consume the resend
@@ -18967,7 +19114,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             except Exception as _goal_exc:
                 logger.debug("post-turn hook failed: %s", _goal_exc)
+            await self._complete_gateway_logical_turn(event, _agent_result)
             return _agent_result
+        except asyncio.CancelledError:
+            await self._fail_gateway_logical_turn(
+                event,
+                "gateway turn cancelled before terminal completion",
+                retryable=False,
+            )
+            raise
+        except BaseException as exc:
+            await self._fail_gateway_logical_turn(event, exc, retryable=False)
+            raise
         finally:
             # MoA one-shot restore must run on EVERY exit path, not just
             # success. The restore data lives on the per-turn event object
@@ -19743,6 +19901,783 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    @staticmethod
+    def _gateway_event_type(event: MessageEvent) -> str:
+        explicit = str(getattr(event, "session_event_type", None) or "").strip()
+        if explicit:
+            return explicit
+        return "gateway-internal" if getattr(event, "internal", False) else "gateway-inbound"
+
+    @staticmethod
+    def _gateway_event_source_identity(event: MessageEvent) -> tuple[str, bool]:
+        """Return the accepted occurrence identity and its authority status.
+
+        Transport replay keys win.  Internal/synthetic message IDs are reply
+        anchors, not occurrence identities.  When no authoritative key exists,
+        MessageEvent's acceptance-time occurrence is used and later persisted.
+        """
+        durable_identity = getattr(event, "_durable_source_identity", None)
+        if durable_identity:
+            return str(durable_identity), bool(
+                getattr(event, "_source_identity_authoritative", False)
+            )
+        source = event.source
+        platform = getattr(getattr(source, "platform", None), "value", "unknown")
+        event_type = GatewayRunner._gateway_event_type(event)
+        event_id = getattr(event, "session_event_id", None)
+        update_id = getattr(event, "platform_update_id", None)
+        message_id = getattr(event, "message_id", None)
+        if event_id:
+            return f"{platform}:event:{event_type}:{event_id}", True
+        if update_id is not None:
+            return f"{platform}:update:{source.chat_id}:{update_id}", True
+        if message_id and not getattr(event, "internal", False):
+            thread_id = getattr(source, "thread_id", None) or ""
+            return (
+                f"{platform}:message:{source.chat_id}:{thread_id}:{message_id}",
+                True,
+            )
+        occurrence_id = str(getattr(event, "occurrence_id", None) or uuid.uuid4().hex)
+        event.occurrence_id = occurrence_id
+        return f"{platform}:occurrence:{occurrence_id}", False
+
+    @staticmethod
+    def _gateway_logical_turn_payload(
+        event: MessageEvent,
+        *,
+        source_identity_authoritative: bool,
+    ) -> Dict[str, Any]:
+        source = event.source
+        timestamp = getattr(event, "timestamp", None)
+        if hasattr(timestamp, "isoformat"):
+            timestamp = timestamp.isoformat()
+        message_type = getattr(event, "message_type", MessageType.TEXT)
+        message_type_value = getattr(message_type, "value", str(message_type))
+        metadata = dict(getattr(event, "metadata", None) or {})
+        recovery_policy = str(
+            metadata.get("logical_turn_recovery_policy") or "manual_reconcile"
+        )
+        return {
+            "event_type": GatewayRunner._gateway_event_type(event),
+            "text": event.text,
+            "message_type": message_type_value,
+            "message_id": getattr(event, "message_id", None),
+            "reply_to_message_id": getattr(event, "reply_to_message_id", None),
+            "reply_to_text": getattr(event, "reply_to_text", None),
+            "reply_to_author_id": getattr(event, "reply_to_author_id", None),
+            "reply_to_author_name": getattr(event, "reply_to_author_name", None),
+            "reply_to_is_own_message": bool(
+                getattr(event, "reply_to_is_own_message", False)
+            ),
+            "platform_update_id": getattr(event, "platform_update_id", None),
+            "internal": bool(getattr(event, "internal", False)),
+            "allow_gateway_control": bool(
+                getattr(event, "allow_gateway_control", True)
+            ),
+            "session_event_id": getattr(event, "session_event_id", None),
+            "occurrence_id": getattr(event, "occurrence_id", None),
+            "source_identity_authoritative": source_identity_authoritative,
+            "session_event_type": GatewayRunner._gateway_event_type(event),
+            "source": source.to_dict() if hasattr(source, "to_dict") else {},
+            "media_urls": list(getattr(event, "media_urls", None) or []),
+            "media_types": list(getattr(event, "media_types", None) or []),
+            "auto_skill": getattr(event, "auto_skill", None),
+            "channel_prompt": getattr(event, "channel_prompt", None),
+            "channel_context": getattr(event, "channel_context", None),
+            "metadata": metadata,
+            "timestamp": timestamp,
+            "delegation_id": getattr(event, "delegation_id", None),
+            "barrier_id": getattr(event, "barrier_id", None),
+            "parent_logical_turn_id": getattr(
+                event, "parent_logical_turn_id", None
+            ),
+            "recovery_policy": recovery_policy,
+        }
+
+    async def admit_session_event(
+        self,
+        event: MessageEvent,
+        session_entry: SessionEntry,
+        *,
+        claim: bool = True,
+    ) -> Dict[str, Any]:
+        """Canonical durable gateway admission facade for a new session turn."""
+        if getattr(self, "_allow_ephemeral_gateway_admission_for_tests", False):
+            # Explicit compatibility mode for unit tests that isolate deep
+            # agent/transcript behavior with non-persistent fakes.  Real
+            # GatewayRunner construction never sets this flag.
+            logical_turn_id = f"ephemeral-test-{uuid.uuid4().hex}"
+            attempt_id = f"ephemeral-test-{uuid.uuid4().hex}"
+            setattr(event, "_logical_turn_id", logical_turn_id)
+            setattr(event, "_logical_attempt_id", attempt_id)
+            setattr(event, "_ephemeral_gateway_admission_for_test", True)
+            return {
+                "outcome": "claimed",
+                "attempt_id": attempt_id,
+                "turn": {"logical_turn_id": logical_turn_id},
+                "lease": None,
+            }
+        state = self._session_db
+        if state is None:
+            raise DurableSessionAdmissionError(
+                "SessionDB is unavailable; refusing unmanaged persistent gateway work"
+            )
+        source = event.source
+        platform = getattr(getattr(source, "platform", None), "value", "gateway")
+        if not await state.get_session(session_entry.session_id):
+            await state.create_session(
+                session_entry.session_id,
+                platform,
+                user_id=getattr(source, "user_id", None),
+            )
+        source_identity, authoritative = self._gateway_event_source_identity(event)
+        admitted = await state.admit_session_event(
+            session_id=session_entry.session_id,
+            session_key=session_entry.session_key,
+            source_identity=source_identity,
+            event_type=self._gateway_event_type(event),
+            payload=self._gateway_logical_turn_payload(
+                event, source_identity_authoritative=authoritative
+            ),
+            task_id=getattr(event, "task_id", None),
+            goal_id=getattr(event, "goal_id", None),
+            branch=getattr(event, "branch", None),
+            worktree=getattr(event, "worktree", None),
+        )
+        setattr(event, "_logical_turn_id", admitted["logical_turn_id"])
+        setattr(event, "_logical_turn_db", state)
+        setattr(event, "_durable_source_identity", source_identity)
+        setattr(event, "_source_identity_authoritative", authoritative)
+        if admitted.get("duplicate") and admitted.get("state") == "completed":
+            return {"outcome": "duplicate-completed", "turn": admitted}
+        if not claim:
+            return {"outcome": "queued", "turn": admitted}
+        claimed = await state.claim_logical_turn(
+            admitted["logical_turn_id"],
+            owner=f"gateway:{os.getpid()}",
+            pid=os.getpid(),
+            ttl_seconds=_GATEWAY_LOGICAL_TURN_LEASE_TTL_SECONDS,
+        )
+        if claimed.get("outcome") == "claimed":
+            setattr(event, "_logical_attempt_id", claimed["attempt_id"])
+            setattr(event, "_logical_turn_lease", claimed.get("lease"))
+            self._start_gateway_logical_turn_heartbeat(event)
+        return claimed
+
+    async def _admit_busy_gateway_event(
+        self, event: MessageEvent, session_key: str
+    ) -> Dict[str, Any]:
+        """Persist a same-session next turn without waiting on its owner."""
+        entry = await self.async_session_store.lookup_by_session_key(session_key)
+        if entry is None:
+            entry = await self.async_session_store.get_or_create_session(
+                event.source,
+                touch_activity=not bool(getattr(event, "internal", False)),
+            )
+        return await self.admit_session_event(event, entry, claim=False)
+
+    async def _persist_busy_gateway_event(
+        self, event: MessageEvent, session_key: str
+    ) -> bool:
+        """Fail closed while accepting a next turn behind active work."""
+        try:
+            await self._admit_busy_gateway_event(event, session_key)
+            return True
+        except Exception as exc:
+            logger.error(
+                "Refusing process-local-only busy work: session=%s error=%s",
+                session_key,
+                exc,
+                exc_info=True,
+            )
+            adapter = self._adapter_for_source(event.source)
+            if adapter is not None:
+                try:
+                    await adapter._send_with_retry(
+                        chat_id=event.source.chat_id,
+                        content=(
+                            "⛔ Durable session storage is unavailable, so this "
+                            "message was not queued or executed. Please retry after "
+                            "storage recovers."
+                        ),
+                        reply_to=self._reply_anchor_for_event(event),
+                        metadata=self._thread_metadata_for_source(
+                            event.source, self._reply_anchor_for_event(event)
+                        ),
+                    )
+                except Exception:
+                    logger.debug(
+                        "Could not send durable-admission failure notice",
+                        exc_info=True,
+                    )
+            return False
+
+    def _start_gateway_logical_turn_heartbeat(self, event: MessageEvent) -> None:
+        if getattr(event, "_logical_turn_heartbeat_task", None) is not None:
+            return
+
+        async def _heartbeat() -> None:
+            while True:
+                await asyncio.sleep(_GATEWAY_LOGICAL_TURN_HEARTBEAT_SECONDS)
+                db = getattr(event, "_logical_turn_db", None)
+                turn_id = getattr(event, "_logical_turn_id", None)
+                attempt_id = getattr(event, "_logical_attempt_id", None)
+                if db is None or not turn_id or not attempt_id:
+                    return
+                if not await db.heartbeat_logical_turn(
+                    turn_id,
+                    attempt_id,
+                    ttl_seconds=_GATEWAY_LOGICAL_TURN_LEASE_TTL_SECONDS,
+                ):
+                    logger.error(
+                        "Durable logical-turn heartbeat lost ownership: "
+                        "session=%s turn=%s attempt=%s",
+                        self._session_key_for_source(event.source),
+                        turn_id,
+                        attempt_id,
+                    )
+                    return
+
+        task = asyncio.create_task(_heartbeat())
+        setattr(event, "_logical_turn_heartbeat_task", task)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _stop_gateway_logical_turn_heartbeat(self, event: MessageEvent) -> None:
+        task = getattr(event, "_logical_turn_heartbeat_task", None)
+        setattr(event, "_logical_turn_heartbeat_task", None)
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def _complete_gateway_logical_turn(
+        self, event: MessageEvent, result: Any
+    ) -> None:
+        db = getattr(event, "_logical_turn_db", None)
+        turn_id = getattr(event, "_logical_turn_id", None)
+        attempt_id = getattr(event, "_logical_attempt_id", None)
+        if db is None or not turn_id or not attempt_id:
+            return
+        await self._stop_gateway_logical_turn_heartbeat(event)
+        if isinstance(result, dict) and (
+            result.get("failed")
+            or result.get("error")
+            or result.get("interrupted")
+        ):
+            await db.fail_logical_turn(
+                turn_id,
+                attempt_id,
+                str(result.get("error") or "gateway execution did not complete"),
+                retryable=False,
+            )
+            return
+        response = self._final_text_for_post_turn_hooks(result, event)
+        delivery_required = bool(response.strip())
+        await db.complete_logical_turn(
+            turn_id,
+            attempt_id,
+            {
+                "completed": True,
+                "response": response,
+                "response_present": delivery_required,
+            },
+            delivery_required=delivery_required,
+        )
+        if delivery_required:
+            setattr(
+                event,
+                "_logical_turn_delivery_callback",
+                self._record_gateway_turn_delivery,
+            )
+
+    async def _fail_gateway_logical_turn(
+        self,
+        event: MessageEvent,
+        error: BaseException | str,
+        *,
+        retryable: bool = False,
+    ) -> None:
+        db = getattr(event, "_logical_turn_db", None)
+        turn_id = getattr(event, "_logical_turn_id", None)
+        attempt_id = getattr(event, "_logical_attempt_id", None)
+        if db is None or not turn_id or not attempt_id:
+            return
+        await self._stop_gateway_logical_turn_heartbeat(event)
+        await db.fail_logical_turn(
+            turn_id,
+            attempt_id,
+            str(error),
+            retryable=retryable,
+        )
+
+    async def _record_gateway_turn_delivery(
+        self,
+        event: MessageEvent,
+        succeeded: bool,
+        error: Optional[str] = None,
+    ) -> None:
+        db = getattr(event, "_logical_turn_db", None)
+        turn_id = getattr(event, "_logical_turn_id", None)
+        attempt_id = getattr(event, "_logical_attempt_id", None)
+        if db is None or not turn_id or not attempt_id:
+            return
+        await db.begin_logical_turn_delivery(turn_id, attempt_id)
+        if succeeded:
+            await db.acknowledge_logical_turn_delivery(turn_id, attempt_id)
+        else:
+            await db.fail_logical_turn_delivery(
+                turn_id,
+                attempt_id,
+                error or "no successful delivery acknowledgement",
+            )
+
+    @staticmethod
+    def _message_event_from_logical_turn(turn: Dict[str, Any]) -> Optional[MessageEvent]:
+        """Restore one accepted event without minting a new occurrence."""
+        payload = turn.get("payload") or {}
+        source_data = payload.get("source") or {}
+        if not source_data:
+            return None
+        try:
+            source = SessionSource.from_dict(source_data)
+            raw_message_type = str(payload.get("message_type") or "text")
+            try:
+                message_type = MessageType(raw_message_type)
+            except ValueError:
+                message_type = MessageType.TEXT
+            raw_timestamp = payload.get("timestamp")
+            try:
+                timestamp = datetime.fromisoformat(raw_timestamp) if raw_timestamp else datetime.now()
+            except (TypeError, ValueError):
+                timestamp = datetime.now()
+            event = MessageEvent(
+                text=str(payload.get("text") or ""),
+                message_type=message_type,
+                source=source,
+                message_id=payload.get("message_id"),
+                platform_update_id=payload.get("platform_update_id"),
+                media_urls=list(payload.get("media_urls") or []),
+                media_types=list(payload.get("media_types") or []),
+                reply_to_message_id=payload.get("reply_to_message_id"),
+                reply_to_text=payload.get("reply_to_text"),
+                reply_to_author_id=payload.get("reply_to_author_id"),
+                reply_to_author_name=payload.get("reply_to_author_name"),
+                reply_to_is_own_message=bool(
+                    payload.get("reply_to_is_own_message", False)
+                ),
+                auto_skill=payload.get("auto_skill"),
+                channel_prompt=payload.get("channel_prompt"),
+                channel_context=payload.get("channel_context"),
+                internal=bool(payload.get("internal")),
+                metadata=dict(payload.get("metadata") or {}),
+                session_event_id=payload.get("session_event_id"),
+                occurrence_id=str(payload.get("occurrence_id") or ""),
+                session_event_type=(
+                    payload.get("session_event_type") or payload.get("event_type")
+                ),
+                task_id=turn.get("task_id"),
+                goal_id=turn.get("goal_id"),
+                delegation_id=payload.get("delegation_id"),
+                barrier_id=payload.get("barrier_id"),
+                parent_logical_turn_id=payload.get("parent_logical_turn_id"),
+                branch=turn.get("branch"),
+                worktree=turn.get("worktree"),
+                timestamp=timestamp,
+                allow_gateway_control=bool(
+                    payload.get("allow_gateway_control", True)
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "Could not rehydrate durable gateway turn %s",
+                turn.get("logical_turn_id"),
+                exc_info=True,
+            )
+            return None
+        setattr(event, "_durable_source_identity", turn.get("source_identity"))
+        setattr(
+            event,
+            "_source_identity_authoritative",
+            bool(payload.get("source_identity_authoritative", False)),
+        )
+        setattr(event, "_logical_turn_id", turn.get("logical_turn_id"))
+        return event
+
+    async def _drain_gateway_logical_turn_scope(self) -> int:
+        db = self._session_db
+        if db is None:
+            return 0
+        await db.reconcile_logical_turns()
+        turns = await db.list_ready_logical_turns(
+            limit=_GATEWAY_LOGICAL_TURN_DRAIN_LIMIT,
+            event_types=_GATEWAY_LOGICAL_TURN_EVENT_TYPES,
+        )
+        dispatched = 0
+        dispatching = getattr(self, "_gateway_logical_turn_dispatching", None)
+        if dispatching is None:
+            dispatching = {}
+            self._gateway_logical_turn_dispatching = dispatching
+        now = time.monotonic()
+        for logical_turn_id, started_at in list(dispatching.items()):
+            if now - started_at > 30.0:
+                dispatching.pop(logical_turn_id, None)
+        for turn in turns:
+            logical_turn_id = str(turn["logical_turn_id"])
+            if logical_turn_id in dispatching:
+                continue
+            if await db.get_session_turn_lease(turn["session_id"]):
+                continue
+            event = self._message_event_from_logical_turn(turn)
+            if event is None:
+                continue
+            adapter = self._adapter_for_source(event.source)
+            if adapter is None:
+                continue
+            session_key = self._session_key_for_source(event.source)
+            if session_key in getattr(adapter, "_active_sessions", {}):
+                healer = getattr(adapter, "_heal_stale_session_lock", None)
+                healed = bool(callable(healer) and healer(session_key))
+                if not healed:
+                    logger.warning(
+                        "Gateway local-active/durable-owner disagreement: "
+                        "session=%s turn=%s; dispatching accepted work to the "
+                        "adapter FIFO because local state is not ownership",
+                        session_key,
+                        logical_turn_id,
+                    )
+            dispatching[logical_turn_id] = now
+            try:
+                await adapter.handle_message(event)
+                dispatched += 1
+            except Exception:
+                dispatching.pop(logical_turn_id, None)
+                logger.warning(
+                    "Durable gateway turn dispatch failed: turn=%s session=%s",
+                    logical_turn_id,
+                    turn.get("session_key"),
+                    exc_info=True,
+                )
+        # Independent /background child sessions have their own executor and
+        # must not be rehydrated as messages in the parent chat session.
+        dispatched += await self._drain_gateway_background_turns()
+        return dispatched
+
+    async def _gateway_logical_turn_watcher(self) -> None:
+        """Bounded startup/live dispatcher for accepted gateway work."""
+        from hermes_constants import get_hermes_home
+
+        while self._running:
+            homes = [Path(get_hermes_home())]
+            if getattr(self.config, "multiplex_profiles", False):
+                homes.extend(home for _name, home in _multiplex_profile_homes(self.config))
+            seen: set[Path] = set()
+            for home in homes:
+                resolved = Path(home).resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                try:
+                    with _profile_runtime_scope(resolved):
+                        await self._drain_gateway_logical_turn_scope()
+                except Exception:
+                    logger.warning(
+                        "Durable gateway logical-turn recovery pass failed for %s",
+                        resolved,
+                        exc_info=True,
+                    )
+            await asyncio.sleep(1.0)
+
+    @staticmethod
+    def _approval_continuation_event(continuation, entry) -> MessageEvent:
+        """Translate a durable approval into one canonical gateway event."""
+        decision = str(continuation.decision or "deny")
+        command = str(continuation.payload.get("command") or "")
+        description = str(continuation.payload.get("description") or "")
+        marker = f"[approval-continuation:{continuation.id}]"
+        if decision == "deny":
+            text = (
+                f"{marker}\nThe user denied the dangerous command requested "
+                "in the interrupted turn. Do not execute or retry it. Continue "
+                "from persisted history and report that the workflow stopped."
+            )
+        else:
+            text = (
+                f"{marker}\nThe user approved the dangerous command from the "
+                f"interrupted turn with decision `{decision}`. Reconstruct the "
+                "pending workflow from persisted history, execute the approved "
+                "action only if it remains pending, and report the outcome.\n\n"
+                f"Approved command:\n```\n{command}\n```"
+            )
+            if description:
+                text += f"\nApproval reason: {description}"
+        return MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=dataclasses.replace(entry.origin),
+            message_id=None,
+            internal=True,
+            allow_gateway_control=False,
+            session_event_id=f"approval:{continuation.id}",
+            session_event_type="approval-continuation",
+            task_id=str(continuation.payload.get("task_id") or "") or None,
+            goal_id=str(continuation.payload.get("goal_id") or "") or None,
+            parent_logical_turn_id=(
+                str(continuation.payload.get("parent_logical_turn_id") or "")
+                or None
+            ),
+            branch=str(continuation.payload.get("branch") or "") or None,
+            worktree=str(continuation.payload.get("worktree") or "") or None,
+            metadata={"approval_continuation_id": continuation.id},
+        )
+
+    async def _consume_approval_continuation_async(
+        self, store, continuation
+    ) -> Dict[str, Any]:
+        """Admit and observe a continuation through ordinary gateway ingress.
+
+        The continuation worker never takes a session lease. SessionDB logical
+        turn claiming in ``_handle_message_with_agent`` remains the sole
+        execution-ownership path.
+        """
+        from gateway.approval_continuation import (
+            ContinuationPending,
+            ContinuationUnavailable,
+            UnrecoverableContinuation,
+        )
+
+        if not self._running:
+            raise ContinuationUnavailable("gateway is not running")
+        entry = await self.async_session_store.lookup_by_session_key(
+            continuation.session_key
+        )
+        if entry is None or entry.origin is None:
+            raise UnrecoverableContinuation(
+                "gateway session binding no longer exists"
+            )
+        state = self._session_db
+        if state is None:
+            raise ContinuationUnavailable("SessionDB unavailable")
+        requested_session_id = str(
+            continuation.payload.get("session_id") or ""
+        )
+        session_id = str(entry.session_id or "")
+        if not session_id or not await state.get_session(session_id):
+            raise UnrecoverableContinuation("persisted gateway session was deleted")
+        if requested_session_id and requested_session_id != session_id:
+            requested_tip = await state.get_compression_tip(requested_session_id)
+            if requested_tip != session_id:
+                raise UnrecoverableContinuation(
+                    "approval continuation no longer matches the active session"
+                )
+
+        event = self._approval_continuation_event(continuation, entry)
+        admission = await self.admit_session_event(event, entry, claim=False)
+        turn = admission.get("turn") or {}
+        logical_turn_id = str(turn.get("logical_turn_id") or "")
+        if not logical_turn_id:
+            raise ContinuationUnavailable(
+                "approval continuation could not create a logical turn"
+            )
+        # Bind the continuation to the durable transcript head that existed
+        # when its logical turn was accepted.  ``get_active_message_watermark``
+        # is the current-line SessionDB API for this value; the old Phase 1
+        # prototype's ``get_last_message_id`` helper no longer exists.
+        history_message_id = await state.get_active_message_watermark(session_id)
+        binding = await asyncio.to_thread(
+            store.get_or_create_turn_binding,
+            continuation.id,
+            session_id=session_id,
+            turn_id=logical_turn_id,
+            history_message_id=history_message_id,
+        )
+        if binding.turn_id != logical_turn_id:
+            raise UnrecoverableContinuation(
+                "approval continuation maps to conflicting logical turns"
+            )
+
+        async def _read_turn() -> Dict[str, Any]:
+            current = await state.get_logical_turn(logical_turn_id)
+            if current is None:
+                raise UnrecoverableContinuation(
+                    "approval logical turn disappeared"
+                )
+            return current
+
+        current = await _read_turn()
+        if current["state"] == "completed":
+            result = current.get("result") or {
+                "logical_turn_id": logical_turn_id,
+                "session_id": session_id,
+            }
+            await asyncio.to_thread(
+                store.acknowledge_turn_binding,
+                continuation.id,
+                result,
+            )
+            return result
+        if current["state"] in {
+            "blocked",
+            "cancelled",
+            "unrecoverable",
+        }:
+            raise UnrecoverableContinuation(
+                current.get("error")
+                or f"approval logical turn is {current['state']}"
+            )
+
+        # A valid durable owner is genuine contention. Leave the already
+        # admitted turn queued; the continuation retry does not spend its
+        # failure budget while waiting.
+        if await state.get_session_turn_lease(session_id):
+            raise ContinuationPending("approval logical turn is queued")
+
+        adapter = self._adapter_for_source(entry.origin)
+        if adapter is None:
+            raise ContinuationUnavailable("gateway platform adapter unavailable")
+
+        decision = str(continuation.decision or "deny")
+        pattern_keys = [
+            str(key)
+            for key in (continuation.payload.get("pattern_keys") or [])
+            if key
+        ]
+        if not pattern_keys and continuation.payload.get("pattern_key"):
+            pattern_keys = [str(continuation.payload["pattern_key"])]
+        temporary_keys: list[str] = []
+        session_key = entry.session_key
+        if decision != "deny" and pattern_keys:
+            from tools.approval import (
+                approve_permanent,
+                approve_session,
+                is_approved,
+                load_permanent_allowlist,
+                save_permanent_allowlist,
+            )
+
+            if decision == "once":
+                temporary_keys = [
+                    key for key in pattern_keys if not is_approved(session_key, key)
+                ]
+                for key in temporary_keys:
+                    approve_session(session_key, key)
+            else:
+                for key in pattern_keys:
+                    approve_session(session_key, key)
+                if decision == "always":
+                    permanent_keys = {
+                        str(key)
+                        for key in (
+                            continuation.payload.get("permanent_pattern_keys")
+                            or []
+                        )
+                        if key
+                    }
+                    if permanent_keys:
+                        persisted = load_permanent_allowlist()
+                        for key in permanent_keys:
+                            approve_permanent(key)
+                        save_permanent_allowlist(persisted | permanent_keys)
+
+        try:
+            await asyncio.to_thread(
+                store.mark_turn_binding_running,
+                continuation.id,
+            )
+            await adapter.handle_message(event)
+            task = getattr(adapter, "_session_tasks", {}).get(session_key)
+            if task is not None:
+                await asyncio.shield(task)
+            current = await _read_turn()
+        finally:
+            if temporary_keys:
+                from tools.approval import revoke_session_approvals
+
+                revoke_session_approvals(session_key, temporary_keys)
+
+        if current["state"] == "completed":
+            result = current.get("result") or {
+                "logical_turn_id": logical_turn_id,
+                "session_id": session_id,
+            }
+            await asyncio.to_thread(
+                store.acknowledge_turn_binding,
+                continuation.id,
+                result,
+            )
+            return result
+        if current["state"] in {
+            "blocked",
+            "cancelled",
+            "unrecoverable",
+        }:
+            raise UnrecoverableContinuation(
+                current.get("error")
+                or f"approval logical turn is {current['state']}"
+            )
+        raise ContinuationPending(
+            f"approval logical turn remains {current['state']}"
+        )
+
+    def _consume_approval_continuation(self, store, continuation):
+        """Bridge the worker thread onto the live gateway event loop."""
+        from gateway.approval_continuation import ContinuationUnavailable
+
+        loop = self._gateway_loop
+        if loop is None or not loop.is_running():
+            raise ContinuationUnavailable("gateway event loop unavailable")
+        future = asyncio.run_coroutine_threadsafe(
+            self._consume_approval_continuation_async(store, continuation),
+            loop,
+        )
+        return future.result()
+
+    async def _approval_continuation_watcher(
+        self, poll_interval: float = 0.5
+    ) -> None:
+        """Poll each profile's durable approval inbox with bounded work."""
+        from gateway.approval_continuation import ContinuationWorker
+        from gateway.approval_store import ApprovalStore
+        from hermes_constants import get_hermes_home
+
+        while self._running:
+            homes = [Path(get_hermes_home())]
+            if getattr(self.config, "multiplex_profiles", False):
+                homes.extend(
+                    home for _name, home in _multiplex_profile_homes(self.config)
+                )
+            processed = False
+            for home in dict.fromkeys(Path(value).resolve() for value in homes):
+                with _profile_runtime_scope(home):
+                    runtime = self._approval_continuation_runtimes.get(home)
+                    if runtime is None:
+                        store = ApprovalStore(home / "approvals.db")
+                        worker = ContinuationWorker(
+                            store,
+                            worker_id=(
+                                f"gateway:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+                            ),
+                            lease_seconds=30,
+                            base_backoff=1,
+                            max_backoff=60,
+                        )
+                        worker.register(
+                            "hermes_session",
+                            lambda item, _store=store: self._consume_approval_continuation(
+                                _store, item
+                            ),
+                        )
+                        runtime = (store, worker)
+                        self._approval_continuation_runtimes[home] = runtime
+                    _store, worker = runtime
+                    item = await asyncio.to_thread(worker.run_once)
+                    processed = processed or item is not None
+            if not processed:
+                await asyncio.sleep(poll_interval)
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -19881,6 +20816,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await asyncio.to_thread(self._record_telegram_topic_binding, source, session_entry)
                 except Exception:
                     logger.debug("Failed to record Telegram topic binding", exc_info=True)
+
+        # Durable admission is the accepted-work boundary.  It happens after
+        # final session resolution (including topic and delegation pinning),
+        # but before hooks, transcript mutation, or model/tool execution.
+        admission = await self.admit_session_event(event, session_entry)
+        admission_outcome = admission.get("outcome")
+        if admission_outcome == "duplicate-completed":
+            raise DurableSessionTurnAlreadyCompleted(
+                str(admission["turn"]["logical_turn_id"])
+            )
+        if admission_outcome == "busy":
+            raise DurableSessionTurnQueued(
+                session_entry.session_id,
+                str(getattr(event, "_logical_turn_id", "")),
+            )
+        if admission_outcome == "terminal":
+            raise DurableSessionTurnAlreadyCompleted(
+                str(getattr(event, "_logical_turn_id", ""))
+            )
+        if admission_outcome != "claimed":
+            raise DurableSessionAdmissionError(
+                f"unexpected durable admission outcome: {admission_outcome!r}"
+            )
         # Capture and immediately consume was_auto_reset so it does not
         # re-fire on subsequent messages — preventing the cleanup from
         # wiping model/reasoning overrides set between turns (Closes #48031).
@@ -20084,47 +21042,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as e:
                 logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
 
-        # ── Turn lease (#64934) ────────────────────────────────────────
-        # Session resolution is FINAL here (get_or_create → async-delegation
-        # pinning → topic tip-walk switch_session are all above). Serialize
-        # the [load history → run → flush] region per resolved SESSION_ID:
-        # when a second routing key is mapped to this same session_id, its
-        # turn waits here for the previous turn's flush instead of loading a
-        # stale history base and interleaving transcript writes. Same-key
-        # messages never reach this point mid-turn (adapter + runner guards
-        # hold them), so the lock is uncontended outside the alias-key route.
-        # Fail-closed on timeout: never enter the transcript region without a
-        # lease. Outer dispatch returns a bounded rejection/resend notice rather
-        # than recreating the exact concurrent-turn corruption this lease exists
-        # to prevent. Released in _handle_message's finally via
-        # _release_turn_lease — granted per (routing key, run generation) so a
-        # stale unwind can't release a newer turn's lease.
-        _lease_registry = getattr(self, "_turn_leases", None)
-        if _lease_registry is not None:
-            try:
-                _lease_token = await _lease_registry.acquire(
-                    session_entry.session_id,
-                    owner_key=_quick_key,
-                    generation=run_generation,
-                    timeout=_float_env(
-                        "HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT
-                    ),
+        # The SessionDB logical-turn claim already owns the authoritative
+        # cross-process session lease.  The old SessionTurnLeaseRegistry is a
+        # process-local alias cache and must not create a second wait/ownership
+        # decision for durably admitted work.
+        if not getattr(event, "_ephemeral_gateway_admission_for_test", False):
+            logical_turn_id = getattr(event, "_logical_turn_id", None)
+            logical_attempt_id = getattr(event, "_logical_attempt_id", None)
+            logical_turn_db = getattr(event, "_logical_turn_db", None)
+            if (
+                logical_turn_db is None
+                or not logical_turn_id
+                or not logical_attempt_id
+                or not await logical_turn_db.mark_logical_turn_started(
+                    logical_turn_id, logical_attempt_id
                 )
-            except TurnLeaseTimeoutError:
-                # The broad session-context cleanup finally starts later in this
-                # method. Restore the tokens here before propagating the rejection
-                # to outer dispatch, or this early exit leaks task-local identity.
+            ):
                 self._clear_session_env(_session_env_tokens)
-                raise
-            if _lease_token is not None:
-                _lease_state = self._session_state(_quick_key).turn
-                _lease_state.lease_token = _lease_token
-                _lease_state.lease_generation = run_generation
+                raise DurableSessionAdmissionError(
+                    "durable logical turn lost ownership before execution"
+                )
 
-        # A turn only becomes durable recovery work after it owns (or has
-        # explicitly degraded past) the per-session lease.  Marking before the
-        # await above would falsely recover an alias-routed message that never
-        # began processing if the gateway died while it was still waiting.
         await self._mark_durable_active_turn(event, session_entry.session_key)
 
         # Load conversation history from transcript
@@ -21137,6 +22075,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
+                task_id=getattr(event, "task_id", None),
+                goal_id=getattr(event, "goal_id", None),
+                branch=getattr(event, "branch", None),
+                worktree=getattr(event, "worktree", None),
+                parent_logical_turn_id=getattr(
+                    event, "parent_logical_turn_id", None
+                ),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -22331,9 +23276,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await self._warm_goals_session_db("heartbeat poll")
                 for quick_key, (source, session_id) in list(watch.items()):
                     try:
-                        # Busy sessions coalesce their tick to the next idle poll.
-                        if quick_key in self._running_agents:
-                            continue
                         from hermes_cli.heartbeat import HeartbeatManager
 
                         mgr = HeartbeatManager(session_id=session_id)
@@ -22352,8 +23294,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             source=source,
                             message_id=None,
                             channel_prompt=None,
+                            internal=True,
+                            allow_gateway_control=False,
+                            session_event_id=(
+                                f"heartbeat:{session_id}:"
+                                f"{mgr.state.fire_count if mgr.state else 0}"
+                            ),
+                            session_event_type="gateway-heartbeat",
                         )
-                        self._enqueue_fifo(quick_key, hb_event, adapter)
+                        entry = await self.async_session_store.lookup_by_session_key(
+                            quick_key
+                        )
+                        if entry is None:
+                            continue
+                        await self.admit_session_event(
+                            hb_event,
+                            entry,
+                            claim=False,
+                        )
+                        await adapter.handle_message(hb_event)
                     except Exception as exc:
                         logger.debug("heartbeat poll for %s failed: %s", quick_key, exc)
 
@@ -22442,6 +23401,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_entry: Any,
         source: Any,
         final_response: str,
+        event: Any = None,
     ) -> None:
         """Run the goal judge after a gateway turn and, if still active,
         enqueue a continuation prompt for the same session.
@@ -22515,22 +23475,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not prompt or source is None:
             return
 
-        # Enqueue via the adapter's FIFO so a user message already in
-        # flight preempts the continuation naturally.
+        # This is a new reasoning turn, not an injection into the current
+        # model loop. Persist it behind the current SessionDB lease; never
+        # synchronously wait on the same session from this post-turn hook.
         try:
+            parent_turn_id = getattr(event, "_logical_turn_id", None)
+            cont_event = MessageEvent(
+                text=prompt,
+                message_type=MessageType.TEXT,
+                source=source,
+                message_id=None,
+                channel_prompt=None,
+                internal=True,
+                allow_gateway_control=False,
+                session_event_id=(
+                    f"goal-after-turn:{parent_turn_id}"
+                    if parent_turn_id
+                    else None
+                ),
+                session_event_type="gateway-goal-continuation",
+                task_id=getattr(event, "task_id", None),
+                goal_id=getattr(event, "goal_id", None),
+                parent_logical_turn_id=parent_turn_id,
+                branch=getattr(event, "branch", None),
+                worktree=getattr(event, "worktree", None),
+            )
+            await self.admit_session_event(
+                cont_event,
+                session_entry,
+                claim=False,
+            )
             adapter = self._adapter_for_source(source)
-            _quick_key = self._session_key_for_source(source)
-            if adapter and _quick_key:
-                cont_event = MessageEvent(
-                    text=prompt,
-                    message_type=MessageType.TEXT,
-                    source=source,
-                    message_id=None,
-                    channel_prompt=None,
-                )
-                self._enqueue_fifo(_quick_key, cont_event, adapter)
+            if adapter is not None:
+                self._enqueue_fifo(session_entry.session_key, cont_event, adapter)
         except Exception as exc:
-            logger.debug("goal continuation: enqueue failed: %s", exc)
+            logger.error(
+                "goal continuation: durable admission failed: %s",
+                exc,
+                exc_info=True,
+            )
 
     async def _run_post_turn_hooks(
         self,
@@ -22560,6 +23543,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_entry=session_entry,
                     source=source,
                     final_response=final_text,
+                    event=event,
                 )
             except Exception as exc:
                 logger.debug("goal continuation hook failed: %s", exc)
@@ -22706,8 +23690,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         session_key = self._session_key_for_source(source)
                     except Exception:
                         session_key = None
-                    if session_key and session_key in self._running_agents:
-                        continue  # busy — stays due, next scan retries
                     if goal_blocks_loop_tick(sid):
                         continue
 
@@ -22723,11 +23705,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             message_type=MessageType.TEXT,
                             source=source,
                             internal=True,
+                            session_event_id=(
+                                f"loop:{sid}:"
+                                f"{mgr.state.ticks_fired if mgr.state else 0}"
+                            ),
+                            session_event_type="gateway-loop-wakeup",
                         )
                         logger.info(
                             "loop wakeup #%s — injecting for %s chat=%s thread=%s",
                             mgr.state.ticks_fired if mgr.state else "?",
                             platform_name, source.chat_id, source.thread_id,
+                        )
+                        entry = await self.async_session_store.lookup_by_session_key(
+                            session_key
+                        )
+                        if entry is None:
+                            raise RuntimeError(
+                                f"loop session route missing for {session_key}"
+                            )
+                        await self.admit_session_event(
+                            synth_event,
+                            entry,
+                            claim=False,
                         )
                         await adapter.handle_message(synth_event)
                         # Slash-command loops dispatch through the command
@@ -23332,6 +24331,230 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_metadata=metadata,
         )
 
+    @staticmethod
+    def _gateway_background_task_id(source_identity: str) -> str:
+        """Derive one stable child-task identity from its accepted command."""
+        value = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"hermes:gateway-background:{source_identity}",
+        ).hex
+        return f"bg_{value[:20]}"
+
+    async def _admit_gateway_background_task(
+        self,
+        parent_event: MessageEvent,
+        prompt: str,
+        *,
+        event_message_id: Optional[str] = None,
+        media_urls: Optional[List[str]] = None,
+        media_types: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Persist a /background child before the parent reports success."""
+        source_identity, authoritative = self._gateway_event_source_identity(
+            parent_event
+        )
+        # Preserve the acceptance mapping on the in-memory command too. A
+        # repeated handler invocation for this accepted occurrence resolves
+        # the same child; a separate no-ID command receives a fresh occurrence.
+        setattr(parent_event, "_durable_source_identity", source_identity)
+        setattr(parent_event, "_source_identity_authoritative", authoritative)
+        source = parent_event.source
+        task_id = self._gateway_background_task_id(source_identity)
+        session_key = f"agent:background:{task_id}"
+        entry = SessionEntry(
+            session_key=session_key,
+            session_id=task_id,
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=dataclasses.replace(source),
+            platform=source.platform,
+            chat_type=source.chat_type,
+        )
+        child_event = MessageEvent(
+            text=prompt,
+            message_type=MessageType.TEXT,
+            source=dataclasses.replace(source),
+            internal=True,
+            allow_gateway_control=False,
+            session_event_type="gateway-background-child",
+            task_id=task_id,
+            parent_logical_turn_id=(
+                str(getattr(parent_event, "_logical_turn_id", None) or "") or None
+            ),
+            branch=getattr(parent_event, "branch", None),
+            worktree=getattr(parent_event, "worktree", None),
+            metadata={
+                "logical_turn_recovery_policy": "manual_reconcile",
+                "background_task": {
+                    "task_id": task_id,
+                    "event_message_id": event_message_id,
+                    "media_urls": list(media_urls or []),
+                    "media_types": list(media_types or []),
+                },
+            },
+        )
+        setattr(child_event, "_durable_source_identity", source_identity)
+        setattr(child_event, "_source_identity_authoritative", authoritative)
+        admission = await self.admit_session_event(child_event, entry, claim=False)
+        turn = admission.get("turn") or {}
+        if not turn.get("logical_turn_id"):
+            raise DurableSessionAdmissionError(
+                "background child logical turn could not be persisted"
+            )
+        return {"task_id": task_id, "event": child_event, "turn": turn}
+
+    def _launch_gateway_background_turn(self, turn: Dict[str, Any]) -> bool:
+        """Launch one accepted child turn, deduplicated within this process."""
+        logical_turn_id = str(turn.get("logical_turn_id") or "")
+        payload = turn.get("payload") or {}
+        details = payload.get("metadata", {}).get("background_task", {})
+        source_data = payload.get("source") or {}
+        if not logical_turn_id or not details or not source_data:
+            return False
+        dispatching = getattr(self, "_gateway_background_turn_dispatching", None)
+        if dispatching is None:
+            dispatching = {}
+            self._gateway_background_turn_dispatching = dispatching
+        active = dispatching.get(logical_turn_id)
+        if active is not None and not active.done():
+            return False
+        try:
+            source = SessionSource.from_dict(source_data)
+        except Exception:
+            logger.warning(
+                "Could not rehydrate gateway background child %s",
+                logical_turn_id,
+                exc_info=True,
+            )
+            return False
+        task = asyncio.create_task(
+            self._run_background_task(
+                str(payload.get("text") or ""),
+                source,
+                str(details.get("task_id") or turn.get("task_id") or ""),
+                event_message_id=details.get("event_message_id"),
+                media_urls=list(details.get("media_urls") or []),
+                media_types=list(details.get("media_types") or []),
+                logical_turn_id=logical_turn_id,
+            )
+        )
+        dispatching[logical_turn_id] = task
+        self._background_tasks.add(task)
+
+        def _done(completed: asyncio.Task) -> None:
+            self._background_tasks.discard(completed)
+            if dispatching.get(logical_turn_id) is completed:
+                dispatching.pop(logical_turn_id, None)
+
+        task.add_done_callback(_done)
+        return True
+
+    async def _drain_gateway_background_turns(self) -> int:
+        """Boundedly dispatch accepted/retry background children on startup."""
+        state = self._session_db
+        if state is None:
+            return 0
+        turns = await state.list_ready_logical_turns(
+            limit=_GATEWAY_LOGICAL_TURN_DRAIN_LIMIT,
+            event_types=("gateway-background-child",),
+        )
+        launched = 0
+        for turn in turns:
+            if await state.get_session_turn_lease(turn["session_id"]):
+                continue
+            launched += int(self._launch_gateway_background_turn(turn))
+        deliveries = await state.list_pending_logical_turn_deliveries(
+            limit=_GATEWAY_LOGICAL_TURN_DRAIN_LIMIT,
+            include_transport_accepted=True,
+            event_types=("gateway-background-child",),
+        )
+        for turn in deliveries:
+            attempt_id = str(turn.get("current_attempt_id") or "")
+            if not attempt_id:
+                continue
+            if turn.get("delivery_state") == "transport_accepted":
+                await state.acknowledge_logical_turn_delivery(
+                    turn["logical_turn_id"], attempt_id
+                )
+                launched += 1
+                continue
+            launched += int(self._launch_gateway_background_delivery(turn))
+        return launched
+
+    def _launch_gateway_background_delivery(self, turn: Dict[str, Any]) -> bool:
+        logical_turn_id = str(turn.get("logical_turn_id") or "")
+        if not logical_turn_id:
+            return False
+        key = f"delivery:{logical_turn_id}"
+        dispatching = getattr(self, "_gateway_background_turn_dispatching", None)
+        if dispatching is None:
+            dispatching = {}
+            self._gateway_background_turn_dispatching = dispatching
+        active = dispatching.get(key)
+        if active is not None and not active.done():
+            return False
+        task = asyncio.create_task(self._recover_gateway_background_delivery(turn))
+        dispatching[key] = task
+        self._background_tasks.add(task)
+
+        def _done(completed: asyncio.Task) -> None:
+            self._background_tasks.discard(completed)
+            if dispatching.get(key) is completed:
+                dispatching.pop(key, None)
+
+        task.add_done_callback(_done)
+        return True
+
+    async def _recover_gateway_background_delivery(
+        self, turn: Dict[str, Any]
+    ) -> None:
+        """Replay only delivery for a terminal background execution."""
+        state = self._session_db
+        if state is None:
+            return
+        logical_turn_id = str(turn.get("logical_turn_id") or "")
+        attempt_id = str(turn.get("current_attempt_id") or "")
+        payload = turn.get("payload") or {}
+        details = payload.get("metadata", {}).get("background_task", {})
+        result = turn.get("result") or {}
+        if not logical_turn_id or not attempt_id or not details:
+            return
+        try:
+            source = SessionSource.from_dict(payload.get("source") or {})
+        except Exception:
+            logger.warning(
+                "Could not restore background delivery source for %s",
+                logical_turn_id,
+                exc_info=True,
+            )
+            return
+        await state.begin_logical_turn_delivery(logical_turn_id, attempt_id)
+        try:
+            succeeded = await self._deliver_gateway_background_response(
+                prompt=str(payload.get("text") or ""),
+                response=str(result.get("response") or ""),
+                source=source,
+                event_message_id=details.get("event_message_id"),
+            )
+        except Exception as exc:
+            await state.fail_logical_turn_delivery(
+                logical_turn_id, attempt_id, str(exc)
+            )
+            return
+        if not succeeded:
+            await state.fail_logical_turn_delivery(
+                logical_turn_id,
+                attempt_id,
+                "background result delivery was not fully acknowledged",
+            )
+            return
+        await state.record_logical_turn_transport_accepted(
+            logical_turn_id, attempt_id
+        )
+        await state.acknowledge_logical_turn_delivery(
+            logical_turn_id, attempt_id
+        )
+
     async def _run_background_task(
         self,
         prompt: str,
@@ -23340,6 +24563,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event_message_id: Optional[str] = None,
         media_urls: Optional[List[str]] = None,
         media_types: Optional[List[str]] = None,
+        logical_turn_id: Optional[str] = None,
     ) -> None:
         """Profile-scoping wrapper around the background agent task.
 
@@ -23350,13 +24574,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._run_background_task_inner(
-                prompt, source, task_id, event_message_id, media_urls, media_types,
+                prompt,
+                source,
+                task_id,
+                event_message_id,
+                media_urls,
+                media_types,
+                logical_turn_id,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
         with _profile_runtime_scope(profile_home):
             return await self._run_background_task_inner(
-                prompt, source, task_id, event_message_id, media_urls, media_types,
+                prompt,
+                source,
+                task_id,
+                event_message_id,
+                media_urls,
+                media_types,
+                logical_turn_id,
             )
 
     def _resolve_enabled_toolsets_for_source(
@@ -23394,6 +24630,125 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return sorted(_get_platform_tools(user_config, platform_key))
 
+    async def _deliver_gateway_background_response(
+        self,
+        *,
+        prompt: str,
+        response: str,
+        source: SessionSource,
+        event_message_id: Optional[str],
+    ) -> bool:
+        """Deliver a terminal child result without reopening model execution."""
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            return False
+        metadata = self._thread_metadata_for_source(source, event_message_id)
+        attempted = False
+        succeeded = True
+
+        async def _send(awaitable):
+            nonlocal attempted, succeeded
+            attempted = True
+            try:
+                outcome = await awaitable
+            except Exception:
+                succeeded = False
+                raise
+            if hasattr(outcome, "success") and outcome.success is not True:
+                succeeded = False
+            return outcome
+
+        preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+        header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
+        if not response:
+            await _send(
+                adapter.send(
+                    chat_id=source.chat_id,
+                    content=header + "(No response generated)",
+                    metadata=metadata,
+                )
+            )
+            return attempted and succeeded
+
+        media_files, cleaned = adapter.extract_media(response)
+        from gateway.platforms.base import (
+            BasePlatformAdapter,
+            should_send_media_as_audio as _should_send_media_as_audio,
+        )
+
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+        images, text_content = adapter.extract_images(cleaned)
+        if text_content:
+            await _send(
+                adapter.send(
+                    chat_id=source.chat_id,
+                    content=header + text_content,
+                    metadata=metadata,
+                )
+            )
+        elif not images and not media_files:
+            await _send(
+                adapter.send(
+                    chat_id=source.chat_id,
+                    content=header + "(No response generated)",
+                    metadata=metadata,
+                )
+            )
+
+        for image_url, alt_text in images or []:
+            try:
+                await _send(
+                    adapter.send_image(
+                        chat_id=source.chat_id,
+                        image_url=image_url,
+                        caption=alt_text,
+                        metadata=metadata,
+                    )
+                )
+            except Exception:
+                succeeded = False
+
+        image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+        video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
+        for media_path, is_voice in media_files or []:
+            extension = os.path.splitext(media_path)[1].lower()
+            try:
+                if _should_send_media_as_audio(source.platform, extension, is_voice):
+                    await _send(
+                        adapter.send_voice(
+                            chat_id=source.chat_id,
+                            audio_path=media_path,
+                            metadata=metadata,
+                        )
+                    )
+                elif extension in video_exts:
+                    await _send(
+                        adapter.send_video(
+                            chat_id=source.chat_id,
+                            video_path=media_path,
+                            metadata=metadata,
+                        )
+                    )
+                elif extension in image_exts:
+                    await _send(
+                        adapter.send_image_file(
+                            chat_id=source.chat_id,
+                            image_path=media_path,
+                            metadata=metadata,
+                        )
+                    )
+                else:
+                    await _send(
+                        adapter.send_document(
+                            chat_id=source.chat_id,
+                            file_path=media_path,
+                            metadata=metadata,
+                        )
+                    )
+            except Exception:
+                succeeded = False
+        return attempted and succeeded
+
     async def _run_background_task_inner(
         self,
         prompt: str,
@@ -23402,10 +24757,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event_message_id: Optional[str] = None,
         media_urls: Optional[List[str]] = None,
         media_types: Optional[List[str]] = None,
+        logical_turn_id: Optional[str] = None,
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
         from run_agent import AIAgent
 
+        if not logical_turn_id:
+            raise DurableSessionAdmissionError(
+                "refusing unmanaged persistent gateway background execution"
+            )
+        state = self._session_db
+        if state is None:
+            raise DurableSessionAdmissionError(
+                "SessionDB unavailable for gateway background execution"
+            )
         media_urls = media_urls or []
         media_types = media_types or []
 
@@ -23415,7 +24780,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
-
+        claim = await state.claim_logical_turn(
+            logical_turn_id,
+            owner=f"gateway-background:{os.getpid()}",
+            pid=os.getpid(),
+            ttl_seconds=_GATEWAY_LOGICAL_TURN_LEASE_TTL_SECONDS,
+        )
+        if claim.get("outcome") in {"busy", "terminal"}:
+            return
+        if claim.get("outcome") != "claimed":
+            raise DurableSessionAdmissionError(
+                f"background logical turn cannot be claimed: {claim.get('outcome')}"
+            )
+        attempt_id = str(claim["attempt_id"])
+        model_started = False
+        execution_completed = False
         try:
             user_config = _load_gateway_config()
             model, runtime_kwargs = self._resolve_session_agent_runtime(
@@ -23423,6 +24802,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_config=user_config,
             )
             if not runtime_kwargs.get("api_key"):
+                await state.fail_logical_turn(
+                    logical_turn_id,
+                    attempt_id,
+                    "no provider credentials configured",
+                    retryable=False,
+                )
                 await adapter.send(
                     source.chat_id,
                     f"❌ Background task {task_id} failed: no provider credentials configured.",
@@ -23506,6 +24891,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 finally:
                     self._cleanup_agent_resources(agent)
 
+            assert await state.mark_logical_turn_started(
+                logical_turn_id, attempt_id
+            )
+            model_started = True
             result = await self._run_in_executor_with_context(run_sync)
 
             response = result.get("final_response", "") if result else ""
@@ -23521,88 +24910,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     result.get("messages", []),
                 )
 
-            # Extract media files from the response
-            if response:
-                media_files, response = adapter.extract_media(response)
-                from gateway.platforms.base import BasePlatformAdapter
-                media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
-                images, text_content = adapter.extract_images(response)
+            await state.complete_logical_turn(
+                logical_turn_id,
+                attempt_id,
+                {
+                    "completed": True,
+                    "response": response,
+                    "response_present": bool(response),
+                    "task_id": task_id,
+                },
+                delivery_required=True,
+            )
+            execution_completed = True
 
-                preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
-
-                if text_content:
-                    await adapter.send(
-                        chat_id=source.chat_id,
-                        content=header + text_content,
-                        metadata=_thread_metadata,
-                    )
-                elif not images and not media_files:
-                    await adapter.send(
-                        chat_id=source.chat_id,
-                        content=header + "(No response generated)",
-                        metadata=_thread_metadata,
-                    )
-
-                # Send extracted images
-                for image_url, alt_text in (images or []):
-                    try:
-                        await adapter.send_image(
-                            chat_id=source.chat_id,
-                            image_url=image_url,
-                            caption=alt_text,
-                            metadata=_thread_metadata,
-                        )
-                    except Exception:
-                        pass
-
-                # Send media files, routing each by type so a TTS clip
-                # arrives as a voice bubble / a clip as a video rather than
-                # a generic document. Mirrors the streaming + kanban paths.
-                from gateway.platforms.base import (
-                    should_send_media_as_audio as _should_send_media_as_audio,
+            delivery_succeeded = await self._deliver_gateway_background_response(
+                prompt=prompt,
+                response=response,
+                source=source,
+                event_message_id=event_message_id,
+            )
+            if delivery_succeeded:
+                await state.record_logical_turn_transport_accepted(
+                    logical_turn_id, attempt_id
                 )
-                _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
-                _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
-                for media_path, _is_voice in (media_files or []):
-                    _ext = os.path.splitext(media_path)[1].lower()
-                    try:
-                        if _should_send_media_as_audio(source.platform, _ext, _is_voice):
-                            await adapter.send_voice(
-                                chat_id=source.chat_id,
-                                audio_path=media_path,
-                                metadata=_thread_metadata,
-                            )
-                        elif _ext in _VIDEO_EXTS:
-                            await adapter.send_video(
-                                chat_id=source.chat_id,
-                                video_path=media_path,
-                                metadata=_thread_metadata,
-                            )
-                        elif _ext in _IMAGE_EXTS:
-                            await adapter.send_image_file(
-                                chat_id=source.chat_id,
-                                image_path=media_path,
-                                metadata=_thread_metadata,
-                            )
-                        else:
-                            await adapter.send_document(
-                                chat_id=source.chat_id,
-                                file_path=media_path,
-                                metadata=_thread_metadata,
-                            )
-                    except Exception:
-                        pass
+                await state.acknowledge_logical_turn_delivery(
+                    logical_turn_id, attempt_id
+                )
             else:
-                preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                await adapter.send(
-                    chat_id=source.chat_id,
-                    content=f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)',
-                    metadata=_thread_metadata,
+                await state.fail_logical_turn_delivery(
+                    logical_turn_id,
+                    attempt_id,
+                    "background result delivery was not fully acknowledged",
                 )
 
         except Exception as e:
             logger.exception("Background task %s failed", task_id)
+            if execution_completed:
+                await state.fail_logical_turn_delivery(
+                    logical_turn_id,
+                    attempt_id,
+                    str(e),
+                )
+            else:
+                await state.fail_logical_turn(
+                    logical_turn_id,
+                    attempt_id,
+                    str(e),
+                    retryable=not model_started,
+                )
             try:
                 await adapter.send(
                     chat_id=source.chat_id,
@@ -26124,7 +27479,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
-                message_id=str(evt.get("message_id") or "").strip() or None,
+                message_id=None,
+                reply_to_message_id=(
+                    str(evt.get("message_id") or "").strip() or None
+                ),
+                session_event_id=(
+                    str(evt.get("event_id") or "").strip() or None
+                ),
+                session_event_type="gateway-background-completion",
                 metadata=metadata,
             )
             logger.info(
@@ -28870,6 +30232,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        task_id: Optional[str] = None,
+        goal_id: Optional[str] = None,
+        branch: Optional[str] = None,
+        worktree: Optional[str] = None,
+        parent_logical_turn_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -28890,6 +30257,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                task_id=task_id, goal_id=goal_id, branch=branch,
+                worktree=worktree,
+                parent_logical_turn_id=parent_logical_turn_id,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -28903,6 +30273,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                task_id=task_id, goal_id=goal_id, branch=branch,
+                worktree=worktree,
+                parent_logical_turn_id=parent_logical_turn_id,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -29046,6 +30419,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        task_id: Optional[str] = None,
+        goal_id: Optional[str] = None,
+        branch: Optional[str] = None,
+        worktree: Optional[str] = None,
+        parent_logical_turn_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -29355,6 +30733,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
+            task_id=task_id,
+            goal_id=goal_id,
+            branch=branch,
+            worktree=worktree,
+            parent_logical_turn_id=parent_logical_turn_id,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to
@@ -30586,6 +31969,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    task_id=task_id,
+                    goal_id=goal_id,
+                    branch=branch,
+                    worktree=worktree,
+                    parent_logical_turn_id=parent_logical_turn_id,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
