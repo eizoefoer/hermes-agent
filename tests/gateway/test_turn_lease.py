@@ -192,7 +192,12 @@ async def test_full_dispatch_durably_queues_contention_without_running_goal_hook
     runner._run_agent = pytest.fail
     runner._post_turn_goal_continuation = AsyncMock()
 
-    response = await asyncio.wait_for(runner._handle_message(_event()), timeout=1)
+    # The path crosses AsyncSessionDB's executor boundary. Under the canonical
+    # eight-worker runner a cold, contended host can spend more than one second
+    # waiting for a thread even though the durable queue path is not blocked.
+    # Five seconds still fails a real ownership deadlock promptly while keeping
+    # this invariant test independent of suite load.
+    response = await asyncio.wait_for(runner._handle_message(_event()), timeout=5)
 
     assert isinstance(response, str)
     assert "safely queued" in response.lower()
