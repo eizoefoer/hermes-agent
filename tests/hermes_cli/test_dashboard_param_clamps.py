@@ -27,7 +27,7 @@ def client(tmp_path, monkeypatch):
     # This file verifies FastAPI validation, not the auth gate.  Earlier auth
     # tests may have initialized the process-global app in gated mode and may
     # also have imported it before this fixture's token environment existed.
-    monkeypatch.setattr(web_server.app.state, "auth_required", False)
+    monkeypatch.setattr(web_server.app.state, "auth_required", False, raising=False)
     with TestClient(web_server.app, raise_server_exceptions=False) as c:
         c.headers["Authorization"] = f"Bearer {web_server._SESSION_TOKEN}"
         yield c

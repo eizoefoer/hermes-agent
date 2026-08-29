@@ -15,6 +15,7 @@ answer is identical on every connection topology.
 import pytest
 
 import tui_gateway.server as server
+import tools.apply_layout_tool  # noqa: F401 -- registers the desktop tool
 from toolsets import TOOLSETS, resolve_toolset
 
 GUI_TOOLS = {
