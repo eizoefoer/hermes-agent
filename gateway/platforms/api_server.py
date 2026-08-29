@@ -2342,6 +2342,22 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return raw, None
 
+    @staticmethod
+    def _api_request_source_identity(
+        request: "web.Request", event_type: str
+    ) -> str:
+        """Return the accepted HTTP occurrence identity for durable admission.
+
+        ``Idempotency-Key`` is an authoritative client replay key.  Without
+        one, each accepted HTTP request is a fresh occurrence; its generated
+        identity is persisted with the logical turn before model execution.
+        Request content is deliberately never used as occurrence identity.
+        """
+        replay_key = str(request.headers.get("Idempotency-Key") or "").strip()
+        if replay_key:
+            return f"api:{event_type}:idempotency:{replay_key}"
+        return f"api:{event_type}:occurrence:{uuid.uuid4().hex}"
+
     # ------------------------------------------------------------------
     # Session DB helper
     # ------------------------------------------------------------------
@@ -4680,6 +4696,10 @@ class APIServerAdapter(BasePlatformAdapter):
             requested_runtime=runtime_request.get("requested") or {},
             route_source=runtime_request.get("route_source") or "global",
             confirmed_runtime_lock=lock_active,
+            logical_turn_source_identity=self._api_request_source_identity(
+                request, "api-session-chat"
+            ),
+            logical_turn_event_type="api-session-chat",
             **agent_overrides,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
@@ -4853,6 +4873,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     requested_runtime=runtime_request.get("requested") or {},
                     route_source=runtime_request.get("route_source") or "global",
                     confirmed_runtime_lock=lock_active,
+                    logical_turn_source_identity=self._api_request_source_identity(
+                        request, "api-session-chat-stream"
+                    ),
+                    logical_turn_event_type="api-session-chat-stream",
                     **agent_overrides,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
@@ -5104,6 +5128,9 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        logical_source_identity = self._api_request_source_identity(
+            request, "api-chat-completion"
+        )
 
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
         # When provided, history is loaded from state.db instead of from the request body.
@@ -5270,6 +5297,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                logical_turn_source_identity=logical_source_identity,
+                logical_turn_event_type="api-chat-completion",
                 **agent_overrides,
                 route=route,
             ))
@@ -5291,6 +5320,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                logical_turn_source_identity=logical_source_identity,
+                logical_turn_event_type="api-chat-completion",
                 **agent_overrides,
                 route=route,
             )
@@ -6212,6 +6243,9 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        logical_source_identity = self._api_request_source_identity(
+            request, "api-response"
+        )
 
         # Parse request body
         try:
@@ -6381,6 +6415,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                logical_turn_source_identity=logical_source_identity,
+                logical_turn_event_type="api-response",
                 **agent_overrides,
                 route=route,
             ))
@@ -6416,6 +6452,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                logical_turn_source_identity=logical_source_identity,
+                logical_turn_event_type="api-response",
                 **agent_overrides,
                 route=route,
             )
@@ -7240,6 +7278,9 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        logical_turn_source_identity: Optional[str] = None,
+        logical_turn_event_type: str = "api-session-turn",
+        authoritative_task_id: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -7271,6 +7312,88 @@ class APIServerAdapter(BasePlatformAdapter):
         call run-scoped control endpoints such as ``/v1/runs/{run_id}/steer``.
         """
         loop = asyncio.get_running_loop()
+        db = await self._ensure_session_db_async()
+        if db is None or not session_id:
+            raise RuntimeError(
+                "persistent API execution requires a SessionDB session"
+            )
+        if not await asyncio.to_thread(db.get_session, session_id):
+            await asyncio.to_thread(
+                db.create_session,
+                session_id,
+                "api_server",
+            )
+        source_identity = (
+            str(logical_turn_source_identity).strip()
+            if logical_turn_source_identity
+            else f"api-occurrence:{uuid.uuid4().hex}"
+        )
+        session_key = gateway_session_key or session_id
+        turn = await asyncio.to_thread(
+            db.admit_session_event,
+            session_id=session_id,
+            session_key=session_key,
+            source_identity=source_identity,
+            event_type=logical_turn_event_type,
+            payload={
+                "user_message": user_message,
+                "conversation_history": conversation_history,
+                "ephemeral_system_prompt": ephemeral_system_prompt,
+                "gateway_session_key": gateway_session_key,
+                "requested_model": requested_model,
+                "requested_provider": requested_provider,
+                "model_options": model_options,
+                "route": route,
+                "session_model": session_model,
+                "requested_runtime": requested_runtime,
+                "route_source": route_source,
+                "confirmed_runtime_lock": confirmed_runtime_lock,
+                "recovery_policy": "manual_reconcile",
+            },
+            task_id=authoritative_task_id,
+        )
+        claim = await asyncio.to_thread(
+            db.claim_logical_turn,
+            turn["logical_turn_id"],
+            owner=f"api-server:{os.getpid()}",
+            pid=os.getpid(),
+            ttl_seconds=1800.0,
+        )
+        if claim.get("outcome") == "terminal":
+            result = (claim.get("turn") or {}).get("result") or {}
+            return result.get("agent_result") or result, result.get("usage") or {}
+        if claim.get("outcome") != "claimed":
+            raise RuntimeError(
+                "API session turn durably queued behind active ownership: "
+                f"{turn['logical_turn_id']}"
+            )
+        logical_turn_id = turn["logical_turn_id"]
+        attempt_id = claim["attempt_id"]
+        if not await asyncio.to_thread(
+            db.mark_logical_turn_started, logical_turn_id, attempt_id
+        ):
+            await asyncio.to_thread(
+                db.fail_logical_turn,
+                logical_turn_id,
+                attempt_id,
+                "could not transition claimed API turn to executing",
+                retryable=True,
+            )
+            raise RuntimeError(f"could not start API logical turn {logical_turn_id}")
+
+        async def _heartbeat_api_turn() -> None:
+            while True:
+                await asyncio.sleep(30.0)
+                renewed = await asyncio.to_thread(
+                    db.heartbeat_logical_turn,
+                    logical_turn_id,
+                    attempt_id,
+                    ttl_seconds=1800.0,
+                )
+                if not renewed:
+                    return
+
+        heartbeat_task = asyncio.create_task(_heartbeat_api_turn())
         # Capture before hopping to the executor — ContextVars do not follow
         # run_in_executor threads, so the profile scope must be re-entered
         # inside _run() from this explicit value.
@@ -7316,13 +7439,17 @@ class APIServerAdapter(BasePlatformAdapter):
                         agent_ref[0] = agent
                     if active_run_id:
                         self._active_run_agents[active_run_id] = agent
-                    effective_task_id = session_id or str(uuid.uuid4())
+                    # Process cleanup needs a per-run key, but that runtime key
+                    # is not durable task correlation.  Ordinary API chat has
+                    # no task_id; only /v1/runs (or another authoritative
+                    # task-backed producer) supplies one explicitly.
+                    effective_work_id = authoritative_task_id or logical_turn_id
                     # Baseline for selective background-process reaping on
                     # SSE client disconnect — mirrors gateway/run.py's
                     # gateway-turn cleanup (#76115); this API-server surface
                     # runs its own agent lifecycle and doesn't go through
                     # TurnRunner, so it needs its own baseline.
-                    _publish_turn_process_ownership(agent, effective_task_id)
+                    _publish_turn_process_ownership(agent, effective_work_id)
                     # Shutdown interrupt coverage (#63529).  Registering here,
                     # once, covers every _run_agent() caller — the same reason
                     # the _ProviderAuthResolutionError handler below lives here
@@ -7333,7 +7460,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     result = agent.run_conversation(
                         user_message=user_message,
                         conversation_history=conversation_history,
-                        task_id=effective_task_id,
+                        task_id=authoritative_task_id,
                     )
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
@@ -7471,9 +7598,93 @@ class APIServerAdapter(BasePlatformAdapter):
         self._activate_admitted_request()
         self._inflight_agent_runs += 1
         try:
-            return await loop.run_in_executor(None, _run)
+            result, usage = await loop.run_in_executor(None, _run)
+            await asyncio.to_thread(
+                db.complete_logical_turn,
+                logical_turn_id,
+                attempt_id,
+                {"agent_result": result, "usage": usage},
+                delivery_required=False,
+            )
+            return result, usage
+        except Exception as exc:
+            await asyncio.to_thread(
+                db.fail_logical_turn,
+                logical_turn_id,
+                attempt_id,
+                str(exc),
+                retryable=False,
+            )
+            raise
         finally:
+            heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
             self._inflight_agent_runs -= 1
+
+    async def _recover_api_logical_turn(self, turn: Dict[str, Any]) -> None:
+        """Execute one previously accepted API turn without reopening delivery."""
+        payload = turn.get("payload") or {}
+        try:
+            await self._run_agent(
+                user_message=payload.get("user_message") or "",
+                conversation_history=list(payload.get("conversation_history") or []),
+                ephemeral_system_prompt=payload.get("ephemeral_system_prompt"),
+                session_id=turn["session_id"],
+                gateway_session_key=payload.get("gateway_session_key"),
+                requested_model=payload.get("requested_model"),
+                requested_provider=payload.get("requested_provider"),
+                model_options=payload.get("model_options"),
+                route=payload.get("route"),
+                session_model=payload.get("session_model"),
+                requested_runtime=payload.get("requested_runtime"),
+                route_source=payload.get("route_source") or "global",
+                confirmed_runtime_lock=bool(
+                    payload.get("confirmed_runtime_lock")
+                ),
+                logical_turn_source_identity=turn["source_identity"],
+                logical_turn_event_type=(
+                    payload.get("event_type") or "api-session-turn"
+                ),
+                authoritative_task_id=turn.get("task_id"),
+            )
+        except RuntimeError as exc:
+            # A valid competing lease leaves the row queued.  Startup drain is
+            # bounded and must not spin or turn durable contention into a
+            # terminal failure.
+            if "durably queued behind active ownership" not in str(exc):
+                logger.exception(
+                    "Recovered API logical turn %s failed",
+                    turn.get("logical_turn_id"),
+                )
+
+    async def _drain_api_logical_turns(self, *, limit: int = 32) -> int:
+        """Boundedly recover only API-owned logical turns at adapter startup."""
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return 0
+        await asyncio.to_thread(db.reconcile_logical_turns)
+        turns = await asyncio.to_thread(
+            db.list_ready_logical_turns,
+            limit=limit,
+            event_types=(
+                "api-session-turn",
+                "api-session-chat",
+                "api-session-chat-stream",
+                "api-chat-completion",
+                "api-response",
+                "api-run",
+            ),
+        )
+        launched = 0
+        for turn in turns:
+            if await asyncio.to_thread(db.get_session_turn_lease, turn["session_id"]):
+                continue
+            task = asyncio.create_task(self._recover_api_logical_turn(turn))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+            launched += 1
+        return launched
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
@@ -7677,8 +7888,69 @@ class APIServerAdapter(BasePlatformAdapter):
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
 
-        run_id = f"run_{uuid.uuid4().hex}"
+        run_source_identity = self._api_request_source_identity(request, "api-run")
+        run_id = f"run_{uuid.uuid5(uuid.NAMESPACE_URL, run_source_identity).hex}"
         session_id = session_id or run_id
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error(
+                    "Session database unavailable", code="session_db_unavailable"
+                ),
+                status=503,
+            )
+        if not await asyncio.to_thread(db.get_session, session_id):
+            await asyncio.to_thread(db.create_session, session_id, "api_server")
+        durable_run = await asyncio.to_thread(
+            db.admit_session_event,
+            session_id=session_id,
+            session_key=gateway_session_key or session_id,
+            source_identity=run_source_identity,
+            event_type="api-run",
+            payload={
+                "user_message": user_message,
+                "conversation_history": conversation_history,
+                "ephemeral_system_prompt": instructions,
+                "gateway_session_key": gateway_session_key,
+                "requested_model": agent_overrides.get("requested_model"),
+                "requested_provider": agent_overrides.get("requested_provider"),
+                "model_options": agent_overrides.get("model_options"),
+                "route": route,
+                "recovery_policy": "manual_reconcile",
+                "run_id": run_id,
+            },
+            task_id=run_id,
+        )
+        run_claim = await asyncio.to_thread(
+            db.claim_logical_turn,
+            durable_run["logical_turn_id"],
+            owner=f"api-run:{os.getpid()}",
+            pid=os.getpid(),
+            ttl_seconds=1800.0,
+        )
+        if run_claim.get("outcome") == "terminal":
+            terminal = run_claim.get("turn") or durable_run
+            result = terminal.get("result") or {}
+            return web.json_response(
+                {
+                    "run_id": run_id,
+                    "status": terminal.get("state"),
+                    "logical_turn_id": terminal.get("logical_turn_id"),
+                    "result": result,
+                },
+                status=200,
+            )
+        if run_claim.get("outcome") != "claimed":
+            return web.json_response(
+                {
+                    "run_id": run_id,
+                    "status": "queued",
+                    "logical_turn_id": durable_run["logical_turn_id"],
+                },
+                status=202,
+            )
+        run_logical_turn_id = durable_run["logical_turn_id"]
+        run_attempt_id = run_claim["attempt_id"]
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
         # conversation/memory scopes, not authorization namespaces: multiple
@@ -7688,6 +7960,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
+        worker_admitted = asyncio.Event()
         created_at = time.time()
         self._run_streams[run_id] = q
         self._run_streams_created[run_id] = created_at
@@ -7736,6 +8009,14 @@ class APIServerAdapter(BasePlatformAdapter):
 
         async def _run_and_close():
             try:
+                if not await asyncio.to_thread(
+                    db.mark_logical_turn_started,
+                    run_logical_turn_id,
+                    run_attempt_id,
+                ):
+                    raise RuntimeError(
+                        f"could not start API run logical turn {run_logical_turn_id}"
+                    )
                 self._set_run_status(run_id, "running")
                 if run_id in self._stopping_run_ids:
                     _put_event_if_active({
@@ -7802,7 +8083,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         unregister_gateway_notify,
                     )
 
-                    effective_task_id = session_id or run_id
+                    effective_task_id = run_id
                     approval_token = None
                     session_tokens = []
                     with self._profile_scope(request_profile):
@@ -7868,6 +8149,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         }
                         return r, u
 
+                worker_admitted.set()
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
                 if run_id in self._stopping_run_ids:
                     _put_event_if_active({
@@ -7897,6 +8179,13 @@ class APIServerAdapter(BasePlatformAdapter):
                         error=error_msg,
                         last_event="run.failed",
                     )
+                    await asyncio.to_thread(
+                        db.fail_logical_turn,
+                        run_logical_turn_id,
+                        run_attempt_id,
+                        error_msg,
+                        retryable=False,
+                    )
                 else:
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                     # Undelivered steer text (accepted after the final response;
@@ -7921,6 +8210,13 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="run.completed",
                         **({"pending_steer": pending_steer} if pending_steer else {}),
                     )
+                    await asyncio.to_thread(
+                        db.complete_logical_turn,
+                        run_logical_turn_id,
+                        run_attempt_id,
+                        {"agent_result": result, "usage": usage, "run_id": run_id},
+                        delivery_required=False,
+                    )
             except asyncio.CancelledError:
                 self._set_run_status(
                     run_id,
@@ -7935,6 +8231,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     })
                 except Exception:
                     pass
+                await asyncio.to_thread(
+                    db.fail_logical_turn,
+                    run_logical_turn_id,
+                    run_attempt_id,
+                    "API run cancelled",
+                    retryable=False,
+                )
                 raise
             except _ProviderAuthResolutionError as exc:
                 # /v1/runs builds its own agent via _create_agent() and does
@@ -7961,6 +8264,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     })
                 except Exception:
                     pass
+                await asyncio.to_thread(
+                    db.fail_logical_turn,
+                    run_logical_turn_id,
+                    run_attempt_id,
+                    error_msg,
+                    retryable=False,
+                )
             except Exception as exc:
                 logger.exception("[api_server] run %s failed", run_id)
                 self._set_run_status(
@@ -7978,7 +8288,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     })
                 except Exception:
                     pass
+                await asyncio.to_thread(
+                    db.fail_logical_turn,
+                    run_logical_turn_id,
+                    run_attempt_id,
+                    str(exc),
+                    retryable=False,
+                )
             finally:
+                worker_admitted.set()
                 # If the asyncio wrapper is cancelled (for example via
                 # /stop), the executor thread can still be blocked waiting
                 # on an approval Event.  Unregistering here releases those
@@ -8009,6 +8327,16 @@ class APIServerAdapter(BasePlatformAdapter):
             pass
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
+        # Preserve the established /v1/runs contract that the worker has been
+        # scheduled before the 202 response is observed.  This also closes the
+        # admitted-before-local-registration shutdown gap without making local
+        # task state authoritative ownership.
+        try:
+            await asyncio.wait_for(worker_admitted.wait(), timeout=1.0)
+        except asyncio.TimeoutError:
+            # The durable row remains authoritative and startup recovery can
+            # continue it even if local scheduling is unusually delayed.
+            logger.warning("API run %s worker scheduling delayed", run_id)
 
         response_headers = (
             {"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {}
@@ -8425,6 +8753,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 pass
             if hasattr(sweep_task, "add_done_callback"):
                 sweep_task.add_done_callback(self._background_tasks.discard)
+
+            # Recover accepted API turns independently of the request process
+            # that first admitted them.  Dispatcher filtering happens in
+            # SQLite before LIMIT, so foreign gateway/CLI producers cannot
+            # starve API recovery.
+            await self._drain_api_logical_turns()
 
             # Loud warning when a network-accessible API server runs against an
             # unsandboxed local terminal backend. The API server can drive the
