@@ -66,6 +66,7 @@ def _make_internal_event(text: str = "[async delegation completed]") -> MessageE
 
 def _make_runner() -> GatewayRunner:
     runner = object.__new__(GatewayRunner)
+    runner._persist_busy_gateway_event = AsyncMock(return_value=True)
     runner._running_agents = {}
     runner._running_agents_ts = {}
     runner._pending_messages = {}
@@ -118,12 +119,11 @@ async def test_internal_event_does_not_interrupt_busy_session() -> None:
 
     handled = await runner._handle_active_session_busy_message(event, sk)
 
-    # Returns False so the base adapter silently queues the internal event
-    # as a cascading next turn — it must NOT be handled-with-interrupt here.
-    assert handled is False
+    # The runner durably accepts the completion as a cascading next turn and
+    # handles it here; it must NOT be handled-with-interrupt.
+    assert handled is True
+    runner._persist_busy_gateway_event.assert_awaited_once_with(event, sk)
     # The active turn must survive.
     parent.interrupt.assert_not_called()
     # No "⚡ Interrupting current task" (or any) ack for a synthetic event.
     adapter._send_with_retry.assert_not_called()
-
-

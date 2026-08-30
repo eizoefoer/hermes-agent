@@ -1,26 +1,31 @@
 """Import-safety tests for the Discord gateway adapter."""
 
-import builtins
-import importlib
+import subprocess
 import sys
 
 
 class TestDiscordImportSafety:
-    def test_module_imports_even_when_discord_dependency_is_missing(self, monkeypatch):
-        original_import = builtins.__import__
-
-        def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
-            if name == "discord" or name.startswith("discord."):
-                raise ImportError("discord unavailable for test")
-            return original_import(name, globals, locals, fromlist, level)
-
-        # Purge the cached module so the import below actually re-runs the
-        # module body with discord.py simulated-missing.
-        monkeypatch.delitem(sys.modules, "plugins.platforms.discord.adapter", raising=False)
-        monkeypatch.delitem(sys.modules, "plugins.platforms.discord", raising=False)
-        monkeypatch.setattr(builtins, "__import__", fake_import)
-
-        module = importlib.import_module("plugins.platforms.discord.adapter")
-
-        assert module.DISCORD_AVAILABLE is False
-        assert module.discord is None
+    def test_module_imports_even_when_discord_dependency_is_missing(self):
+        # Run the import-failure simulation in a child interpreter. Replacing
+        # this process's canonical adapter module creates split module/class
+        # identities for later tests in a monolithic gateway run.
+        code = r'''
+import builtins
+original_import = builtins.__import__
+def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == "discord" or name.startswith("discord."):
+        raise ImportError("discord unavailable for test")
+    return original_import(name, globals, locals, fromlist, level)
+builtins.__import__ = fake_import
+import plugins.platforms.discord.adapter as module
+assert module.DISCORD_AVAILABLE is False
+assert module.discord is None
+'''
+        completed = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=str(__import__("pathlib").Path(__file__).resolve().parents[2]),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert completed.returncode == 0, completed.stderr

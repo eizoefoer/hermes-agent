@@ -54,3 +54,28 @@ def _suppress_concurrent_hermes_gate(request, monkeypatch):
         lambda *_a, **_k: [],
         raising=False,
     )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_in_process_update_module_purge(request, monkeypatch):
+    """Keep simulated updates from invalidating later test imports.
+
+    Production deliberately purges cached Hermes modules after replacing its
+    checkout.  In a monolithic pytest process that creates two simultaneous
+    class/module universes: test modules retain collection-time references
+    while later imports resolve newly-created module objects.  Update tests are
+    not testing that global side effect, except for the dedicated purge test
+    module, so suppress it everywhere else.
+    """
+    if request.node.path.name == "test_update_stale_module_purge.py":
+        return
+    try:
+        from hermes_cli import main as cli_main
+    except Exception:
+        return
+    monkeypatch.setattr(
+        cli_main,
+        "_purge_stale_hermes_modules",
+        lambda: None,
+        raising=False,
+    )

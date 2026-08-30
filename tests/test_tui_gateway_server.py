@@ -20,6 +20,12 @@ from tui_gateway import server
 from tui_gateway.transport import bind_transport, reset_transport
 
 
+@pytest.fixture(autouse=True)
+def _explicit_ephemeral_tui_test_mode(monkeypatch):
+    """Legacy unit doubles intentionally run without a persistent SessionDB."""
+    monkeypatch.setenv("HERMES_TUI_TEST_EPHEMERAL", "1")
+
+
 def _dispatch_sync(req: dict, transport=None) -> dict | None:
     """Run one RPC to completion synchronously, regardless of pool routing.
 
@@ -309,7 +315,9 @@ def test_prompt_submit_dispatches_to_compute_host_when_turn_isolation_enabled(mo
         assert fake_supervisor.frames[0]["text"] == "hello"
         assert fake_supervisor.frames[0]["history"] == seed_history
         assert server._sessions["iso-sid"]["history"] == seed_history
-        assert parent_writes == {"ensure_session": 0, "persist_seed": 0}
+        # The serving process now establishes the durable acceptance row
+        # before handing execution ownership to the compute host.
+        assert parent_writes == {"ensure_session": 1, "persist_seed": 0}
         assert server._sessions["iso-sid"]["running"] is True
 
         fake_supervisor.callback(
@@ -6753,7 +6761,7 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_emit", lambda *args, **_kwargs: emitted.append(args))
 
-    def _deliver(_rid, sid, session, text):
+    def _deliver(_rid, sid, session, text, **_kwargs):
         delivered["a" if sid == "sid-a-live-handoff" else "b"].append(text)
         session["running"] = False
 
@@ -6862,7 +6870,7 @@ def test_notification_poller_live_loop_drops_addressed_orphan(
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     server._sessions["sid-live-orphan"] = session
     process_registry._completion_consumed.discard(event["session_id"])
@@ -6903,7 +6911,7 @@ def test_notification_poller_drops_orphaned_events(monkeypatch, routing):
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     monkeypatch.setattr(server, "_get_db", lambda: None)
 
@@ -6969,7 +6977,7 @@ def test_notification_poller_delivers_owned_events(
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     monkeypatch.setattr(server, "_get_db", lambda: _CompressionDB())
 
@@ -7960,7 +7968,7 @@ def test_config_set_yolo_global_scope_writes_approvals_mode(tmp_path, monkeypatc
     import yaml
 
     cfg_path = tmp_path / "config.yaml"
-    cfg_path.write_text(yaml.safe_dump({"approvals": {"mode": "manual"}}))
+    cfg_path.write_text(yaml.safe_dump({"approvals": {"mode": "manual"}}), encoding="utf-8")
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
 
     resp_on = server.handle_request(
@@ -7972,7 +7980,7 @@ def test_config_set_yolo_global_scope_writes_approvals_mode(tmp_path, monkeypatc
     )
     assert resp_on["result"]["value"] == "1"
     assert resp_on["result"]["scope"] == "global"
-    assert yaml.safe_load(cfg_path.read_text())["approvals"]["mode"] == "off"
+    assert yaml.safe_load(cfg_path.read_text(encoding="utf-8"))["approvals"]["mode"] == "off"
 
     resp_off = server.handle_request(
         {
@@ -7982,7 +7990,7 @@ def test_config_set_yolo_global_scope_writes_approvals_mode(tmp_path, monkeypatc
         }
     )
     assert resp_off["result"]["value"] == "0"
-    assert yaml.safe_load(cfg_path.read_text())["approvals"]["mode"] == "manual"
+    assert yaml.safe_load(cfg_path.read_text(encoding="utf-8"))["approvals"]["mode"] == "manual"
 
 
 def test_config_get_approval_mode_uses_smart_default_when_key_is_missing(
@@ -8069,7 +8077,7 @@ def test_config_set_approval_mode_persists_three_way_value_and_emits_live_status
         server._sessions.clear()
 
     assert resp["result"] == {"key": "approvals.mode", "value": "manual"}
-    assert yaml.safe_load((tmp_path / "config.yaml").read_text())["approvals"]["mode"] == "manual"
+    assert yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))["approvals"]["mode"] == "manual"
     assert emitted and emitted[0][0:2] == ("session.info", "sid")
     assert emitted[0][2]["approval_mode"] == "manual"
 
@@ -8165,7 +8173,7 @@ def test_config_set_yolo_global_scope_honors_explicit_value(tmp_path, monkeypatc
     import yaml
 
     cfg_path = tmp_path / "config.yaml"
-    cfg_path.write_text(yaml.safe_dump({"approvals": {"mode": "manual"}}))
+    cfg_path.write_text(yaml.safe_dump({"approvals": {"mode": "manual"}}), encoding="utf-8")
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
 
     resp = server.handle_request(
@@ -8176,7 +8184,7 @@ def test_config_set_yolo_global_scope_honors_explicit_value(tmp_path, monkeypatc
         }
     )
     assert resp["result"]["value"] == "1"
-    assert yaml.safe_load(cfg_path.read_text())["approvals"]["mode"] == "off"
+    assert yaml.safe_load(cfg_path.read_text(encoding="utf-8"))["approvals"]["mode"] == "off"
 
     # Setting it on again is idempotent — stays off.
     resp_again = server.handle_request(
@@ -8187,7 +8195,7 @@ def test_config_set_yolo_global_scope_honors_explicit_value(tmp_path, monkeypatc
         }
     )
     assert resp_again["result"]["value"] == "1"
-    assert yaml.safe_load(cfg_path.read_text())["approvals"]["mode"] == "off"
+    assert yaml.safe_load(cfg_path.read_text(encoding="utf-8"))["approvals"]["mode"] == "off"
 
 
 def test_config_set_fast_updates_live_agent_session_scoped(monkeypatch):
@@ -8409,7 +8417,7 @@ def test_config_set_statusbar_survives_non_dict_display(tmp_path, monkeypatch):
     import yaml
 
     cfg_path = tmp_path / "config.yaml"
-    cfg_path.write_text(yaml.safe_dump({"display": "broken"}))
+    cfg_path.write_text(yaml.safe_dump({"display": "broken"}), encoding="utf-8")
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
 
     resp = server.handle_request(
@@ -8421,7 +8429,7 @@ def test_config_set_statusbar_survives_non_dict_display(tmp_path, monkeypatch):
     )
 
     assert resp["result"]["value"] == "bottom"
-    saved = yaml.safe_load(cfg_path.read_text())
+    saved = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     assert saved["display"]["tui_statusbar"] == "bottom"
 
 
@@ -8445,7 +8453,7 @@ def test_config_set_details_mode_pins_all_sections(tmp_path, monkeypatch):
     )
 
     assert resp["result"] == {"key": "details_mode", "value": "collapsed"}
-    saved = yaml.safe_load(cfg_path.read_text())
+    saved = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     assert saved["display"]["details_mode"] == "collapsed"
     assert saved["display"]["sections"] == {
         "thinking": "collapsed",
@@ -8470,7 +8478,7 @@ def test_config_set_section_writes_per_section_override(tmp_path, monkeypatch):
     )
 
     assert resp["result"] == {"key": "details_mode.activity", "value": "hidden"}
-    saved = yaml.safe_load(cfg_path.read_text())
+    saved = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     assert saved["display"]["sections"] == {"activity": "hidden"}
 
 
@@ -8494,7 +8502,7 @@ def test_config_set_section_clears_override_on_empty_value(tmp_path, monkeypatch
     )
 
     assert resp["result"] == {"key": "details_mode.activity", "value": ""}
-    saved = yaml.safe_load(cfg_path.read_text())
+    saved = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     assert saved["display"]["sections"] == {"tools": "expanded"}
 
 
@@ -17453,7 +17461,7 @@ def test_session_save_writes_under_hermes_home_with_system_prompt(monkeypatch, t
     assert saved_file.parent == saved_dir
     assert saved_file.exists()
 
-    payload = json.loads(saved_file.read_text())
+    payload = json.loads(saved_file.read_text(encoding="utf-8"))
     assert payload["model"] == "hermes-test"
     assert payload["session_id"] == "20260101_120000_abc123"
     assert payload["session_start"] == "2026-01-01T12:00:00"
@@ -17512,7 +17520,7 @@ def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
     turns = []
     emitted = []
 
-    def _fake_run_prompt_submit(rid, sid, session, text):
+    def _fake_run_prompt_submit(rid, sid, session, text, **_kwargs):
         turns.append(text)
         with session["history_lock"]:
             session["running"] = False
@@ -18859,7 +18867,7 @@ def test_persist_model_switch_preserves_sibling_model_keys(tmp_path, monkeypatch
         new_model="new-model", target_provider="anthropic", base_url=None
     )
     server._persist_model_switch(result)
-    saved = yaml.safe_load(cfg_path.read_text())
+    saved = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
 
     # The switched fields updated...
     assert saved["model"]["default"] == "new-model"
@@ -18893,7 +18901,7 @@ def test_persist_model_switch_clears_stale_base_url(tmp_path, monkeypatch):
         new_model="claude-haiku", target_provider="anthropic", base_url=None
     )
     server._persist_model_switch(result)
-    saved = yaml.safe_load(cfg_path.read_text())
+    saved = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
 
     assert saved["model"]["default"] == "claude-haiku"
     assert saved["model"]["provider"] == "anthropic"
@@ -20918,6 +20926,21 @@ def test_prompt_submit_consecutive_rewinds_with_returned_survivor_row_ids(
     original_row_ids = [m["_row_id"] for m in msgs]
 
     sess = _session(history=[dict(m) for m in msgs], session_key=session_key)
+    sess["agent"].run_conversation = lambda prompt, **kwargs: {
+        "final_response": "ok",
+    }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, **_kwargs):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+        def join(self, timeout=None):
+            return None
+
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
     sid = "real-db-consec-rewind-sid"
     server._sessions[sid] = sess
     monkeypatch.setattr(server, "_get_db", lambda: db)
@@ -20970,7 +20993,16 @@ def test_prompt_submit_consecutive_rewinds_with_returned_survivor_row_ids(
             str(original_row_ids[5]): None,
         }
         assert "999999" not in row_id_map
-        sess["running"] = False
+        # Durable ownership remains authoritative until the dispatched turn
+        # reaches its terminal finally; do not clear only the local status flag
+        # and race a second transcript mutation against it.
+        run_thread = sess.get("_run_thread")
+        if run_thread is not None:
+            run_thread.join(timeout=5)
+        deadline = time.time() + 5
+        while db.get_session_turn_lease(session_key) is not None and time.time() < deadline:
+            time.sleep(0.01)
+        assert not sess.get("running")
 
         # Rewind 2a: the STALE pre-rewind id for "second" must fail closed.
         stale_resp = server.handle_request(

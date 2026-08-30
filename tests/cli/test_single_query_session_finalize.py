@@ -138,7 +138,7 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
 
     import cli as cli_mod
 
-    def run_conversation(*, user_message, conversation_history):
+    def run_conversation(*, user_message, conversation_history, task_id=None):
         calls.append(("run", user_message, conversation_history))
         return {
             "final_response": "",
@@ -153,6 +153,10 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
             self.session_id = "quiet-session"
             self.conversation_history = []
             self._active_agent_route_signature = "same-route"
+            self._session_db = SimpleNamespace(
+                reconcile_logical_turns=lambda: None,
+                list_session_logical_turns=lambda _session_id: [],
+            )
             self.agent = SimpleNamespace(
                 session_id="quiet-session",
                 platform="cli",
@@ -184,6 +188,12 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
             calls.append(("init", kwargs))
             return True
 
+        def _admit_cli_logical_turn(self, *_args, **_kwargs):
+            return {"outcome": "claimed", "logical_turn_id": "turn-1", "attempt_id": "attempt-1"}
+
+        def _finish_cli_logical_turn(self, claim, result):
+            calls.append(("finish", claim["logical_turn_id"], bool(result.get("failed"))))
+
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
     monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
@@ -200,4 +210,5 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
     assert exc_info.value.code == 1
     assert ("claim", "cli", True) in calls
     assert ("run", "hello", []) in calls
+    assert ("finish", "turn-1", True) in calls
     assert calls[-1] == ("finalize", "quiet-session")

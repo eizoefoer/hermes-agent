@@ -35,6 +35,7 @@ class _ProfileAdapter(BasePlatformAdapter):
 
 def _runner(*, default_mode: str = "interrupt") -> GatewayRunner:
     runner = GatewayRunner.__new__(GatewayRunner)
+    runner._persist_busy_gateway_event = AsyncMock(return_value=True)
     runner.config = GatewayConfig(multiplex_profiles=True)
     runner._busy_input_mode = default_mode
     runner._busy_text_mode = "queue" if default_mode == "queue" else "interrupt"
@@ -102,7 +103,7 @@ async def _load_profile_snapshot(
 @pytest.mark.parametrize(
     ("secondary_mode", "handled", "expected_action", "expected_text_mode"),
     [
-        ("queue", False, "queue", "queue"),
+        ("queue", True, "queue", "queue"),
         ("steer", True, "steer", "interrupt"),
         ("interrupt", True, "interrupt", "interrupt"),
     ],
@@ -286,7 +287,7 @@ async def test_secondary_legacy_busy_text_mode_is_profile_specific(tmp_path):
     agent._active_children = []
     runner._running_agents[session_key] = agent
 
-    assert await runner._handle_active_session_busy_message(event, session_key) is False
+    assert await runner._handle_active_session_busy_message(event, session_key) is True
     assert adapter._busy_text_mode == "queue"
     agent.interrupt.assert_not_called()
 

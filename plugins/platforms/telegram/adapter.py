@@ -5237,6 +5237,18 @@ class TelegramAdapter(BasePlatformAdapter):
 
         self._app = None
         self._bot = None
+        approval_store = getattr(self, "_telegram_approval_store", None)
+        if approval_store is not None:
+            try:
+                approval_store.close()
+            except Exception:
+                logger.debug(
+                    "[%s] Durable approval store close failed",
+                    self.name,
+                    exc_info=True,
+                )
+            self._telegram_approval_store = None
+            self._telegram_approval_service = None
         logger.info("[%s] Disconnected from Telegram", self.name)
 
     def _should_thread_reply(self, reply_to: Optional[str], chunk_index: int) -> bool:
@@ -6335,13 +6347,27 @@ class TelegramAdapter(BasePlatformAdapter):
             # Resolve thread context for thread replies
             thread_id = self._metadata_thread_id(metadata)
 
-            # We'll use the message_id as part of callback_data to look up session_key
-            # Send a placeholder first, then update — or use a counter.
-            # Simpler: use a monotonic counter to generate short IDs.
-            import itertools
-            if not hasattr(self, "_approval_counter"):
-                self._approval_counter = itertools.count(1)
-            approval_id = next(self._approval_counter)
+            continuation = metadata.get("approval_continuation") if metadata else None
+            durable = isinstance(continuation, dict)
+            if durable:
+                import secrets
+
+                approval_id = f"d{secrets.token_hex(8)}"
+                self._get_telegram_approval_service().create(
+                    request_id=approval_id,
+                    session_key=session_key,
+                    continuation_kind=str(continuation["kind"]),
+                    payload=dict(continuation.get("payload") or {}),
+                    idempotency_key=str(continuation["idempotency_key"]),
+                )
+            else:
+                # Legacy process-local approval cards retain their compact
+                # monotonic token and in-memory queue behavior.
+                import itertools
+
+                if not hasattr(self, "_approval_counter"):
+                    self._approval_counter = itertools.count(1)
+                approval_id = next(self._approval_counter)
 
             buttons = [
                 InlineKeyboardButton("✅ Allow Once", callback_data=f"ea:once:{approval_id}")
@@ -6381,13 +6407,32 @@ class TelegramAdapter(BasePlatformAdapter):
 
             msg = await self._send_message_with_thread_fallback(**kwargs)
 
-            # Store session_key keyed by approval_id for the callback handler
-            self._approval_state[approval_id] = session_key
+            if not durable:
+                self._approval_state[approval_id] = session_key
 
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.warning("[%s] send_exec_approval failed: %s", self.name, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
+
+    def _get_telegram_approval_service(self):
+        """Return the profile-scoped durable conversational approval service."""
+        service = getattr(self, "_telegram_approval_service", None)
+        if service is not None:
+            return service
+
+        from gateway.approval_store import ApprovalStore
+        from gateway.telegram_approval import TelegramApprovalService
+        from tools.approval import resolve_gateway_approval
+
+        store = ApprovalStore()
+        service = TelegramApprovalService(
+            store,
+            process_local_resolver=resolve_gateway_approval,
+        )
+        self._telegram_approval_store = store
+        self._telegram_approval_service = service
+        return service
 
     async def send_slash_confirm(
         self, chat_id: str, title: str, message: str, session_key: str,
@@ -7189,6 +7234,16 @@ class TelegramAdapter(BasePlatformAdapter):
         if not query or not query.data:
             return
         data = query.data
+
+        # Durable signed repository/task approvals are a distinct ``pa:``
+        # protocol used by control-plane plugins. Route through the stable
+        # compatibility module before conversational callback parsing.
+        if data.startswith("pa:"):
+            from gateway import telegram_approval
+
+            await telegram_approval.handle_callback(self, query)
+            return
+
         query_message = getattr(query, "message", None)
         query_chat_id = getattr(query_message, "chat_id", None)
         query_chat = getattr(query_message, "chat", None)
@@ -7227,11 +7282,16 @@ class TelegramAdapter(BasePlatformAdapter):
             parts = data.split(":", 2)
             if len(parts) == 3:
                 choice = parts[1]  # once, session, always, deny
-                try:
-                    approval_id = int(parts[2])
-                except (ValueError, IndexError):
-                    await query.answer(text="Invalid approval data.")
-                    return
+                approval_token = parts[2]
+                durable = approval_token.startswith("d")
+                if durable:
+                    approval_id = approval_token
+                else:
+                    try:
+                        approval_id = int(approval_token)
+                    except (ValueError, IndexError):
+                        await query.answer(text="Invalid approval data.")
+                        return
 
                 # Only authorized users may click approval buttons.
                 caller_id = str(getattr(query.from_user, "id", ""))
@@ -7246,7 +7306,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     return
 
                 session_key = self._approval_state.pop(approval_id, None)
-                if not session_key:
+                if not durable and not session_key:
                     await query.answer(text="This approval has already been resolved.")
                     return
 
@@ -7259,14 +7319,37 @@ class TelegramAdapter(BasePlatformAdapter):
                 # the command was already denied and will not run (#63501
                 # regression follow-up: 60s waits made stale taps common).
                 try:
-                    from tools.approval import resolve_gateway_approval
-                    count = resolve_gateway_approval(session_key, choice)
+                    if durable:
+                        durable_outcome = self._get_telegram_approval_service().decide(
+                            approval_id,
+                            choice,
+                            decided_by=caller_id,
+                        )
+                        count = (
+                            durable_outcome.local_resolution_count
+                            if not durable_outcome.durable
+                            else 1
+                        )
+                    else:
+                        from tools.approval import resolve_gateway_approval
+
+                        count = resolve_gateway_approval(session_key, choice)
                     logger.info(
                         "Telegram button resolved %d approval(s) for session %s (choice=%s, user=%s)",
-                        count, session_key, choice, user_display,
+                        count, session_key or "durable", choice, user_display,
                     )
+                except KeyError:
+                    await query.answer(text="This approval has expired.")
+                    return
+                except PermissionError:
+                    await query.answer(
+                        text="⛔ This approval belongs to another Telegram user."
+                    )
+                    return
                 except Exception as exc:
-                    logger.error("Failed to resolve gateway approval from Telegram button: %s", exc)
+                    logger.error(
+                        "Failed to persist/resolve Telegram approval: %s", exc
+                    )
                     count = 0
 
                 if count:

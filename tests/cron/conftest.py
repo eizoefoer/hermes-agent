@@ -49,6 +49,10 @@ def make_cron_provider():
 def _default_cron_test_model(monkeypatch):
     """Pin a default HERMES_MODEL so cron run_job tests have a resolvable model."""
     monkeypatch.setenv("HERMES_MODEL", "test-cron-default-model")
+    # Legacy cron unit tests use deliberately tiny SessionDB doubles while
+    # testing unrelated config/model behavior. Make that exemption explicit;
+    # production persistent cron execution remains fail-closed.
+    monkeypatch.setenv("HERMES_EXPLICIT_EPHEMERAL_CRON_TEST_MODE", "1")
     yield
 
 

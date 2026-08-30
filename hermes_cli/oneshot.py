@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import uuid
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Optional
@@ -339,7 +340,7 @@ def run_oneshot(
 
 
 def _create_session_db_for_oneshot():
-    """Best-effort SessionDB for ``hermes -z`` / oneshot mode.
+    """Create the canonical SessionDB for ``hermes -z`` / oneshot mode.
 
     Oneshot bypasses ``HermesCLI._init_agent()``, so it must wire the SQLite
     session store itself. Without this, the ``session_search``/recall tool is
@@ -350,8 +351,7 @@ def _create_session_db_for_oneshot():
 
         return SessionDB()
     except Exception as exc:
-        logging.debug("SQLite session store not available for oneshot mode: %s", exc)
-        return None
+        raise RuntimeError(f"SessionDB unavailable for hermes -z: {exc}") from exc
 
 
 def _run_agent(
@@ -462,12 +462,56 @@ def _run_agent(
     skills_prompt = _build_preloaded_skills_prompt(skills)
 
     session_db = _create_session_db_for_oneshot()
+    session_id = (
+        os.getenv("HERMES_ONESHOT_SESSION_ID", "").strip()
+        or f"oneshot-{uuid.uuid4().hex}"
+    )
+    source_identity = (
+        os.getenv("HERMES_ONESHOT_SOURCE_ID", "").strip()
+        or f"cli:oneshot:{session_id}"
+    )
+    session_db.reconcile_logical_turns()
+    if not session_db.get_session(session_id):
+        session_db.create_session(session_id, "cli-oneshot")
+    admitted = session_db.admit_session_event(
+        session_id=session_id,
+        session_key=f"cli:{session_id}",
+        source_identity=source_identity,
+        event_type="cli-oneshot",
+        payload={"text": prompt, "source": "cli-oneshot"},
+    )
+    claim = session_db.claim_logical_turn(
+        admitted["logical_turn_id"],
+        owner=f"cli-oneshot:{os.getpid()}",
+        pid=os.getpid(),
+        ttl_seconds=1800.0,
+    )
     # The try spans agent construction (not just ``chat``) so the SQLite store
     # opened above is always closed — including when ``AIAgent(...)`` itself
     # raises on a provider/config error. The one-shot exit path hard-exits via
     # os._exit and skips finalizers, so an un-closed connection here would leak.
     agent = None
     try:
+        if claim.get("outcome") == "terminal":
+            stored = (claim.get("turn") or {}).get("result") or {}
+            stored_result = stored.get("agent_result") or stored
+            return (stored_result.get("final_response") or "", stored_result)
+        if claim.get("outcome") != "claimed":
+            raise RuntimeError(
+                "oneshot logical turn durably queued behind active ownership: "
+                f"{admitted['logical_turn_id']}"
+            )
+        attempt_id = claim["attempt_id"]
+        if not session_db.mark_logical_turn_started(
+            admitted["logical_turn_id"], attempt_id
+        ):
+            session_db.fail_logical_turn(
+                admitted["logical_turn_id"],
+                attempt_id,
+                "could not start oneshot logical turn",
+                retryable=True,
+            )
+            raise RuntimeError("could not start oneshot logical turn")
         # Read the effective fallback chain from profile config so oneshot
         # workers honour the same merge semantics as interactive CLI and
         # gateway sessions.
@@ -483,6 +527,7 @@ def _run_agent(
             enabled_toolsets=toolsets_list,
             quiet_mode=True,
             platform="cli",
+            session_id=session_id,
             session_db=session_db,
             credential_pool=runtime.get("credential_pool"),
             fallback_model=_fb or None,
@@ -507,8 +552,42 @@ def _run_agent(
         agent.stream_delta_callback = None
         agent.tool_gen_callback = None
 
-        result = agent.run_conversation(prompt)
+        try:
+            result = agent.run_conversation(prompt, task_id=None)
+        except BaseException as exc:
+            session_db.fail_logical_turn(
+                admitted["logical_turn_id"],
+                attempt_id,
+                str(exc),
+                retryable=False,
+            )
+            raise
+        if result.get("failed") or result.get("error") or result.get("interrupted"):
+            session_db.fail_logical_turn(
+                admitted["logical_turn_id"],
+                attempt_id,
+                str(result.get("error") or "oneshot turn failed"),
+                retryable=bool(result.get("interrupted")),
+            )
+        else:
+            session_db.complete_logical_turn(
+                admitted["logical_turn_id"],
+                attempt_id,
+                {"agent_result": result},
+                delivery_required=False,
+            )
         return (result.get("final_response") or "", result)
+    except BaseException as exc:
+        if claim.get("outcome") == "claimed":
+            current = session_db.get_logical_turn(admitted["logical_turn_id"])
+            if current and current.get("state") in {"claimed", "executing"}:
+                session_db.fail_logical_turn(
+                    admitted["logical_turn_id"],
+                    claim["attempt_id"],
+                    str(exc),
+                    retryable=False,
+                )
+        raise
     finally:
         # Ordering deliberately mirrors gateway/run.py:_cleanup_agent_resources,
         # NOT cli.py:_run_cleanup — oneshot has no _active_agent_ref and must

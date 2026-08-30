@@ -429,6 +429,7 @@ class TestPrompt:
         def _run(*args, **kwargs):
             # Runs inside the session context copy set up by prompt().
             captured["child"] = _make_run_env({}).get("HERMES_SESSION_ID")
+            captured["task_id"] = kwargs.get("task_id")
             return {"final_response": "ok", "messages": []}
 
         state.agent.run_conversation = _run
@@ -445,6 +446,69 @@ class TestPrompt:
         )
 
         assert captured.get("child") == resp.session_id
+        assert captured.get("task_id") is None
+        turns = mock_manager._get_db().list_session_logical_turns(resp.session_id)
+        assert len(turns) == 1
+        assert turns[0]["state"] == "completed"
+        assert turns[0]["delivery_state"] == "delivered"
+        assert turns[0]["task_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_busy_acp_prompt_is_durably_queued(self, agent, mock_manager):
+        resp = await agent.new_session(cwd=".")
+        state = mock_manager.get_session(resp.session_id)
+        db = mock_manager._get_db()
+        owner = db.admit_session_event(
+            session_id=resp.session_id,
+            session_key=resp.session_id,
+            source_identity="acp:owner",
+            event_type="acp-prompt",
+        )
+        claim = db.claim_logical_turn(owner["logical_turn_id"], owner="other-acp")
+        assert claim["outcome"] == "claimed"
+        state.is_running = True
+        state.agent._supports_active_turn_redirect = False
+        conn = MagicMock(spec=acp.Client)
+        conn.session_update = AsyncMock()
+        agent._conn = conn
+
+        result = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="next")],
+            session_id=resp.session_id,
+            request_id="request-next",
+        )
+
+        assert result.stop_reason == "end_turn"
+        turns = db.list_session_logical_turns(resp.session_id)
+        assert [turn["state"] for turn in turns] == ["claimed", "queued"]
+        assert state.queued_prompts == []
+        state.agent.run_conversation.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_acp_startup_drain_rehydrates_same_source_identity(
+        self, agent, mock_manager
+    ):
+        resp = await agent.new_session(cwd=".")
+        db = mock_manager._get_db()
+        turn = db.admit_session_event(
+            session_id=resp.session_id,
+            session_key=resp.session_id,
+            source_identity="acp:recover-me",
+            event_type="acp-prompt",
+            payload={"user_text": "recover", "user_content": "recover"},
+        )
+        calls = []
+
+        async def _capture(*, prompt, session_id, **kwargs):
+            calls.append((prompt, session_id, kwargs))
+            return PromptResponse(stop_reason="end_turn")
+
+        with patch.object(agent, "prompt", side_effect=_capture):
+            assert await agent._drain_acp_logical_turns() == 1
+            await asyncio.sleep(0)
+
+        assert calls[0][1] == resp.session_id
+        assert calls[0][2]["_logical_turn_source_identity"] == turn["source_identity"]
 
 
 
