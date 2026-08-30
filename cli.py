@@ -25,6 +25,7 @@ except ModuleNotFoundError:
 
 import logging
 import copy
+import hashlib
 import os
 import shutil
 import sys
@@ -46,6 +47,74 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional, Mapping
 
 logger = logging.getLogger(__name__)
+
+
+def _cli_request_digest(message: Any) -> str:
+    """Immutable matching metadata for an accepted CLI request."""
+    return hashlib.sha256(
+        json.dumps(message, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+class DurableRecoveryAmbiguous(RuntimeError):
+    """More than one unfinished durable request matches a recovery attempt."""
+
+
+def _resolve_cli_query_source_identity(state, session_id: str, message: Any) -> str:
+    """Reuse one unfinished quiet request, otherwise mint a new occurrence.
+
+    Recovery is based on immutable acceptance metadata in the logical-turn
+    ledger, never on the mutable transcript watermark.  A completed identical
+    query is a new user occurrence.
+    """
+    supplied = os.environ.get("HERMES_CLI_SOURCE_ID", "").strip()
+    if supplied:
+        return supplied
+    state.reconcile_logical_turns()
+    digest = _cli_request_digest(message)
+    candidates = []
+    for turn in state.list_session_logical_turns(session_id):
+        payload = turn.get("payload") or {}
+        if payload.get("event_type") != "cli-query":
+            continue
+        if turn.get("state") in {"completed", "failed", "unrecoverable", "cancelled"}:
+            continue
+        if payload.get("request_digest") == digest:
+            candidates.append(turn)
+    if len(candidates) > 1:
+        raise DurableRecoveryAmbiguous(
+            f"multiple unfinished cli-query turns match session {session_id}"
+        )
+    if candidates:
+        return str(candidates[0]["source_identity"])
+    return f"cli:query:{session_id}:{uuid.uuid4().hex}"
+
+
+def _cli_kanban_turn_source_identity(task_id: str, iteration: int) -> str:
+    return f"cli:kanban:task:{task_id}:iteration:{int(iteration)}"
+
+
+def _resolve_kanban_iteration(state, session_id: str, task_id: str) -> int:
+    """Reconstruct the next or explicitly replayed Kanban iteration."""
+    supplied = os.environ.get("HERMES_CLI_SOURCE_ID", "").strip()
+    relevant = []
+    for turn in state.list_session_logical_turns(session_id):
+        payload = turn.get("payload") or {}
+        if turn.get("task_id") != task_id or payload.get("event_type") != "kanban-goal-turn":
+            continue
+        relevant.append(turn)
+        if supplied and turn.get("source_identity") == supplied:
+            return int(payload.get("iteration") or 1)
+    pending = [
+        turn for turn in relevant
+        if turn.get("state") not in {"completed", "failed", "unrecoverable", "cancelled"}
+    ]
+    if pending:
+        return int((pending[-1].get("payload") or {}).get("iteration") or 1)
+    return max(
+        [int((turn.get("payload") or {}).get("iteration") or 0) for turn in relevant]
+        or [0]
+    ) + 1
 
 # Suppress startup messages for clean CLI experience
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
@@ -16658,6 +16727,114 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
+    def _admit_cli_logical_turn(
+        self,
+        message: Any,
+        *,
+        event_type: str = "cli-input",
+        source_identity: Optional[str] = None,
+        task_id: Optional[str] = None,
+        goal_id: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Persist and claim one CLI turn before any model-side mutation."""
+        state = self._session_db
+        if state is None:
+            raise RuntimeError(
+                "SessionDB is unavailable; refusing unmanaged persistent CLI work"
+            )
+        if not state.get_session(self.session_id):
+            state.create_session(self.session_id, "cli")
+        accepted_source = source_identity or f"cli:{event_type}:{uuid.uuid4().hex}"
+        admitted = state.admit_session_event(
+            session_id=self.session_id,
+            session_key=f"cli:{self.session_id}",
+            source_identity=accepted_source,
+            event_type=event_type,
+            payload={"text": str(message), "source": "cli", **(payload or {})},
+            task_id=task_id,
+            goal_id=goal_id,
+            worktree=os.getcwd(),
+        )
+        claim = state.claim_logical_turn(
+            admitted["logical_turn_id"],
+            owner=f"cli:{os.getpid()}",
+            pid=os.getpid(),
+            ttl_seconds=1800.0,
+        )
+        claim["logical_turn_id"] = admitted["logical_turn_id"]
+        if claim.get("outcome") == "claimed":
+            if not state.mark_logical_turn_started(
+                admitted["logical_turn_id"], claim["attempt_id"]
+            ):
+                state.fail_logical_turn(
+                    admitted["logical_turn_id"],
+                    claim["attempt_id"],
+                    "could not start CLI logical turn",
+                    retryable=True,
+                )
+                claim["outcome"] = "failed"
+                return claim
+            stop = threading.Event()
+
+            def _heartbeat() -> None:
+                while not stop.wait(30.0):
+                    if not state.heartbeat_logical_turn(
+                        admitted["logical_turn_id"],
+                        claim["attempt_id"],
+                        ttl_seconds=1800.0,
+                    ):
+                        return
+
+            thread = threading.Thread(
+                target=_heartbeat,
+                name=f"cli-turn-heartbeat-{admitted['logical_turn_id'][:8]}",
+                daemon=True,
+            )
+            thread.start()
+            claim["_heartbeat_stop"] = stop
+        return claim
+
+    def _finish_cli_logical_turn(
+        self, claim: Optional[Dict[str, Any]], result: Optional[Dict[str, Any]]
+    ) -> None:
+        if not claim or claim.get("outcome") != "claimed" or self._session_db is None:
+            return
+        stop = claim.get("_heartbeat_stop")
+        if stop is not None:
+            stop.set()
+        turn_id = claim.get("logical_turn_id")
+        attempt_id = claim.get("attempt_id")
+        if not turn_id or not attempt_id:
+            return
+        current = self._session_db.get_logical_turn(turn_id)
+        if not current or current.get("state") not in {"claimed", "executing"}:
+            return
+        if result and (
+            result.get("failed") or result.get("error") or result.get("interrupted")
+        ):
+            self._session_db.fail_logical_turn(
+                turn_id,
+                attempt_id,
+                str(result.get("error") or "CLI turn failed"),
+                retryable=bool(result.get("interrupted")),
+            )
+        else:
+            response = result.get("final_response") if result else None
+            completion = dict(result or {})
+            completion.update(
+                {
+                    "response": response,
+                    "response_present": bool(str(response or "").strip()),
+                }
+            )
+            self._session_db.complete_logical_turn(
+                turn_id,
+                attempt_id,
+                completion,
+                delivery_required=False,
+            )
+
     def chat(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
         """
         Send a message to the agent and get a response.
@@ -16688,9 +16865,26 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # this to True. Early returns (credential refresh failure, etc.)
         # leave it False, which is correct — those aren't user interrupts.
         self._last_turn_interrupted = False
+        result: Optional[Dict[str, Any]] = None
+
+        logical_turn_claim = self._admit_cli_logical_turn(message)
+        if logical_turn_claim.get("outcome") == "busy":
+            _cprint(
+                "  Session is durably owned by another turn; input was queued safely."
+            )
+            return None
+        if logical_turn_claim.get("outcome") == "terminal":
+            stored = (logical_turn_claim.get("turn") or {}).get("result") or {}
+            return stored.get("response")
+        if logical_turn_claim.get("outcome") != "claimed":
+            return None
 
         # Refresh provider credentials if needed (handles key rotation transparently)
         if not self._ensure_runtime_credentials():
+            self._finish_cli_logical_turn(
+                logical_turn_claim,
+                {"failed": True, "error": "runtime credentials unavailable"},
+            )
             return None
 
         turn_route = self._resolve_turn_agent_config(message)
@@ -16705,9 +16899,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             runtime_override=turn_route["runtime"],
             request_overrides=turn_route.get("request_overrides"),
         ):
+            self._finish_cli_logical_turn(
+                logical_turn_claim,
+                {"failed": True, "error": "agent initialization failed"},
+            )
             return None
         agent = self.agent
         if agent is None:
+            self._finish_cli_logical_turn(
+                logical_turn_claim,
+                {"failed": True, "error": "agent initialization returned no agent"},
+            )
             return None
 
         # Route image attachments based on the active model's vision capability.
@@ -16796,7 +16998,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     for w in _ctx_result.warnings:
                         _cprint(f"  {_DIM}⚠ {w}{_RST}")
                     if _ctx_result.blocked:
-                        return "\n".join(_ctx_result.warnings) or "Context injection refused."
+                        blocked = "\n".join(_ctx_result.warnings) or "Context injection refused."
+                        self._finish_cli_logical_turn(
+                            logical_turn_claim,
+                            {"failed": True, "error": blocked},
+                        )
+                        return blocked
                     message = _ctx_result.message
             except Exception as e:
                 logging.debug("@ context reference expansion failed: %s", e)
@@ -17017,7 +17224,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         user_message=agent_message,
                         conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
                         stream_callback=stream_callback,
-                        task_id=self.session_id,
+                        task_id=None,
                         persist_user_message=_persist_clean_user_message,
                         moa_config=_moa_cfg,
                     )
@@ -17486,8 +17693,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             
         except Exception as e:
             print(f"Error: {e}")
+            result = {"failed": True, "error": str(e), "final_response": ""}
             return None
         finally:
+            self._finish_cli_logical_turn(logical_turn_claim, result)
             # Stop the ambient thinking sound the moment the turn ends —
             # every exit path (normal, error, interrupt) lands here.
             if _thinking_started:
@@ -21424,10 +21633,31 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     max_turns = task.goal_max_turns or _DEF_TURNS
 
     def _run_turn(prompt: str) -> str:
-        result = cli.agent.run_conversation(
-            user_message=prompt,
-            conversation_history=cli.conversation_history,
+        iteration = _resolve_kanban_iteration(cli._session_db, cli.session_id, task_id)
+        claim = cli._admit_cli_logical_turn(
+            prompt,
+            event_type="kanban-goal-turn",
+            source_identity=_cli_kanban_turn_source_identity(task_id, iteration),
+            task_id=task_id,
+            goal_id=None,
+            payload={"iteration": iteration, "evaluation_identity": iteration},
         )
+        if claim.get("outcome") == "terminal":
+            return str(((claim.get("turn") or {}).get("result") or {}).get("response") or "")
+        if claim.get("outcome") != "claimed":
+            raise RuntimeError(f"kanban iteration {iteration} is {claim.get('outcome')}")
+        try:
+            result = cli.agent.run_conversation(
+                user_message=prompt,
+                conversation_history=cli.conversation_history,
+                task_id=task_id,
+            )
+        except Exception as exc:
+            cli._finish_cli_logical_turn(
+                claim, {"failed": True, "error": str(exc)}
+            )
+            raise
+        cli._finish_cli_logical_turn(claim, result)
         # Keep session_id in sync if mid-run compression rotated it.
         if (
             getattr(cli.agent, "session_id", None)
@@ -21753,7 +21983,15 @@ def main(
         cli.show_banner()
         cli.show_toolsets()
         sys.exit(0)
-    
+
+    # Bounded startup recovery for independent persisted /background children.
+    # This consumes only CLI-background event types from the shared logical-turn
+    # ledger; process-local thread maps remain UI/runtime caches.
+    try:
+        cli._recover_cli_background_children(limit=16)
+    except Exception:
+        logger.warning("CLI background recovery pass failed", exc_info=True)
+
     # Register cleanup for single-query mode (interactive mode registers in run())
     atexit.register(_run_cleanup)
 
@@ -21915,6 +22153,30 @@ def main(
                 # Quiet mode: suppress banner, spinner, tool previews.
                 # Only print the final response and parseable session info.
                 cli.tool_progress_mode = "off"
+                quiet_source = _resolve_cli_query_source_identity(
+                    cli._session_db, cli.session_id, query
+                )
+                quiet_claim = cli._admit_cli_logical_turn(
+                    query,
+                    event_type="cli-query",
+                    source_identity=quiet_source,
+                    task_id=_kanban_task_id or None,
+                    goal_id=None,
+                    payload={"request_digest": _cli_request_digest(query)},
+                )
+                if quiet_claim.get("outcome") == "busy":
+                    print("Session is durably busy; query was queued.", file=sys.stderr)
+                    sys.exit(1)
+                if quiet_claim.get("outcome") == "terminal":
+                    prior = (quiet_claim.get("turn") or {}).get("result") or {}
+                    prior_response = str(prior.get("response") or "")
+                    if prior_response:
+                        print(prior_response)
+                    print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
+                    sys.exit(0)
+                if quiet_claim.get("outcome") != "claimed":
+                    print("Unable to claim durable CLI query.", file=sys.stderr)
+                    sys.exit(1)
                 if cli._ensure_runtime_credentials():
                     effective_query: Any = query
                     if single_query_images or single_query_image_urls:
@@ -22009,11 +22271,22 @@ def main(
                             result = cli.agent.run_conversation(
                                 user_message=effective_query,
                                 conversation_history=cli.conversation_history,
+                                task_id=_kanban_task_id or None,
                             )
                         except KeyboardInterrupt:
+                            cli._finish_cli_logical_turn(
+                                quiet_claim,
+                                {"interrupted": True, "error": "keyboard interrupt"},
+                            )
                             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
                             print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
                             sys.exit(130)
+                        except Exception as exc:
+                            cli._finish_cli_logical_turn(
+                                quiet_claim, {"failed": True, "error": str(exc)}
+                            )
+                            raise
+                        cli._finish_cli_logical_turn(quiet_claim, result)
                         # Sync session_id if mid-run compression created a
                         # continuation session. The exit line below reports
                         # session_id to stderr for automation wrappers; without
@@ -22081,6 +22354,10 @@ def main(
                                     _exit_code = 1
                         sys.exit(_exit_code)
 
+                cli._finish_cli_logical_turn(
+                    quiet_claim,
+                    {"failed": True, "error": "credentials or agent initialization failed"},
+                )
                 # Exit with error code if credentials or agent init fails
                 sys.exit(1)
             else:

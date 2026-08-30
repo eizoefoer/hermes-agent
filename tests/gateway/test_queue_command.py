@@ -64,6 +64,9 @@ def _make_runner(session_entry: SessionEntry):
     runner._send_voice_reply = AsyncMock()
     runner._capture_gateway_honcho_if_configured = lambda *args, **kwargs: None
     runner._emit_gateway_run_progress = AsyncMock()
+    # This suite isolates local FIFO payload preservation. Durable admission
+    # itself is exercised with a real SessionDB in the Phase 1 gateway tests.
+    runner._persist_busy_gateway_event = AsyncMock(return_value=True)
     return runner, adapter
 
 

@@ -163,14 +163,19 @@ def _make_adapter(**extra) -> HomeAssistantAdapter:
     return adapter
 
 
-def _make_event(entity_id, old_state, new_state, old_attrs=None, new_attrs=None):
-    return {
+def _make_event(
+    entity_id, old_state, new_state, old_attrs=None, new_attrs=None, context_id=None
+):
+    event = {
         "data": {
             "entity_id": entity_id,
             "old_state": {"state": old_state, "attributes": old_attrs or {}},
             "new_state": {"state": new_state, "attributes": new_attrs or {"friendly_name": entity_id}},
         }
     }
+    if context_id is not None:
+        event["context"] = {"id": context_id}
+    return event
 
 
 class TestEventFilteringPipeline:
@@ -201,6 +206,30 @@ class TestEventFilteringPipeline:
         assert "heat" in msg_event.text
         assert msg_event.source.platform == Platform.HOMEASSISTANT
         assert msg_event.source.chat_id == "ha_events"
+
+    @pytest.mark.asyncio
+    async def test_context_id_is_authoritative_occurrence_identity(self):
+        adapter = _make_adapter(watch_all=True, cooldown_seconds=0)
+        await adapter._handle_ha_event(
+            _make_event("sensor.temp", "20", "21", context_id="ctx-1")
+        )
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_id is None
+        assert event.session_event_id == "homeassistant:ctx-1"
+
+    @pytest.mark.asyncio
+    async def test_no_context_events_do_not_derive_identity_from_entity_or_text(self):
+        adapter = _make_adapter(watch_all=True, cooldown_seconds=0)
+        event = _make_event("sensor.temp", "20", "21")
+        await adapter._handle_ha_event(event)
+        await adapter._handle_ha_event(event)
+        first = adapter.handle_message.call_args_list[0].args[0]
+        second = adapter.handle_message.call_args_list[1].args[0]
+        assert first.message_id is None
+        assert second.message_id is None
+        assert first.session_event_id is None
+        assert second.session_event_id is None
+        assert first.occurrence_id != second.occurrence_id
 
 
 # ---------------------------------------------------------------------------
@@ -317,4 +346,3 @@ class TestWsUrlConstruction:
         adapter = HomeAssistantAdapter(config)
         ws_url = adapter._hass_url.replace("http://", "ws://").replace("https://", "wss://")
         assert ws_url == "ws://ha:8123"
-

@@ -11,6 +11,8 @@ behavior-neutral move that lifts ~1,000 LOC out of run.py.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import re
@@ -31,6 +33,33 @@ _LOCAL_PATH_RE = re.compile(
     r"(?<![\w:/])(?:/(?:Users|home|private|tmp|var|etc|workspace)/[^\s,;]+|"
     r"[A-Za-z]:\\[^\s,;]+)"
 )
+
+
+def _kanban_wake_source_event_id(
+    *, board: Optional[str], sub: dict[str, Any], cursor: int
+) -> str:
+    """Return the durable producer identity for one Kanban wake occurrence.
+
+    The notifier cursor is advanced transactionally with the durable Kanban
+    event stream.  Combining it with the subscription destination identifies
+    the same claimed wake across rewind/retry while keeping the next event --
+    even one rendering identical text -- distinct.  The rendered notification
+    is deliberately absent from this identity.
+    """
+    identity = [
+        "kanban-wake-v1",
+        str(board or ""),
+        str(sub.get("task_id") or ""),
+        str(sub.get("platform") or ""),
+        str(sub.get("chat_id") or ""),
+        str(sub.get("thread_id") or ""),
+        str(sub.get("notifier_profile") or ""),
+        int(cursor),
+    ]
+    digest = hashlib.sha256(
+        json.dumps(identity, separators=(",", ":"), ensure_ascii=True).encode()
+    ).hexdigest()
+    return f"kanban-wake:{digest}"
 
 
 def _safe_review_reason(value: Any, limit: int = 160) -> str:
@@ -518,6 +547,11 @@ class GatewayKanbanWatchersMixin:
                     sub = d["sub"]
                     task = d["task"]
                     board_slug = d.get("board")
+                    wake_source_event_id = _kanban_wake_source_event_id(
+                        board=board_slug,
+                        sub=sub,
+                        cursor=d["cursor"],
+                    )
                     platform_str = (sub["platform"] or "").lower()
                     try:
                         plat = _Platform(platform_str)
@@ -921,6 +955,7 @@ class GatewayKanbanWatchersMixin:
                                     adapter,
                                     text=_synth,
                                     session_id=_session_key,
+                                    source_event_id=wake_source_event_id,
                                 )
                                 logger.info(
                                     "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
@@ -1009,6 +1044,7 @@ class GatewayKanbanWatchersMixin:
                                 text=_synth,
                                 session_id=_session_key,
                                 source=_source,
+                                source_event_id=wake_source_event_id,
                             )
                             logger.info(
                                 "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",

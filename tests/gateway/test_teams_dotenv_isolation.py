@@ -134,6 +134,9 @@ class TestTeamsAdapterImportDoesNotLeakDotenv:
 
     def test_namespace_without_apps_is_not_sdk_available(self, monkeypatch):
         """A sibling microsoft_teams package must not count as the Teams SDK."""
+        for name in list(sys.modules):
+            if name.startswith("microsoft_teams."):
+                monkeypatch.delitem(sys.modules, name, raising=False)
         ns = types.ModuleType("microsoft_teams")
         ns.__path__ = []  # type: ignore[attr-defined]
         monkeypatch.setitem(sys.modules, "microsoft_teams", ns)

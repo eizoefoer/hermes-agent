@@ -251,6 +251,7 @@ async def test_session_hygiene_preserves_transcript_when_no_rotation(monkeypatch
 
     adapter = HygieneCaptureAdapter()
     runner = object.__new__(GatewayRunner)
+    runner._allow_ephemeral_gateway_admission_for_tests = True
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
     )
@@ -413,6 +414,7 @@ async def test_session_hygiene_preserves_transcript_when_in_place_configured_but
 
     adapter = HygieneCaptureAdapter()
     runner = object.__new__(GatewayRunner)
+    runner._allow_ephemeral_gateway_admission_for_tests = True
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
     )
@@ -547,6 +549,7 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
 
     adapter = HygieneCaptureAdapter()
     runner = object.__new__(GatewayRunner)
+    runner._allow_ephemeral_gateway_admission_for_tests = True
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
     )
@@ -570,6 +573,7 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     runner._pending_messages = {}
     runner._pending_approvals = {}
     runner._session_db = SimpleNamespace(_db=fake_db)
+    runner._allow_ephemeral_gateway_admission_for_tests = True
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
     runner._run_agent = AsyncMock(
@@ -740,6 +744,7 @@ async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
     runner._pending_messages = {}
     runner._pending_approvals = {}
     runner._session_db = SimpleNamespace(_db=fake_db)
+    runner._allow_ephemeral_gateway_admission_for_tests = True
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
     runner._run_agent = AsyncMock(
@@ -917,6 +922,7 @@ async def test_session_hygiene_idle_timeout_still_takes_failure_path(
     runner._pending_messages = {}
     runner._pending_approvals = {}
     runner._session_db = SimpleNamespace(_db=fake_db)
+    runner._allow_ephemeral_gateway_admission_for_tests = True
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
     runner._run_agent = AsyncMock(
@@ -1049,6 +1055,7 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
 
     adapter = HygieneCaptureAdapter()
     runner = object.__new__(GatewayRunner)
+    runner._allow_ephemeral_gateway_admission_for_tests = True
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
     )
@@ -1183,6 +1190,7 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
 
     adapter = HygieneCaptureAdapter()
     runner = object.__new__(GatewayRunner)
+    runner._allow_ephemeral_gateway_admission_for_tests = True
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
     )
@@ -1276,6 +1284,7 @@ def _make_progress_runner(monkeypatch, tmp_path, agent_cls, cfg_text):
 
     adapter = HygieneCaptureAdapter()
     runner = object.__new__(GatewayRunner)
+    runner._allow_ephemeral_gateway_admission_for_tests = True
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
     )
@@ -1364,6 +1373,7 @@ def _make_cooldown_runner(monkeypatch, tmp_path, agent_cls, session_db, session_
 
     adapter = HygieneCaptureAdapter()
     runner = object.__new__(GatewayRunner)
+    runner._allow_ephemeral_gateway_admission_for_tests = True
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
     )

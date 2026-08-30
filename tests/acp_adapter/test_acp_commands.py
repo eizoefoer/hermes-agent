@@ -6,6 +6,7 @@ from acp.schema import TextContentBlock
 
 from acp_adapter.server import HermesACPAgent
 from acp_adapter.session import SessionManager
+from hermes_state import SessionDB
 
 
 class FakeAgent:
@@ -121,8 +122,22 @@ def test_acp_real_agent_gets_session_db_for_recall(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_acp_steer_slash_command_injects_into_running_agent():
-    acp_agent, state, fake, _conn = make_agent_and_state()
+async def test_acp_steer_slash_command_injects_into_running_agent(tmp_path):
+    fake = FakeAgent()
+    db = SessionDB(tmp_path / "state.db")
+    manager = SessionManager(agent_factory=lambda **kwargs: fake, db=db)
+    acp_agent = HermesACPAgent(session_manager=manager)
+    state = manager.create_session(cwd=".")
+    acp_agent.on_connect(CaptureConn())
+    owner = db.admit_session_event(
+        session_id=state.session_id,
+        session_key=state.session_id,
+        source_identity="acp:active-owner",
+        event_type="acp-prompt",
+    )
+    assert db.claim_logical_turn(
+        owner["logical_turn_id"], owner="active-acp"
+    )["outcome"] == "claimed"
     state.is_running = True
 
     response = await acp_agent.prompt(
@@ -131,7 +146,7 @@ async def test_acp_steer_slash_command_injects_into_running_agent():
     )
 
     assert response.stop_reason == "end_turn"
-    assert fake.steers == ["prefer the simpler fix"]
+    assert fake.redirects == ["prefer the simpler fix"]
     assert fake.runs == []
 
 
@@ -161,7 +176,6 @@ async def test_acp_cancel_publishes_hard_stop_while_holding_runtime_lock():
     assert observed["lock_held"] is True
     assert state.cancel_event.is_set()
     assert state.interrupted_prompt_text == "original request"
-
 
 
 

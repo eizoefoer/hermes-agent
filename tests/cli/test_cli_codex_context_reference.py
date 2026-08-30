@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 
-def test_at_context_resolution_passes_active_provider():
+def test_at_context_resolution_passes_active_provider(tmp_path):
     """The CLI @-reference path must preserve the active Codex provider."""
     from cli import HermesCLI
 
@@ -14,6 +14,11 @@ def test_at_context_resolution_passes_active_provider():
     cli.api_key = "token"
     cli.provider = "openai-codex"
     cli.agent = SimpleNamespace(_config_context_length=None)
+    from hermes_state import SessionDB
+
+    cli.session_id = "cli-context-test"
+    cli._session_db = SessionDB(tmp_path / "state.db")
+    cli._session_db.create_session(cli.session_id, "cli")
     cli._active_agent_route_signature = "route"
     cli._secret_capture_callback = lambda *_args, **_kwargs: None
     cli._last_turn_interrupted = False
@@ -39,6 +44,10 @@ def test_at_context_resolution_passes_active_provider():
         result = cli.chat("inspect @file:example.py")
 
     assert result == "blocked for test"
+    turns = cli._session_db.list_session_logical_turns(cli.session_id)
+    assert len(turns) == 1
+    assert turns[0]["state"] == "unrecoverable"
+    assert "blocked for test" in (turns[0].get("error") or "")
     mock_context.assert_called_once_with(
         "gpt-5.6-terra",
         base_url="https://chatgpt.com/backend-api/codex",

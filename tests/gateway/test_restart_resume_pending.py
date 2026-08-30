@@ -845,7 +845,7 @@ class TestStuckLoopEscalation:
         # Simulate counter already at threshold (3 consecutive interrupted
         # restarts).  _suspend_stuck_loop_sessions will flip suspended=True.
         counts_file = tmp_path / ".restart_failure_counts"
-        counts_file.write_text(json.dumps({entry.session_key: 3}))
+        counts_file.write_text(json.dumps({entry.session_key: 3}), encoding="utf-8")
 
         monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
         runner = object.__new__(GatewayRunner)
@@ -973,6 +973,7 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
     runner._active_session_leases = {}
     runner._busy_ack_ts = {}
     runner._post_turn_goal_continuation = AsyncMock()
+    runner._allow_ephemeral_gateway_admission_for_tests = True
     runner.session_store.get_or_create_session.return_value = None
 
     # Count how many times an actual agent run is started for this session.
@@ -1164,5 +1165,3 @@ async def test_startup_boot_sends_still_run_when_they_finish_quickly(monkeypatch
     runner._send_restart_notification.assert_awaited_once()
     runner._claim_pending_obligations.assert_awaited_once()
     runner._redeliver_claimed_obligations.assert_awaited_once()
-
-

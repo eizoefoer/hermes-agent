@@ -22,6 +22,27 @@ from tools import approval as approval_module
 
 
 class _DummySessionDB:
+    def ensure_session(self, *args, **kwargs):
+        pass
+
+    def admit_session_event(self, **kwargs):
+        return {"logical_turn_id": "cron-turn"}
+
+    def claim_logical_turn(self, *args, **kwargs):
+        return {"outcome": "claimed", "attempt_id": "cron-attempt"}
+
+    def mark_logical_turn_started(self, *args, **kwargs):
+        return True
+
+    def heartbeat_logical_turn(self, *args, **kwargs):
+        return True
+
+    def complete_logical_turn(self, *args, **kwargs):
+        pass
+
+    def fail_logical_turn(self, *args, **kwargs):
+        pass
+
     def set_session_title(self, *args, **kwargs):
         pass
 

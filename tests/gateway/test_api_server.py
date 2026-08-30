@@ -357,7 +357,7 @@ def auth_adapter():
 
 class TestAgentExecution:
     @pytest.mark.asyncio
-    async def test_run_agent_uses_session_id_as_task_id(self, adapter):
+    async def test_run_agent_keeps_ordinary_session_task_correlation_empty(self, adapter):
         mock_agent = MagicMock()
         mock_agent.run_conversation.return_value = {"final_response": "ok"}
         mock_agent.session_prompt_tokens = 1
@@ -389,8 +389,90 @@ class TestAgentExecution:
         mock_agent.run_conversation.assert_called_once_with(
             user_message="hello",
             conversation_history=[],
-            task_id="session-123",
+            task_id=None,
         )
+        db = adapter._ensure_session_db()
+        turns = db.list_session_logical_turns("session-123")
+        assert len(turns) == 1
+        assert turns[0]["state"] == "completed"
+        assert turns[0]["task_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_api_replay_key_reuses_completed_logical_turn(self, adapter):
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "once"}
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            first = await adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="session-replay",
+                logical_turn_source_identity="api:test:replay-1",
+            )
+            replay = await adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="session-replay",
+                logical_turn_source_identity="api:test:replay-1",
+            )
+
+        assert first == replay
+        assert mock_agent.run_conversation.call_count == 1
+        assert adapter._ensure_session_db().count_logical_turns("session-replay") == 1
+
+    @pytest.mark.asyncio
+    async def test_api_valid_durable_owner_queues_competing_turn(self, adapter):
+        db = adapter._ensure_session_db()
+        db.create_session("session-busy", "api_server")
+        owner = db.admit_session_event(
+            session_id="session-busy",
+            session_key="session-busy",
+            source_identity="api:test:owner",
+            event_type="api-session-turn",
+        )
+        claim = db.claim_logical_turn(owner["logical_turn_id"], owner="other-process")
+        assert claim["outcome"] == "claimed"
+
+        with pytest.raises(RuntimeError, match="durably queued"):
+            await adapter._run_agent(
+                user_message="wait",
+                conversation_history=[],
+                session_id="session-busy",
+                logical_turn_source_identity="api:test:queued",
+            )
+
+        turns = db.list_session_logical_turns("session-busy")
+        assert [turn["state"] for turn in turns] == ["claimed", "queued"]
+
+    @pytest.mark.asyncio
+    async def test_api_startup_drain_rehydrates_queued_turn(self, adapter):
+        db = adapter._ensure_session_db()
+        db.create_session("session-recover", "api_server")
+        turn = db.admit_session_event(
+            session_id="session-recover",
+            session_key="session-recover",
+            source_identity="api:test:recover",
+            event_type="api-session-chat",
+            payload={
+                "user_message": "survive",
+                "conversation_history": [],
+            },
+        )
+        recovered = []
+
+        async def _capture(row):
+            recovered.append(row)
+
+        with patch.object(adapter, "_recover_api_logical_turn", side_effect=_capture):
+            assert await adapter._drain_api_logical_turns() == 1
+            await asyncio.gather(*list(adapter._background_tasks))
+
+        assert [row["logical_turn_id"] for row in recovered] == [
+            turn["logical_turn_id"]
+        ]
 
     @pytest.mark.asyncio
     async def test_run_agent_sets_and_clears_process_ownership_markers(self, adapter):
@@ -421,7 +503,11 @@ class TestAgentExecution:
                 model_options={"reasoning": {"enabled": False}, "fast": False},
             )
 
-        assert captured["task_id"] == "session-456"
+        turns = adapter._ensure_session_db().list_session_logical_turns("session-456")
+        assert len(turns) == 1
+        # Process cleanup is scoped by the durable logical execution, not by
+        # fabricating task identity from the conversation session.
+        assert captured["task_id"] == turns[0]["logical_turn_id"]
         assert isinstance(captured["baseline"], frozenset)
         # Turn completed normally — markers must be cleared so a disconnect
         # arriving after this point can't reap work this turn left running.

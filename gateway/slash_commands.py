@@ -3622,27 +3622,32 @@ class GatewaySlashCommandsMixin:
             return t("gateway.background.usage")
 
         source = event.source
-        task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
-
         event_message_id = self._reply_anchor_for_event(event)
 
         # Forward image/audio attachments so the background agent can see them.
         media_urls = list(event.media_urls) if event.media_urls else []
         media_types = list(event.media_types) if event.media_types else []
 
-        # Fire-and-forget the background task
-        _task = asyncio.create_task(
-            self._run_background_task(
-                prompt,
-                source,
-                task_id,
-                event_message_id=event_message_id,
-                media_urls=media_urls,
-                media_types=media_types,
-            )
+        # Persist the independent child session and its first logical turn
+        # before returning success for the parent slash-command turn.  The
+        # child identity is derived from the accepted command occurrence, so
+        # replay after a crash cannot mint another background job.
+        child = await self._admit_gateway_background_task(
+            event,
+            prompt,
+            event_message_id=event_message_id,
+            media_urls=media_urls,
+            media_types=media_types,
         )
-        self._background_tasks.add(_task)
-        _task.add_done_callback(self._background_tasks.discard)
+        task_id = child["task_id"]
+        child_turn = child["turn"]
+        if child_turn.get("state") not in {
+            "completed",
+            "unrecoverable",
+            "cancelled",
+            "blocked",
+        }:
+            self._launch_gateway_background_turn(child_turn)
 
         preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
         return t("gateway.background.started", preview=preview, task_id=task_id)

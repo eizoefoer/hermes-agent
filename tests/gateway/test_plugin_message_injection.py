@@ -113,6 +113,7 @@ async def test_plugin_context_routes_through_live_gateway_to_existing_session(
     runner._background_tasks = set()
     runner._queued_events = {}
     runner._is_user_authorized = MagicMock(return_value=True)
+    runner._persist_busy_gateway_event = AsyncMock(return_value=True)
     adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
 
     manager = PluginManager()
