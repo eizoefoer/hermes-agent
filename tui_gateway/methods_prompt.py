@@ -814,9 +814,25 @@ def _(rid, params: dict) -> dict:
         session["last_active"] = time.time()
         _start_inflight_turn(session, text)
 
+    isolated_admission = None
     if turn_isolation:
+        try:
+            _ensure_session_db_row(session)
+            isolated_admission = _admit_tui_turn(
+                sid, session, text, event_type="tui-prompt", claim=False
+            )
+        except Exception as exc:
+            with session["history_lock"]:
+                session["running"] = False
+                _clear_inflight_turn(session)
+            return _err(rid, 5071, f"durable TUI admission failed: {exc}")
         isolated_response = _submit_prompt_to_compute_host(
-            rid, sid, session, text, display_kind=display_kind
+            rid,
+            sid,
+            session,
+            text,
+            display_kind=display_kind,
+            logical_turn_id=isolated_admission["logical_turn_id"],
         )
         if not isolated_response.get("error"):
             if survivor_user_row_ids is not None and requested_rebind_ids is None:
@@ -862,6 +878,28 @@ def _(rid, params: dict) -> dict:
             5071,
             f"session storage could not be written: {exc}",
         )
+    # Durable acceptance precedes deferred agent construction.  A process
+    # replacement during the build wait can therefore recover this exact
+    # logical request instead of losing an in-memory-only prompt.
+    logical_turn_claim = _admit_tui_turn(
+        sid,
+        session,
+        text,
+        logical_turn_id=(isolated_admission or {}).get("logical_turn_id"),
+    )
+    if logical_turn_claim.get("outcome") not in {"claimed", "unmanaged"}:
+        with session["history_lock"]:
+            session["running"] = False
+            _clear_inflight_turn(session)
+        if logical_turn_claim.get("outcome") in {"busy", "queued"}:
+            return _ok(
+                rid,
+                {
+                    "status": "queued",
+                    "logical_turn_id": logical_turn_claim.get("logical_turn_id"),
+                },
+            )
+        return _err(rid, 4091, "durable TUI turn admission failed")
     _start_agent_build(sid, session)
 
     def run_after_agent_ready() -> None:
@@ -887,6 +925,11 @@ def _(rid, params: dict) -> dict:
                 session["running"] = False
                 session["last_active"] = time.time()
             _emit("session.info", sid, _session_info(session.get("agent"), session))
+            _finish_tui_turn(
+                session,
+                logical_turn_claim,
+                {"failed": True, "error": (err.get("error") or {}).get("message", "agent initialization failed")},
+            )
             return
         with session["history_lock"]:
             if session.get("_turn_cancel_requested") or not session.get("running"):
@@ -907,8 +950,20 @@ def _(rid, params: dict) -> dict:
                         else "Session no longer running before the agent was ready"
                     },
                 )
+                _finish_tui_turn(
+                    session,
+                    logical_turn_claim,
+                    {"failed": True, "error": "turn cancelled before agent was ready"},
+                )
                 return
-        _run_prompt_submit(rid, sid, session, text, display_kind=display_kind)
+        _run_prompt_submit(
+            rid,
+            sid,
+            session,
+            text,
+            display_kind=display_kind,
+            logical_turn_claim=logical_turn_claim,
+        )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck
@@ -1326,12 +1381,51 @@ def _(rid, params: dict) -> dict:
     text, parent = params.get("text", ""), params.get("session_id", "")
     if not text:
         return _err(rid, 4012, "text required")
-    task_id = f"bg_{uuid.uuid4().hex[:6]}"
+    parent_occurrence = str(
+        params.get("event_id") or params.get("occurrence_id") or rid
+    )
+    child_source = f"tui:background-child:{parent}:{parent_occurrence}"
+    task_id = f"bg_{uuid.uuid5(uuid.NAMESPACE_URL, child_source).hex[:20]}"
+    child_session = {
+        "session_key": task_id,
+        "profile_home": session.get("profile_home"),
+        "cwd": _session_cwd(session),
+    }
+    child_claim = _admit_tui_turn(
+        task_id,
+        child_session,
+        text,
+        event_type="tui-background-child",
+        source_identity=child_source,
+        task_id=task_id,
+        payload={
+            "parent_session_id": session.get("session_key") or parent,
+            "parent_ui_session_id": parent,
+            "background_task_id": task_id,
+        },
+    )
+    if child_claim.get("outcome") == "terminal":
+        return _ok(rid, {"task_id": task_id, "replayed": True})
+    if child_claim.get("outcome") not in {"claimed", "unmanaged"}:
+        return _ok(
+            rid,
+            {
+                "task_id": task_id,
+                "status": "queued",
+                "logical_turn_id": child_claim.get("logical_turn_id"),
+            },
+        )
 
     def run():
         session_tokens = _set_session_context(task_id, cwd=_session_cwd(session))
         try:
             from run_agent import AIAgent
+            from hermes_state import bind_preacquired_logical_turn_lease
+
+            if child_claim.get("lease"):
+                bind_preacquired_logical_turn_lease(
+                    task_id, child_claim["lease"]
+                )
 
             # Bug #50233: ephemeral agent threads don't inherit the session's
             # HERMES_HOME override (the ContextVar set on the session-create
@@ -1352,6 +1446,12 @@ def _(rid, params: dict) -> dict:
                     user_message=text,
                     task_id=task_id,
                 )
+                _finish_tui_turn(
+                    child_session,
+                    child_claim,
+                    result,
+                    delivery_succeeded=True,
+                )
             finally:
                 if home_token is not None:
                     reset_hermes_home_override(home_token)
@@ -1368,6 +1468,11 @@ def _(rid, params: dict) -> dict:
                 },
             )
         except Exception as e:
+            _finish_tui_turn(
+                child_session,
+                child_claim,
+                {"failed": True, "error": str(e)},
+            )
             _emit(
                 "background.complete",
                 parent,

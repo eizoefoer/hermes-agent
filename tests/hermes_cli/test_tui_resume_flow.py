@@ -153,7 +153,40 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
     from hermes_cli.oneshot import _run_agent
 
     captured = {}
-    sentinel_db = object()
+    class SentinelDB:
+        def reconcile_logical_turns(self):
+            return 0
+
+        def get_session(self, session_id):
+            return {"id": session_id}
+
+        def create_session(self, *_args, **_kwargs):
+            raise AssertionError("fixture session should already exist")
+
+        def admit_session_event(self, **kwargs):
+            captured["admission"] = kwargs
+            return {"logical_turn_id": "turn-1"}
+
+        def claim_logical_turn(self, *_args, **_kwargs):
+            return {"outcome": "claimed", "attempt_id": "attempt-1"}
+
+        def mark_logical_turn_started(self, logical_turn_id, attempt_id):
+            captured["started"] = (logical_turn_id, attempt_id)
+            return True
+
+        def complete_logical_turn(self, logical_turn_id, attempt_id, result, **_kwargs):
+            captured["completed"] = (logical_turn_id, attempt_id, result)
+
+        def get_logical_turn(self, *_args, **_kwargs):
+            return {"state": "completed"}
+
+        def fail_logical_turn(self, *_args, **_kwargs):
+            raise AssertionError("successful fixture must not fail")
+
+        def close(self):
+            return None
+
+    sentinel_db = SentinelDB()
 
     class FakeAgent:
         def __init__(self, **kwargs):
@@ -214,6 +247,9 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
     assert captured["session_db"] is sentinel_db
     assert captured["enabled_toolsets"] == ["session_search"]
     assert captured["prompt"] == "recall this"
+    assert captured["admission"]["event_type"] == "cli-oneshot"
+    assert captured["started"] == ("turn-1", "attempt-1")
+    assert captured["completed"][2]["agent_result"]["final_response"] == "ok"
 
 
 def test_launch_tui_exports_model_provider_and_toolsets(monkeypatch, main_mod):
@@ -282,7 +318,6 @@ def test_make_tui_argv_dev_prebuilds_hermes_ink(monkeypatch, main_mod, tmp_path)
     assert argv == [str(tsx), "src/entry.tsx"]
     assert cwd == tui_dir
     assert calls == [(["/usr/bin/npm", "run", "build"], str(ink_dir))]
-
 
 
 

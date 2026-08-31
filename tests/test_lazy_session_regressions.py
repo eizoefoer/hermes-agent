@@ -194,6 +194,7 @@ class TestPendingTitleValueError:
 
     def test_valueerror_clears_pending_title(self, monkeypatch):
         """ValueError from set_session_title should drop pending_title."""
+        monkeypatch.setenv("HERMES_TUI_TEST_EPHEMERAL", "1")
         from tui_gateway import server
 
         mock_db = MagicMock()
@@ -364,7 +365,6 @@ class TestFinalizeOrphanedCompressionSessions:
         session = db.get_session("ghost-cont")
         assert session["ended_at"] is not None
         assert session["end_reason"] == "orphaned_compression"
-
 
 
 

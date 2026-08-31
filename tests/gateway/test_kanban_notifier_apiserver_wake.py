@@ -111,8 +111,12 @@ def test_apiserver_sub_wakes_subscription_destination_via_self_post(tmp_path, mo
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
-        posts.append({"text": text, "session_id": session_id})
+    async def fake_self_post(adapter, *, text, session_id, idempotency_key):
+        posts.append({
+            "text": text,
+            "session_id": session_id,
+            "idempotency_key": idempotency_key,
+        })
 
     import gateway.wake as wake_mod
 
@@ -127,6 +131,7 @@ def test_apiserver_sub_wakes_subscription_destination_via_self_post(tmp_path, mo
     )
     assert len(posts) == 1
     assert posts[0]["session_id"] == "origin-session"
+    assert posts[0]["idempotency_key"].startswith("hermes-wake:source:kanban-wake:")
     assert all(post["session_id"] != "worker-session" for post in posts)
     wake_text = posts[0]["text"]
     assert tid in wake_text
@@ -168,8 +173,12 @@ def test_apiserver_subscriptions_have_independent_wake_destinations(
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
-        posts.append({"text": text, "session_id": session_id})
+    async def fake_self_post(adapter, *, text, session_id, idempotency_key):
+        posts.append({
+            "text": text,
+            "session_id": session_id,
+            "idempotency_key": idempotency_key,
+        })
 
     import gateway.wake as wake_mod
 
@@ -193,8 +202,13 @@ def test_apiserver_wake_failure_rewinds_then_retries_destination(
     )
     attempted_sessions = []
 
-    async def fail_once_then_succeed(adapter, *, text, session_id):
+    attempted_identities = []
+
+    async def fail_once_then_succeed(
+        adapter, *, text, session_id, idempotency_key
+    ):
         attempted_sessions.append(session_id)
+        attempted_identities.append(idempotency_key)
         if len(attempted_sessions) == 1:
             raise RuntimeError("simulated wake failure")
 
@@ -214,6 +228,45 @@ def test_apiserver_wake_failure_rewinds_then_retries_destination(
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert attempted_sessions == ["origin-session", "origin-session"]
+    assert len(set(attempted_identities)) == 1
     assert "worker-session" not in attempted_sessions
     assert _unseen_terminal_events(tid, "api_server", "origin-session") == []
 
+
+def test_apiserver_distinct_identical_wakes_use_distinct_durable_cursors(
+    tmp_path, monkeypatch,
+):
+    """The same rendered wake on the next Kanban event is independent work."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "apiserver-cursors.db"))
+    kb.init_db()
+    tid = _create_completed_subscription("api_server", "origin-session")
+    posts = []
+
+    async def fake_self_post(adapter, *, text, session_id, idempotency_key):
+        posts.append((text, idempotency_key))
+
+    import gateway.wake as wake_mod
+
+    monkeypatch.setattr(wake_mod, "_self_post_chat_completion", fake_self_post)
+    runner = _make_runner({Platform.API_SERVER: ApiServerLikeAdapter()})
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    conn = kb.connect()
+    try:
+        # A second durable terminal occurrence with the same payload produces
+        # the same rendered text but a new immutable event cursor.
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'completed', ?, 1)",
+            (tid, '{"summary":"done once"}'),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(posts) == 2
+    assert posts[0][0] == posts[1][0]
+    assert posts[0][1] != posts[1][1]

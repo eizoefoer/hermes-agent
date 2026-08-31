@@ -71,6 +71,7 @@ def _make_runner(session_entry: SessionEntry, *, platform: Platform = Platform.T
     runner._send_voice_reply = AsyncMock()
     runner._capture_gateway_honcho_if_configured = lambda *args, **kwargs: None
     runner._emit_gateway_run_progress = AsyncMock()
+    runner._allow_ephemeral_gateway_admission_for_tests = True
     return runner
 
 

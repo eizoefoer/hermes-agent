@@ -127,7 +127,7 @@ class TestDoctorToolAvailabilitySummary:
 
 class TestDoctorEnvFileEncoding:
     """Regression for #18637 (bug 3): `hermes doctor` crashed on Windows
-    Chinese locale (GBK) because `.env` was read with Path.read_text() which
+    Chinese locale (GBK) because `.env` was read with Path.read_text(encoding="utf-8") which
     defaults to the system locale encoding, not UTF-8."""
 
     def test_doctor_reads_env_as_utf8_even_when_locale_is_not_utf8(
@@ -254,6 +254,7 @@ def test_doctor_reports_vercel_backend_diagnostics(monkeypatch, tmp_path):
     monkeypatch.setenv("VERCEL_TOKEN", "super-secret-value")
     monkeypatch.delenv("VERCEL_PROJECT_ID", raising=False)
     monkeypatch.setenv("VERCEL_TEAM_ID", "team")
+    monkeypatch.setattr("hermes_constants.is_container", lambda: False)
     monkeypatch.setattr(doctor_mod.importlib.util, "find_spec", lambda name: object() if name == "vercel" else None)
 
     fake_model_tools = types.SimpleNamespace(
@@ -291,7 +292,7 @@ class TestDoctorMemoryProviderSection:
         home.mkdir(parents=True, exist_ok=True)
         import yaml
         config = {"memory": {"provider": provider}} if provider else {"memory": {}}
-        (home / "config.yaml").write_text(yaml.dump(config))
+        (home / "config.yaml").write_text(yaml.dump(config), encoding="utf-8")
         return home
 
     def _run_doctor_and_capture(self, monkeypatch, tmp_path, provider=""):

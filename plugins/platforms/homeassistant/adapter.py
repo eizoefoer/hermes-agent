@@ -335,11 +335,20 @@ class HomeAssistantAdapter(BasePlatformAdapter):
             user_name="Home Assistant",
         )
 
+        context = event.get("context") or {}
+        context_id = str(context.get("id") or "").strip()
         msg_event = MessageEvent(
             text=message,
             message_type=MessageType.TEXT,
             source=source,
-            message_id=f"ha_{entity_id}_{int(now)}",
+            # Home Assistant context IDs are authoritative event identities.
+            # If an installation omits one, gateway acceptance persists the
+            # fresh MessageEvent occurrence; entity + wall-clock seconds can
+            # collapse two legitimate state transitions and is not a replay
+            # key.
+            message_id=None,
+            session_event_id=(f"homeassistant:{context_id}" if context_id else None),
+            session_event_type="gateway-inbound",
             timestamp=datetime.now(),
         )
 

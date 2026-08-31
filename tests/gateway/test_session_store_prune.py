@@ -35,6 +35,11 @@ def test_session_store_default_db_uses_runtime_hermes_home(tmp_path, monkeypatch
     fake_home = tmp_path / "alt_hermes_home"
     fake_home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_home))
+    from hermes_constants import set_hermes_home_override
+    import hermes_state
+
+    set_hermes_home_override(None)
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", fake_home / "state.db")
 
     with patch("gateway.session.SessionStore._ensure_loaded"):
         store = SessionStore(sessions_dir=tmp_path / "sessions", config=config)
@@ -201,12 +206,12 @@ class TestPrunePersistsToDisk:
 
         # Verify pre-prune state on disk. Filter out metadata sentinels
         # (e.g. the "_README" note) so we assert on session keys only.
-        saved_pre = json.loads((tmp_path / "sessions.json").read_text())
+        saved_pre = json.loads((tmp_path / "sessions.json").read_text(encoding="utf-8"))
         assert {k for k in saved_pre if not k.startswith("_")} == {"stale", "fresh"}
 
         # Prune and check disk.
         store.prune_old_entries(max_age_days=90)
-        saved_post = json.loads((tmp_path / "sessions.json").read_text())
+        saved_post = json.loads((tmp_path / "sessions.json").read_text(encoding="utf-8"))
         assert {k for k in saved_post if not k.startswith("_")} == {"fresh"}
 
 
@@ -251,11 +256,10 @@ class TestReadmeSentinel:
         )
         store._save()
 
-        raw = json.loads((tmp_path / "sessions.json").read_text())
+        raw = json.loads((tmp_path / "sessions.json").read_text(encoding="utf-8"))
         assert "_README" in raw
         # Sentinel renders first so it's the first thing a user sees on `cat`.
         assert next(iter(raw)) == "_README"
         # The note points users at the real store and command.
         assert "state.db" in raw["_README"]
         assert "hermes sessions list" in raw["_README"]
-

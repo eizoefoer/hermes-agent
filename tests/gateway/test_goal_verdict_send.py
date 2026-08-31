@@ -75,6 +75,7 @@ def _make_runner_with_adapter(session_id: str = None):
     import uuid
 
     runner = object.__new__(GatewayRunner)
+    runner._allow_ephemeral_gateway_admission_for_tests = True
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")},
     )
@@ -172,5 +173,4 @@ async def test_goal_verdict_budget_exhausted_sends_pause(hermes_home):
     assert "turns used" in content.lower()
     # No continuation enqueued when budget is exhausted
     assert not adapter._pending_messages
-
 

@@ -935,6 +935,149 @@ class SessionSchemaMixin:
         finally:
             cursor.execute("PRAGMA foreign_keys=ON")
 
+    def _heal_session_turn_lease_shape(self, cursor: sqlite3.Cursor) -> None:
+        """Convert the Phase 1 legacy lease table to the current-line shape.
+
+        The production overlay added ``session_id`` and a NOT NULL ``turn_id``
+        to ``session_turn_leases`` while current upstream keys the table only
+        by the compression-lineage ``conversation_id``.  Declarative column
+        reconciliation cannot remove the legacy NOT NULL column, so current
+        writers would otherwise fail when they omit ``turn_id``.  Rebuild the
+        table once, retaining the longest-lived lease for each current
+        conversation root.  PID liveness is deliberately irrelevant here:
+        an unexpired migrated lease remains authoritative.
+        """
+        try:
+            columns = cursor.execute(
+                'PRAGMA table_info("session_turn_leases")'
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return
+        if not columns:
+            return
+
+        def _col(row, idx, name):
+            return row[idx] if isinstance(row, (tuple, list)) else row[name]
+
+        names = {_col(row, 1, "name") for row in columns}
+        if "turn_id" not in names and "session_id" not in names:
+            return
+
+        logger.info(
+            "session_turn_leases has Phase 1 legacy columns %r; rebuilding "
+            "with current conversation ownership shape",
+            sorted(names),
+        )
+        rows = cursor.execute("SELECT * FROM session_turn_leases").fetchall()
+        cursor.execute("SAVEPOINT heal_session_turn_lease_shape")
+        try:
+            cursor.execute(
+                "ALTER TABLE session_turn_leases "
+                "RENAME TO session_turn_leases_phase1_legacy"
+            )
+            cursor.execute(
+                """CREATE TABLE session_turn_leases (
+    conversation_id TEXT PRIMARY KEY,
+    holder TEXT NOT NULL,
+    acquired_at REAL NOT NULL,
+    expires_at REAL NOT NULL
+)"""
+            )
+
+            # Sort oldest/shortest first so INSERT OR REPLACE leaves the
+            # lease with the greatest expiry for a shared conversation root.
+            ordered = sorted(
+                rows,
+                key=lambda row: (
+                    float(row["expires_at"]),
+                    float(row["acquired_at"]),
+                    str(row["holder"]),
+                ),
+            )
+            migrated = []
+            for row in ordered:
+                seed = None
+                if "conversation_id" in names:
+                    seed = row["conversation_id"]
+                if not seed and "session_id" in names:
+                    seed = row["session_id"]
+                if not seed:
+                    logger.warning(
+                        "dropping malformed legacy session turn lease without "
+                        "conversation/session identity (holder=%r)",
+                        row["holder"],
+                    )
+                    continue
+                conversation_id = self._session_turn_lease_key_on_conn(
+                    cursor.connection, str(seed)
+                )
+                cursor.execute(
+                    "INSERT OR REPLACE INTO session_turn_leases "
+                    "(conversation_id, holder, acquired_at, expires_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        conversation_id,
+                        row["holder"],
+                        row["acquired_at"],
+                        row["expires_at"],
+                    ),
+                )
+                migrated.append((conversation_id, row))
+
+            # The old logical-turn table did not carry the current-line lease
+            # key. Preserve active attempt correlation while the table shape
+            # is still available to us.
+            logical_tables = cursor.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='logical_turns'"
+            ).fetchone()
+            if logical_tables:
+                for conversation_id, row in migrated:
+                    legacy_turn_id = row["turn_id"] if "turn_id" in names else None
+                    if legacy_turn_id:
+                        cursor.execute(
+                            "UPDATE logical_turns SET lease_conversation_id = ? "
+                            "WHERE current_attempt_id = ? AND lease_holder = ?",
+                            (conversation_id, legacy_turn_id, row["holder"]),
+                        )
+                    else:
+                        cursor.execute(
+                            "UPDATE logical_turns SET lease_conversation_id = ? "
+                            "WHERE lease_holder = ?",
+                            (conversation_id, row["holder"]),
+                        )
+
+            cursor.execute("DROP TABLE session_turn_leases_phase1_legacy")
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_session_turn_leases_expires "
+                "ON session_turn_leases(expires_at)"
+            )
+            cursor.execute("RELEASE SAVEPOINT heal_session_turn_lease_shape")
+        except Exception:
+            cursor.execute("ROLLBACK TO SAVEPOINT heal_session_turn_lease_shape")
+            cursor.execute("RELEASE SAVEPOINT heal_session_turn_lease_shape")
+            raise
+
+    def _backfill_logical_turn_lease_keys(self, cursor: sqlite3.Cursor) -> None:
+        """Populate current conversation keys on pre-forward-port turn rows."""
+        try:
+            session_ids = cursor.execute(
+                "SELECT DISTINCT session_id FROM logical_turns "
+                "WHERE lease_conversation_id IS NULL"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return
+        for row in session_ids:
+            session_id = row[0] if isinstance(row, (tuple, list)) else row["session_id"]
+            conversation_id = self._session_turn_lease_key_on_conn(
+                cursor.connection, str(session_id)
+            )
+            cursor.execute(
+                "UPDATE logical_turns SET lease_conversation_id = ? "
+                "WHERE session_id = ? AND lease_conversation_id IS NULL",
+                (conversation_id, session_id),
+            )
+
     def _init_schema(self):
         """Create tables and FTS if they don't exist, reconcile columns.
 
@@ -969,6 +1112,14 @@ class SessionSchemaMixin:
         # landed — the version-gated rebuild is unreachable there, #73823).
         # Same PK-rebuild constraint as gateway_routing above.
         self._heal_session_model_usage_pk(cursor)
+
+        # The independently verified Phase 1 overlay used a wider lease table
+        # than current upstream. Production snapshots can therefore carry a
+        # NOT NULL turn_id column that current writers do not provide. Convert
+        # that shape and correlate existing logical turns before any runtime
+        # admission occurs.
+        self._heal_session_turn_lease_shape(cursor)
+        self._backfill_logical_turn_lease_keys(cursor)
 
         # Indexes that reference reconciler-added columns must be created
         # AFTER _reconcile_columns runs — declaring them in SCHEMA_SQL

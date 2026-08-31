@@ -165,6 +165,7 @@ def _make_runner(session_db=None):
     runner._clear_session_boundary_security_state = MagicMock()
     runner._set_session_reasoning_override = MagicMock()
     runner._format_session_info = MagicMock(return_value="")
+    runner._allow_ephemeral_gateway_admission_for_tests = True
     return runner
 
 
@@ -829,4 +830,3 @@ def test_get_telegram_topic_binding_by_session_returns_binding(tmp_path):
 # ---------------------------------------------------------------------------
 # Test for session-split thread_id recovery (issue #27166)
 # ---------------------------------------------------------------------------
-

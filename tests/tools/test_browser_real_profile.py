@@ -9,7 +9,7 @@ are limited to OS detection and process launch.
 import json
 import os
 import ntpath
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, mock_open, patch
 
 import pytest
 
@@ -906,13 +906,16 @@ class TestReviewRound3:
         with patch.object(bt, "_use_real_profile", return_value=True), \
              patch.object(bt, "_using_lightpanda_engine", return_value=False), \
              patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
+             patch("hermes_cli.browser_connect.chromium_executable", return_value="/usr/bin/chrome"), \
              patch("hermes_cli.browser_connect.real_profile_copy_dir", return_value=str(tmp_path)), \
              patch("hermes_cli.browser_connect.snapshot_real_profile",
                    return_value=(str(tmp_path), None)) as snap, \
              patch.object(bt, "_agent_browser_get_cdp",
                           side_effect=[None, "http://127.0.0.1:9251"]), \
              patch.object(bt, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
+             patch.object(bt.subprocess, "Popen", return_value=Mock(poll=Mock(return_value=None))), \
              patch.object(bt.subprocess, "run", return_value=proc), \
+             patch("builtins.open", mock_open(read_data="9251\n")), \
              patch.object(bt, "_is_headed_mode", return_value=False):
             cdp, err = bt._real_profile_cdp()
         assert err is None

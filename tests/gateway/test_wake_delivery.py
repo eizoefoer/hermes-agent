@@ -78,6 +78,7 @@ def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
     async def handler(request):
         seen["session_id"] = request.headers.get("X-Hermes-Session-Id")
         seen["auth"] = request.headers.get("Authorization")
+        seen["idempotency_key"] = request.headers.get("Idempotency-Key")
         seen["body"] = await request.json()
         return web.json_response({"choices": [{"message": {"content": "ok"}}]})
 
@@ -92,6 +93,7 @@ def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
     asyncio.run(run())
     assert seen["session_id"] == "raw-sid-42"
     assert seen["auth"] == "Bearer sekrit"
+    assert seen["idempotency_key"].startswith("hermes-wake:occurrence:")
     assert seen["body"]["stream"] is False
     assert seen["body"]["messages"] == [
         {"role": "user", "content": "task done — wake"}
@@ -106,9 +108,11 @@ def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
 
     monkeypatch.setattr(wake_mod, "_RETRY_DELAYS_SECONDS", (0.01, 0.01, 0.01))
     calls = {"n": 0}
+    idempotency_keys = []
 
     async def handler(request):
         calls["n"] += 1
+        idempotency_keys.append(request.headers.get("Idempotency-Key"))
         if calls["n"] == 1:
             return web.json_response({"error": "busy"}, status=429)
         return web.json_response({"choices": []})
@@ -123,5 +127,51 @@ def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
 
     asyncio.run(run())
     assert calls["n"] == 2
+    assert len(set(idempotency_keys)) == 1
 
+
+def test_push_wake_preserves_authoritative_source_identity():
+    """A durable producer replay key survives the synthetic event boundary."""
+    adapter = PushAdapter()
+
+    async def run():
+        await deliver_wake(
+            adapter,
+            text="same rendered wake",
+            source=_source(),
+            source_event_id="kanban-wake:cursor-41",
+        )
+        await deliver_wake(
+            adapter,
+            text="same rendered wake",
+            source=_source(),
+            source_event_id="kanban-wake:cursor-42",
+        )
+
+    asyncio.run(run())
+    assert [event.session_event_id for event in adapter.handled] == [
+        "kanban-wake:cursor-41",
+        "kanban-wake:cursor-42",
+    ]
+    assert adapter.handled[0].text == adapter.handled[1].text
+
+
+def test_push_wake_preserves_generated_occurrence_on_replay():
+    adapter = PushAdapter()
+
+    async def run():
+        for _ in range(2):
+            await deliver_wake(
+                adapter,
+                text="same accepted occurrence",
+                source=_source(),
+                occurrence_id="accepted-occurrence-1",
+            )
+
+    asyncio.run(run())
+    assert [event.occurrence_id for event in adapter.handled] == [
+        "accepted-occurrence-1",
+        "accepted-occurrence-1",
+    ]
+    assert all(event.session_event_id is None for event in adapter.handled)
 

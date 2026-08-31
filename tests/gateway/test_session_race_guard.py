@@ -64,6 +64,9 @@ def _make_runner():
     runner.hooks.emit = AsyncMock()
     runner.session_store = MagicMock()
     runner.delivery_router = MagicMock()
+    # Local sentinel/FIFO behavior is isolated here. Cross-process ownership
+    # is covered by real SessionDB logical-turn tests.
+    runner._persist_busy_gateway_event = AsyncMock(return_value=True)
     return runner
 
 
