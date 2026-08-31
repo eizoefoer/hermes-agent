@@ -4,6 +4,10 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 
 **Never give up on the right solution.**
 
+## Mandatory workspace cleanup
+
+Cleanup is part of completion. Put experiments in named Git branches/worktrees and remove terminal phase/test/scratch checkouts only when the exact path is inactive, `git status --porcelain` is empty, and the commit remains on a durable ref; standalone clones require a current remote ref. Never force-remove dirty or active work. Preserve runtime state, evidence, backups, research, secrets, and user documents. Use exact PID/path checks plus `git worktree remove`/`prune`, and report retained exceptions.
+
 ## Development Environment
 
 ```bash
