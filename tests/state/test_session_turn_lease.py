@@ -410,10 +410,10 @@ def test_acquire_turn_lease_reraises_non_lock_sqlite_error(tmp_path, monkeypatch
         )
 
 
-def test_non_expired_turn_lease_from_dead_pid_is_reclaimed(
+def test_non_expired_turn_lease_from_dead_pid_remains_authoritative(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A holder whose structured pid= no longer exists can be reclaimed early."""
+    """PID liveness cannot revoke durable ownership before lease expiry."""
     db = SessionDB(tmp_path / "state.db")
     db.create_session("shared", source="test")
 
@@ -435,8 +435,34 @@ def test_non_expired_turn_lease_from_dead_pid_is_reclaimed(
     fresh_holder = "pid=525252:turn=fresh:platform=test"
     assert db.try_acquire_session_turn_lease(
         "shared", fresh_holder, ttl_seconds=300
+    ) is False
+    assert probed == []
+
+
+def test_expired_turn_lease_from_dead_pid_is_reclaimed_by_ttl(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Expiry, not the diagnostic PID probe, authorizes recovery."""
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("shared", source="test")
+    dead_holder = "pid=424242:turn=dead:platform=test"
+    assert db.try_acquire_session_turn_lease(
+        "shared", dead_holder, ttl_seconds=0.05
     ) is True
-    assert probed == [424242]
+
+    probed: list[int] = []
+    monkeypatch.setattr(
+        hermes_state,
+        "psutil",
+        SimpleNamespace(pid_exists=lambda pid: probed.append(pid) or False),
+    )
+    time.sleep(0.12)
+
+    fresh_holder = "pid=525252:turn=fresh:platform=test"
+    assert db.try_acquire_session_turn_lease(
+        "shared", fresh_holder, ttl_seconds=300
+    ) is True
+    assert probed == []
 
 
 def test_turn_lease_fences_stale_transcript_flush_after_reclaim(tmp_path):

@@ -61,6 +61,7 @@ def _make_runner(*, compression_in_flight: bool):
     from gateway.run import GatewayRunner
 
     runner = object.__new__(GatewayRunner)
+    runner._persist_busy_gateway_event = AsyncMock(return_value=True)
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
     )
@@ -145,5 +146,4 @@ async def test_priority_path_does_not_interrupt_when_compression_in_flight():
     agent_mock.interrupt.assert_not_called()
     queued = runner.adapters[Platform.TELEGRAM]._pending_messages.get(sk)
     assert queued is not None and queued.text == "still there?"
-
 

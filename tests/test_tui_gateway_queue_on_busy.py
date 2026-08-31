@@ -186,7 +186,9 @@ def test_enqueue_followup_does_not_merge_stale_inflight_self_duplicate():
 
     server._enqueue_prompt(session, "Q", "ws-1")
 
-    assert session.get("queued_prompt") == {"text": "Q", "transport": "ws-1"}
+    queued = session.get("queued_prompt")
+    assert queued["text"] == "Q"
+    assert queued["transport"] == "ws-1"
     assert not session.get("queued_prompts")
 
 
@@ -227,7 +229,10 @@ def test_hard_interrupt_queue_path_scrubs_stale_inflight_self_duplicate(monkeypa
     resp = server._handle_busy_submit("r1", "sid", session, "Q", "ws-1")
 
     assert resp["result"]["status"] == "queued"
-    assert session.get("queued_prompt") == {"text": "Q", "transport": "ws-1"}
+    queued = session.get("queued_prompt")
+    assert queued["text"] == "Q"
+    assert queued["transport"] == "ws-1"
+    assert queued["logical_turn_id"]
     assert not session.get("queued_prompts")
     # Interrupt is async-threaded; policy still enqueued Q after scrubbing P.
 
@@ -559,11 +564,11 @@ def test_busy_submit_claims_attached_image_for_queued_turn(monkeypatch):
     assert redirected == []
     assert not interrupted.wait(0.1)
     assert session["attached_images"] == []
-    assert session["queued_prompt"] == {
-        "text": "is this B?",
-        "image_paths": ["/tmp/b.png"],
-        "transport": None,
-    }
+    queued = session["queued_prompt"]
+    assert queued["text"] == "is this B?"
+    assert queued["image_paths"] == ["/tmp/b.png"]
+    assert queued["transport"] is None
+    assert queued["logical_turn_id"]
 
 
 def test_busy_image_prompts_keep_b_and_c_attachments_in_submission_order(monkeypatch):
@@ -588,9 +593,12 @@ def test_busy_image_prompts_keep_b_and_c_attachments_in_submission_order(monkeyp
         server._methods["prompt.submit"]("c", {"session_id": "sid", "text": "C"})
 
         assert session["queued_prompt"]["image_paths"] == ["/tmp/b.png"]
-        assert session["queued_prompts"] == [
-            {"text": "C", "image_paths": ["/tmp/c.png"], "transport": None}
-        ]
+        queued = session["queued_prompts"]
+        assert len(queued) == 1
+        assert queued[0]["text"] == "C"
+        assert queued[0]["image_paths"] == ["/tmp/c.png"]
+        assert queued[0]["transport"] is None
+        assert queued[0]["logical_turn_id"]
 
         session["running"] = False
         assert server._drain_queued_prompt("drain-b", "sid", session) is True
@@ -599,20 +607,14 @@ def test_busy_image_prompts_keep_b_and_c_attachments_in_submission_order(monkeyp
     finally:
         server._sessions.pop("sid", None)
 
-    assert dispatched == [
-        (
-            "drain-b",
-            "sid",
-            "B",
-            {"image_paths": ["/tmp/b.png"], "queued_prompt_generation": 0},
-        ),
-        (
-            "drain-c",
-            "sid",
-            "C",
-            {"image_paths": ["/tmp/c.png"], "queued_prompt_generation": 0},
-        ),
+    assert [(rid, sid, text) for rid, sid, text, _ in dispatched] == [
+        ("drain-b", "sid", "B"),
+        ("drain-c", "sid", "C"),
     ]
+    assert dispatched[0][3]["image_paths"] == ["/tmp/b.png"]
+    assert dispatched[1][3]["image_paths"] == ["/tmp/c.png"]
+    assert all(item[3]["queued_prompt_generation"] == 0 for item in dispatched)
+    assert all(item[3]["logical_turn_id"] for item in dispatched)
 
 
 # ── _drain_queued_prompt ───────────────────────────────────────────────────
@@ -779,4 +781,3 @@ def test_drain_continues_with_later_queued_prompt_after_dispatch_failure(monkeyp
     assert calls == ["broken", "next"]
     assert session["queued_prompt"] is None
     assert session.get("queued_prompts") is None
-

@@ -461,39 +461,70 @@ class TestF6ExecutorSaturation:
 
 
 class TestS3IdleChargedFromLastProgress:
-    def test_silence_cannot_approach_double_idle_timeout(self):
-        """Progress early in an interval must not extend silence to ~2x idle."""
-        _drain_admission_slots()
-        idle = 0.4
-        release = threading.Event()
+    def test_early_progress_reduces_the_next_idle_wait_slice(self, monkeypatch):
+        """Progress early in a slice leaves only the remaining idle budget.
 
-        def worker(fence: CompressionCommitFence):
-            time.sleep(0.05)
-            fence.touch_progress()  # early progress, then total silence
-            assert release.wait(timeout=10)
-            return ([], "late")
+        This deliberately observes the timeout values passed to the Future,
+        rather than wall-clock elapsed time.  The prior version used a 0.72s
+        host scheduling benchmark to infer this property; that benchmark
+        failed under a busy full-suite worker even though the production loop
+        logged the correct 0.3s-since-progress transition.  The invariant is
+        the second wait slice itself: it must be the remaining 0.05s, not a
+        fresh 0.4s interval that would allow silence to approach 2x idle.
+        """
+        class _Clock:
+            now = 0.0
 
-        t0 = time.monotonic()
-        try:
-            msgs, prompt = run_compress_context_with_progress_timeout(
-                worker=worker,
-                messages=[{"role": "user", "content": "a"}],
-                system_prompt_fallback="fb",
-                idle_timeout_seconds=idle,
-                total_ceiling_seconds=5.0,
-                stall_fallback=False,
-            )
-        finally:
-            elapsed = time.monotonic() - t0
-            release.set()
-        assert prompt == "fb"
-        # Old behavior waited a full interval from the CHECK (~2x idle ≈
-        # 0.85s+). New behavior times out ~idle after the last progress
-        # (~0.45s). Allow generous slack while still excluding ~2x.
-        assert elapsed < idle * 1.8, (
-            f"silence exceeded ~2x idle budget shape: {elapsed:.2f}s"
+            def monotonic(self):
+                return self.now
+
+        clock = _Clock()
+        monkeypatch.setattr(cc.time, "monotonic", clock.monotonic)
+        fence = CompressionCommitFence()
+
+        class _Future:
+            wait_slices = []
+
+            def add_done_callback(self, _callback):
+                pass
+
+            def cancel(self):
+                return True
+
+            def result(self, timeout=None):
+                self.wait_slices.append(timeout)
+                if len(self.wait_slices) == 1:
+                    # The worker reports progress 50ms into the first 400ms
+                    # host wait, then remains silent through its end.
+                    clock.now = 0.05
+                    fence.touch_progress()
+                    clock.now = 0.4
+                else:
+                    # Exhaust exactly the remaining 50ms idle allowance.
+                    clock.now += timeout
+                raise concurrent.futures.TimeoutError
+
+        future = _Future()
+
+        class _Executor:
+            def submit(self, *_args, **_kwargs):
+                return future
+
+        monkeypatch.setattr(cc, "_get_compress_timeout_executor", _Executor)
+        monkeypatch.setattr(cc, "_try_admit_compression_job", lambda: True)
+
+        _msgs, prompt = run_compress_context_with_progress_timeout(
+            worker=lambda _fence: ([], "late"),
+            messages=[{"role": "user", "content": "a"}],
+            system_prompt_fallback="fb",
+            idle_timeout_seconds=0.4,
+            total_ceiling_seconds=5.0,
+            fence=fence,
+            stall_fallback=False,
         )
-        _drain_admission_slots()
+
+        assert prompt == "fb"
+        assert future.wait_slices == pytest.approx([0.4, 0.05])
 
 
 class TestRound2MidCommitLeaseRelease:

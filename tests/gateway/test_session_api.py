@@ -159,7 +159,8 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
     assert usage["total_tokens"] == 0
     assert "runtime" not in usage
     assert observed == {
-        "task_id": "request-session",
+        # A persistent API conversation session is not a task identity.
+        "task_id": None,
         "context_session_id": "request-session",
         "context_platform": "api_server",
         "context_session_key": "request-key",
@@ -202,7 +203,7 @@ async def test_run_agent_registers_active_run_id_for_steering(adapter, monkeypat
 
     assert result["session_id"] == "request-session"
     assert usage == {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-    assert observed == {"registered": True, "task_id": "request-session"}
+    assert observed == {"registered": True, "task_id": None}
     assert "run_steer_test" not in adapter._active_run_agents
 
 

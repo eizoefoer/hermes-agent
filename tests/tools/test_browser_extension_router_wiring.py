@@ -29,7 +29,12 @@ def _route_spy(monkeypatch):
                 "tool_call_id": tool_call_id,
             }
         )
-        return fallback()
+        # Only the two focused tests below assert their patched fallback.
+        # The all-actions wiring test must not launch an installed local
+        # browser/npx backend merely because this host happens to have one.
+        if action in {"browser_navigate", "browser_cdp"}:
+            return fallback()
+        return f"routed-{action}"
 
     import tools.browser_tool as browser_tool
     import tools.browser_cdp_tool as browser_cdp_tool

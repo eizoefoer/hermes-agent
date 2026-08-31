@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -59,13 +60,18 @@ async def deliver_wake(
     text: str,
     session_id: str = "",
     source: Any = None,
+    source_event_id: Optional[str] = None,
+    occurrence_id: Optional[str] = None,
 ) -> None:
     """Deliver a wake turn to the session behind ``adapter``.
 
     ``session_id`` is the RAW session id (the ``X-Hermes-Session-Id`` value /
     ``state.db`` key) — required for non-push adapters. ``source`` is the
     ``SessionSource`` used to build the synthetic event — required for
-    push-capable adapters.
+    push-capable adapters. ``source_event_id`` is an authoritative durable
+    producer replay key when one exists. ``occurrence_id`` is a Hermes-assigned
+    acceptance identity for producers without such a key. Neither identity is
+    ever derived from the rendered wake text.
 
     Raises on failure (bad arguments, exhausted retries, HTTP error) so the
     caller can rewind/retry instead of treating the wake as delivered.
@@ -82,6 +88,12 @@ async def deliver_wake(
             message_type=MessageType.TEXT,
             source=source,
             internal=True,
+            session_event_id=(str(source_event_id).strip() or None)
+            if source_event_id is not None
+            else None,
+            occurrence_id=(str(occurrence_id).strip() or uuid.uuid4().hex)
+            if occurrence_id is not None
+            else uuid.uuid4().hex,
         )
         await adapter.handle_message(synth_event)
         return
@@ -91,11 +103,25 @@ async def deliver_wake(
             "deliver_wake: non-push adapter (supports_async_delivery=False) "
             "requires the raw session id to self-post the wake turn"
         )
-    await _self_post_chat_completion(adapter, text=text, session_id=session_id)
+    if source_event_id is not None and str(source_event_id).strip():
+        idempotency_key = f"hermes-wake:source:{str(source_event_id).strip()}"
+    else:
+        accepted_occurrence = (
+            str(occurrence_id).strip()
+            if occurrence_id is not None and str(occurrence_id).strip()
+            else uuid.uuid4().hex
+        )
+        idempotency_key = f"hermes-wake:occurrence:{accepted_occurrence}"
+    await _self_post_chat_completion(
+        adapter,
+        text=text,
+        session_id=session_id,
+        idempotency_key=idempotency_key,
+    )
 
 
 async def _self_post_chat_completion(
-    adapter: Any, *, text: str, session_id: str
+    adapter: Any, *, text: str, session_id: str, idempotency_key: str
 ) -> None:
     """POST the wake text to the in-pod API server as a normal session turn.
 
@@ -126,6 +152,7 @@ async def _self_post_chat_completion(
     headers = {
         "Authorization": f"Bearer {api_key}",
         "X-Hermes-Session-Id": session_id,
+        "Idempotency-Key": idempotency_key,
     }
     payload = {
         "model": str(getattr(adapter, "_model_name", "") or "hermes-agent"),

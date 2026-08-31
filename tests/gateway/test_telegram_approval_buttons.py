@@ -175,6 +175,19 @@ class TestTelegramExecApproval:
 class TestTelegramApprovalCallback:
     """Test the approval callback handling in _handle_callback_query."""
 
+    @pytest.mark.asyncio
+    async def test_routes_signed_repository_approval_callback(self, monkeypatch):
+        adapter = _make_adapter()
+        query = AsyncMock()
+        query.data = "pa:a:request:signature"
+        update = MagicMock(callback_query=query)
+        handler = AsyncMock(return_value=True)
+        monkeypatch.setattr("gateway.telegram_approval.handle_callback", handler)
+
+        await adapter._handle_callback_query(update, MagicMock())
+
+        handler.assert_awaited_once_with(adapter, query)
+
 
     @pytest.mark.asyncio
     async def test_resume_typing_after_inline_approval(self):
@@ -268,7 +281,7 @@ class TestTelegramApprovalCallback:
 
         # Should NOT have triggered approval resolution
         mock_resolve.assert_not_called()
-        assert (tmp_path / ".update_response").read_text() == "y"
+        assert (tmp_path / ".update_response").read_text(encoding="utf-8") == "y"
 
     @pytest.mark.asyncio
     async def test_update_prompt_callback_rejects_unauthorized_user(self, tmp_path):
@@ -329,4 +342,3 @@ class TestTelegramApprovalCallback:
         assert runner.last_source is not None
         assert runner.last_source.platform == Platform.TELEGRAM
         assert runner.last_source.user_id == "222"
-

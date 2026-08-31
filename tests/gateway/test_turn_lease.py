@@ -131,15 +131,16 @@ def test_timeout_fails_closed_instead_of_authorizing_an_unserialized_turn():
 
 
 @pytest.mark.asyncio
-async def test_agent_path_propagates_timed_out_lease_before_loading_transcript(
+async def test_agent_path_queues_on_valid_durable_lease_before_loading_transcript(
     monkeypatch, tmp_path
 ):
-    """The agent path propagates timeout before transcript work can begin.
+    """The agent path queues on authoritative durable ownership.
 
-    Outer dispatch owns the visible rejection/resend notice. Most importantly,
-    transcript loading and agent execution must not start: both would operate
-    without the per-session serialization guarantee.
+    Most importantly, transcript loading and agent execution must not start.
+    The process-local registry is no longer the cross-process authority.
     """
+    from gateway.run import DurableSessionTurnQueued
+    from hermes_state import AsyncSessionDB, SessionDB
     from tests.gateway.test_42039_duplicate_user_message import (
         _bootstrap,
         _event,
@@ -147,68 +148,60 @@ async def test_agent_path_propagates_timed_out_lease_before_loading_transcript(
     )
 
     runner = _bootstrap(monkeypatch, tmp_path)
-    runner._turn_leases = SessionTurnLeaseRegistry()
-    holder = await runner._turn_leases.acquire(
-        "sess-dedup", owner_key="holder-key", generation=1, timeout=1
+    runner._allow_ephemeral_gateway_admission_for_tests = False
+    state = SessionDB(tmp_path / "durable-state.db")
+    state.create_session("sess-dedup", "telegram", user_id="12345")
+    assert state.try_acquire_session_turn_lease(
+        "sess-dedup", "gateway:foreign", ttl_seconds=30
     )
-    assert holder is not None
-    monkeypatch.setenv("HERMES_TURN_LEASE_TIMEOUT", "0.02")
+    runner._session_db = AsyncSessionDB(state)
 
     runner.session_store.load_transcript.side_effect = AssertionError(
-        "transcript must not load after a turn-lease timeout"
+        "transcript must not load while another durable owner is valid"
     )
     runner._run_agent = pytest.fail
 
-    try:
-        with pytest.raises(TurnLeaseTimeoutError):
-            await runner._handle_message_with_agent(
-                _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
-            )
-    finally:
-        assert runner._turn_leases.release(holder) is True
+    with pytest.raises(DurableSessionTurnQueued):
+        await runner._handle_message_with_agent(
+            _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+        )
 
     runner.session_store.load_transcript.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
+async def test_full_dispatch_durably_queues_contention_without_running_goal_hook(
     monkeypatch, tmp_path
 ):
-    """A lease rejection is not a completed turn for `/goal` evaluation.
-
-    The lease wait also has its own clock: a short lease budget must reject
-    promptly even while the normal agent inactivity timeout remains long.
-    """
+    """Durable contention is accepted/queued, not a completed goal turn."""
+    from hermes_state import AsyncSessionDB, SessionDB
     from tests.gateway.test_42039_duplicate_user_message import _bootstrap, _event
 
     runner = _bootstrap(monkeypatch, tmp_path)
-    runner._turn_leases = SessionTurnLeaseRegistry()
-    holder = await runner._turn_leases.acquire(
-        "sess-dedup", owner_key="holder-key", generation=1, timeout=1
+    runner._allow_ephemeral_gateway_admission_for_tests = False
+    state = SessionDB(tmp_path / "durable-state.db")
+    state.create_session("sess-dedup", "telegram", user_id="12345")
+    assert state.try_acquire_session_turn_lease(
+        "sess-dedup", "gateway:foreign", ttl_seconds=30
     )
-    assert holder is not None
-    monkeypatch.setenv("HERMES_AGENT_TIMEOUT", "5")
-    monkeypatch.setenv("HERMES_TURN_LEASE_TIMEOUT", "0.02")
+    runner._session_db = AsyncSessionDB(state)
 
     runner.session_store.load_transcript.side_effect = AssertionError(
-        "transcript must not load after a turn-lease timeout"
+        "transcript must not load while another durable owner is valid"
     )
-    session_env_tokens = object()
-    runner._set_session_env = MagicMock(return_value=session_env_tokens)
-    runner._clear_session_env = MagicMock()
     runner._run_agent = pytest.fail
     runner._post_turn_goal_continuation = AsyncMock()
 
-    try:
-        response = await asyncio.wait_for(runner._handle_message(_event()), timeout=1)
-    finally:
-        assert runner._turn_leases.release(holder) is True
+    # The path crosses AsyncSessionDB's executor boundary. Under the canonical
+    # eight-worker runner a cold, contended host can spend more than one second
+    # waiting for a thread even though the durable queue path is not blocked.
+    # Five seconds still fails a real ownership deadlock promptly while keeping
+    # this invariant test independent of suite load.
+    response = await asyncio.wait_for(runner._handle_message(_event()), timeout=5)
 
     assert isinstance(response, str)
-    assert "not processed" in response.lower()
-    assert "resend" in response.lower()
+    assert "safely queued" in response.lower()
     runner.session_store.load_transcript.assert_not_called()
-    runner._clear_session_env.assert_called_once_with(session_env_tokens)
     runner._post_turn_goal_continuation.assert_not_awaited()
 
 
