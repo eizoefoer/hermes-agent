@@ -20289,6 +20289,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ttl_seconds=_GATEWAY_LOGICAL_TURN_LEASE_TTL_SECONDS,
         )
         if claimed.get("outcome") == "claimed":
+            # AsyncSessionDB executes the synchronous claim in its executor.
+            # The ContextVar hint bound by SessionDB.claim_logical_turn therefore
+            # belongs to that worker context, not this gateway task.  Bind the
+            # authoritative lease again at the caller boundary so copy_context()
+            # carries it into AIAgent's executor worker.  Without this handoff
+            # AIAgent attempts to acquire the gateway's own valid lease and
+            # waits against itself while the logical-turn heartbeat renews it.
+            from hermes_state import bind_preacquired_logical_turn_lease
+
+            bind_preacquired_logical_turn_lease(
+                session_entry.session_id, claimed["lease"]
+            )
             setattr(event, "_logical_attempt_id", claimed["attempt_id"])
             setattr(event, "_logical_turn_lease", claimed.get("lease"))
             self._start_gateway_logical_turn_heartbeat(event)

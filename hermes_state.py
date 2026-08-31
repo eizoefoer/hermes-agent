@@ -8180,6 +8180,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()
         return dict(row) if row else None
 
+    def inspect_session_turn_lease(
+        self, session_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return the durable lease row for diagnostics, including expiry.
+
+        Unlike :meth:`get_session_turn_lease`, this read-only diagnostic does
+        not hide expired rows and never reclaims or otherwise mutates them.
+        """
+        with self._read_ctx() as conn:
+            conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
+            row = conn.execute(
+                "SELECT * FROM session_turn_leases WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def admit_logical_turn(
         self,
         *,

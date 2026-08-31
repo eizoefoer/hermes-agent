@@ -12,6 +12,7 @@ from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionEntry, SessionSource
 from hermes_state import AsyncSessionDB, SessionDB
+from hermes_state import consume_preacquired_logical_turn_lease
 
 
 def _source() -> SessionSource:
@@ -111,6 +112,22 @@ async def test_real_sessiondb_lease_queues_second_gateway_occurrence(tmp_path):
     assert db.get_logical_turn(second._logical_turn_id)["state"] == "queued"
     assert db.get_session_turn_lease("session-1")["holder"] == first_claim["lease"]["holder"]
     await runner._stop_gateway_logical_turn_heartbeat(first)
+
+
+@pytest.mark.asyncio
+async def test_gateway_rebinds_async_claim_lease_in_caller_context(tmp_path):
+    """The AIAgent worker must inherit the lease claimed by AsyncSessionDB."""
+    runner, db, entry = _runner(tmp_path)
+    event = MessageEvent(text="first", source=_source(), message_id="m1")
+
+    claim = await runner.admit_session_event(event, entry)
+    handed_off = consume_preacquired_logical_turn_lease(entry.session_id)
+
+    assert claim["outcome"] == "claimed"
+    assert handed_off is not None
+    assert handed_off["holder"] == claim["lease"]["holder"]
+    assert db.get_session_turn_lease(entry.session_id)["holder"] == handed_off["holder"]
+    await runner._stop_gateway_logical_turn_heartbeat(event)
 
 
 @pytest.mark.asyncio
