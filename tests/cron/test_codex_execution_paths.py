@@ -92,8 +92,13 @@ class _Codex401ThenSuccessAgent(run_agent.AIAgent):
         return super().run_conversation(user_message, conversation_history=conversation_history, task_id=task_id)
 
 
-def test_cron_run_job_codex_path_handles_internal_401_refresh(monkeypatch):
+def test_cron_run_job_codex_path_handles_internal_401_refresh(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+
     _patch_agent_bootstrap(monkeypatch)
+    state_path = tmp_path / "state.db"
+    monkeypatch.setattr("hermes_state.SessionDB", lambda: SessionDB(state_path))
+    monkeypatch.setattr(cron_scheduler, "_get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(run_agent, "OpenAI", _FakeOpenAI)
     monkeypatch.setattr(run_agent, "AIAgent", _Codex401ThenSuccessAgent)
     monkeypatch.setattr(

@@ -24,8 +24,12 @@ jobs:
       - name: Check for unmapped contributor emails
         id: check-emails
         run: |
-          # Get the merge base between this PR and main
-          MERGE_BASE=$(git merge-base origin/main HEAD)
+          # Compare with the PR's actual base branch. Forks may intentionally
+          # keep a legacy default branch while forward-port PRs target a clean
+          # current-runtime branch; using origin/main there audits thousands of
+          # unrelated upstream commits instead of this PR.
+          BASE_REF="${GITHUB_BASE_REF:-main}"
+          MERGE_BASE=$(git merge-base "origin/${BASE_REF}" HEAD)
 
           # Find any new author emails in this PR's commits
           NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)

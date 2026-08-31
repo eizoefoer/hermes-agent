@@ -40,6 +40,7 @@ def _bootstrap(monkeypatch, tmp_path):
 
     config = GatewayConfig()
     runner = gateway_run.GatewayRunner(config)
+    runner._allow_ephemeral_gateway_admission_for_tests = True
     runner.adapters = {}
     runner._running_agents = {}
     runner._running_agents_ts = {}

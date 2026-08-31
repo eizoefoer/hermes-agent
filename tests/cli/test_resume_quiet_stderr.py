@@ -63,13 +63,16 @@ class TestResumeQuietStderr:
         db.get_session.return_value = None
         cli = _make_cli(quiet=False, db=db)
 
-        with patch("cli._prepare_deferred_agent_startup"):
+        with patch("cli._prepare_deferred_agent_startup"), \
+             patch("cli._cprint") as mock_print:
             result = cli._init_agent()
 
-        captured = capsys.readouterr()
         assert result is False
         # Interactive mode keeps the existing _cprint path → stdout.
-        assert "Session not found" in captured.out
+        assert any(
+            "Session not found" in call.args[0]
+            for call in mock_print.call_args_list
+        )
 
     def test_resumed_banner_goes_to_stderr_in_quiet_mode(self, capsys):
         db = MagicMock()

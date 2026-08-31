@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from hermes_cli.memory_setup import _CANCELLED
+import plugins.memory.hindsight as hindsight_module
 from plugins.memory.hindsight import (
     HindsightMemoryProvider,
     RECALL_SCHEMA,
@@ -746,7 +747,7 @@ class TestPrefetchServerRetainVisibility:
         assert order == ["recall"], "prefetch should recall after the timeout"
         assert elapsed < 3.0, "prefetch must not block well past the drain budget"
 
-    def test_timed_out_ops_are_dropped_not_repolled(self, provider_with_config):
+    def test_timed_out_ops_are_dropped_not_repolled(self, provider_with_config, monkeypatch):
         """Ops unresolved at deadline must be EVICTED so a permanently failing
         status endpoint can't make every later prefetch re-burn the full
         timeout on a growing pending set (unbounded session-wide degradation
@@ -761,21 +762,53 @@ class TestPrefetchServerRetainVisibility:
         p._retain_queue.join()
         assert p._pending_retain_ops, "op should be tracked before the wait"
 
+        class _InlineThread:
+            """Run the prefetch target inline so this test observes its state.
+
+            The prefetch scheduling contract is covered elsewhere.  Here the
+            contract is eviction: after a timed-out retain operation is
+            dropped, a later prefetch must not poll it again.  Running the
+            target inline avoids treating OS scheduling of a daemon thread as
+            evidence about that state transition.
+            """
+
+            def __init__(self, target=None, **_kwargs):
+                self._target = target
+                self._alive = False
+
+            def start(self):
+                self._alive = True
+                try:
+                    assert self._target is not None
+                    self._target()
+                finally:
+                    self._alive = False
+
+            def is_alive(self):
+                return self._alive
+
+            def join(self, timeout=None):
+                return None
+
+        monkeypatch.setattr(hindsight_module.threading, "Thread", _InlineThread)
+        # Keep the production timeout semantics but shorten only the polling
+        # cadence of this deterministic test's mocked status endpoint.
+        p._RETAIN_OP_POLL_INTERVAL_S = 0.01
+
         # First prefetch burns the budget and must DROP the wedged op.
         p.queue_prefetch("q1")
-        if p._prefetch_thread:
-            p._prefetch_thread.join(timeout=5.0)
         assert p._pending_retain_ops == set(), (
             "unresolved ops must be evicted at deadline, not retained"
         )
+        polls_after_drop = p._client.operations.get_operation_status.await_count
+        assert polls_after_drop > 0
 
-        # A later prefetch with nothing pending must be near-instant.
-        start = time.monotonic()
+        # A later prefetch with nothing pending must not contact the status
+        # endpoint at all.  This directly proves that the dropped operation
+        # cannot be re-polled, without a scheduler-dependent wall-clock cap.
         p.queue_prefetch("q2")
-        if p._prefetch_thread:
-            p._prefetch_thread.join(timeout=5.0)
-        assert time.monotonic() - start < 0.25, (
-            "second prefetch re-polled dropped ops — eviction regressed"
+        assert p._client.operations.get_operation_status.await_count == polls_after_drop, (
+            "second prefetch re-polled a dropped operation — eviction regressed"
         )
 
     def test_operation_notfound_treated_as_complete(self, provider):

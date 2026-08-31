@@ -20,6 +20,13 @@ def _no_live_builtin_provider_probes(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.models.provider_model_ids", lambda *_a, **_kw: []
     )
+    # A developer may have a real Ollama daemon on localhost. These tests
+    # exercise generic/configured discovery and must not let the native probe
+    # replace their mocked catalog with the host's models.
+    monkeypatch.setattr(
+        "hermes_cli.models.should_use_ollama_native_catalog",
+        lambda *_a, **_kw: False,
+    )
 
 
 # =============================================================================
@@ -373,7 +380,7 @@ def test_switch_model_resolves_user_provider_credentials(monkeypatch, tmp_path):
     }
     
     config_file = tmp_path / "config.yaml"
-    config_file.write_text(yaml.dump(config))
+    config_file.write_text(yaml.dump(config), encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     
     # Mock validation to pass

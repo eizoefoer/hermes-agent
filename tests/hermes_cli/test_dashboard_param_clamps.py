@@ -17,13 +17,21 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
+    from hermes_cli.dashboard_auth import clear_providers
+
+    clear_providers()
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "clamp-test-token")
     from hermes_cli import web_server
 
+    # This file verifies FastAPI validation, not the auth gate.  Earlier auth
+    # tests may have initialized the process-global app in gated mode and may
+    # also have imported it before this fixture's token environment existed.
+    monkeypatch.setattr(web_server.app.state, "auth_required", False, raising=False)
     with TestClient(web_server.app, raise_server_exceptions=False) as c:
-        c.headers["Authorization"] = "Bearer clamp-test-token"
+        c.headers["Authorization"] = f"Bearer {web_server._SESSION_TOKEN}"
         yield c
+    clear_providers()
 
 
 class TestSessionPaginationClamps:

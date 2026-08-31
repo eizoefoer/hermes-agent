@@ -2954,6 +2954,20 @@ def approve_session(session_key: str, pattern_key: str):
         _session_approved.setdefault(session_key, set()).add(pattern_key)
 
 
+def revoke_session_approvals(session_key: str, pattern_keys) -> None:
+    """Remove only named temporary approvals, preserving prior consent."""
+    keys = set(pattern_keys or [])
+    if not session_key or not keys:
+        return
+    with _lock:
+        approved = _session_approved.get(session_key)
+        if approved is None:
+            return
+        approved.difference_update(keys)
+        if not approved:
+            _session_approved.pop(session_key, None)
+
+
 def _release_permission_mode_dependents(session_key: str) -> None:
     """Drop resources whose immutable mode is derived from Hermes YOLO.
 

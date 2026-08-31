@@ -29,9 +29,11 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
 import weakref
 from collections import deque
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
@@ -55,7 +57,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, Tuple, TypeVar
 
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _BRANCH_CHILD_SQL,
@@ -93,6 +95,40 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _PREVIEW_SCAFFOLD_WINDOW,
     _PREVIEW_SCAFFOLDED_SQL,
 )
+
+
+# A process-local handoff hint, never ownership authority. Canonical admission
+# claims the durable lease before invoking AIAgent; run_conversation consumes
+# this hint only after verifying the exact holder still exists in SessionDB.
+# Keeping it ContextVar-scoped prevents unrelated concurrent sessions in the
+# same gateway process from reusing one another's lease.
+_PREACQUIRED_LOGICAL_TURN_LEASES: ContextVar[Dict[str, Dict[str, Any]]] = (
+    ContextVar("preacquired_logical_turn_leases", default={})
+)
+
+
+def bind_preacquired_logical_turn_lease(
+    session_id: str, lease: Mapping[str, Any]
+) -> None:
+    """Bind a logical-turn lease for the next AIAgent turn in this context.
+
+    Manual worker threads must call this explicitly because Python does not
+    inherit ContextVars into ``threading.Thread``. The consumer still verifies
+    the holder against SessionDB, so this hint cannot manufacture ownership.
+    """
+    leases = dict(_PREACQUIRED_LOGICAL_TURN_LEASES.get())
+    leases[str(session_id)] = dict(lease)
+    _PREACQUIRED_LOGICAL_TURN_LEASES.set(leases)
+
+
+def consume_preacquired_logical_turn_lease(
+    session_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Consume a same-context lease handoff for ``session_id`` once."""
+    leases = dict(_PREACQUIRED_LOGICAL_TURN_LEASES.get())
+    lease = leases.pop(str(session_id), None)
+    _PREACQUIRED_LOGICAL_TURN_LEASES.set(leases)
+    return dict(lease) if lease else None
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_schema import SessionSchemaMixin
 from hermes_state_search import SessionSearchMixin
@@ -7962,9 +7998,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         Compression rotates a session into child segments, so the durable key
         is the lineage root rather than the current segment id. The walk and
-        INSERT share one write transaction. Expired leases and leases whose
-        structured local holder PID is known dead are reclaimed in that same
-        transaction.
+        INSERT share one write transaction. Only expired leases are reclaimed
+        in that transaction; process liveness is diagnostic and cannot revoke
+        durable, unexpired ownership.
         """
         if not session_id or not holder:
             return False
@@ -7980,10 +8016,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()
             if row is not None:
                 current_holder = row["holder"]
-                if (
-                    float(row["expires_at"]) <= now
-                    or _compression_lock_holder_process_is_dead(current_holder)
-                ):
+                # A turn lease is durable execution ownership.  Process
+                # liveness is diagnostic only: a missing local PID does not
+                # prove the work stopped (the holder may be remote, PID reuse
+                # is possible, and recovery must be ordered by the durable
+                # TTL).  Only normal expiry makes this row reclaimable.
+                if float(row["expires_at"]) <= now:
                     conn.execute(
                         "DELETE FROM session_turn_leases "
                         "WHERE conversation_id = ? AND holder = ?",
@@ -8113,6 +8151,669 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
 
         self._execute_write(_do)
+
+    # ── Durable logical-turn admission ──────────────────────────────────
+
+    @staticmethod
+    def _logical_turn_row(row) -> Optional[Dict[str, Any]]:
+        if row is None:
+            return None
+        data = dict(row)
+        for field in ("payload_json", "result_json"):
+            raw = data.pop(field, None)
+            try:
+                decoded = json.loads(raw) if raw else None
+            except (TypeError, json.JSONDecodeError):
+                decoded = None
+            data[field.removesuffix("_json")] = decoded
+        return data
+
+    def get_session_turn_lease(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return a non-expired conversation lease without mutating it."""
+        now = time.time()
+        with self._read_ctx() as conn:
+            conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
+            row = conn.execute(
+                "SELECT * FROM session_turn_leases "
+                "WHERE conversation_id = ? AND expires_at > ?",
+                (conversation_id, now),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def admit_logical_turn(
+        self,
+        *,
+        session_id: str,
+        session_key: str,
+        source_identity: str,
+        payload: Optional[Dict[str, Any]] = None,
+        task_id: Optional[str] = None,
+        goal_id: Optional[str] = None,
+        branch: Optional[str] = None,
+        worktree: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Persist one accepted source occurrence before ownership waiting."""
+        if not session_id or not session_key or not source_identity:
+            raise ValueError(
+                "logical turn requires session_id, session_key, and source_identity"
+            )
+        now = time.time()
+        logical_turn_id = uuid.uuid4().hex
+        encoded_payload = json.dumps(payload or {}, sort_keys=True, default=str)
+
+        def _do(conn):
+            if conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone() is None:
+                raise ValueError(f"unknown session: {session_id}")
+            conn.execute(
+                "INSERT OR IGNORE INTO logical_turns "
+                "(logical_turn_id, session_id, session_key, source_identity, "
+                "payload_json, state, created_at, updated_at, task_id, goal_id, "
+                "branch, worktree) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)",
+                (
+                    logical_turn_id,
+                    session_id,
+                    session_key,
+                    source_identity,
+                    encoded_payload,
+                    now,
+                    now,
+                    task_id,
+                    goal_id,
+                    branch,
+                    worktree,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM logical_turns "
+                "WHERE session_id = ? AND source_identity = ?",
+                (session_id, source_identity),
+            ).fetchone()
+            result = self._logical_turn_row(row) or {}
+            result["duplicate"] = result.get("logical_turn_id") != logical_turn_id
+            return result
+
+        return self._execute_write(_do)
+
+    def admit_session_event(
+        self,
+        *,
+        session_id: str,
+        session_key: str,
+        source_identity: str,
+        event_type: str,
+        payload: Optional[Dict[str, Any]] = None,
+        task_id: Optional[str] = None,
+        goal_id: Optional[str] = None,
+        branch: Optional[str] = None,
+        worktree: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Canonical durable admission facade for future session work."""
+        event_payload = dict(payload or {})
+        event_payload.setdefault("event_type", str(event_type))
+        return self.admit_logical_turn(
+            session_id=session_id,
+            session_key=session_key,
+            source_identity=source_identity,
+            payload=event_payload,
+            task_id=task_id,
+            goal_id=goal_id,
+            branch=branch,
+            worktree=worktree,
+        )
+
+    def get_logical_turn(self, logical_turn_id: str) -> Optional[Dict[str, Any]]:
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT * FROM logical_turns WHERE logical_turn_id = ?",
+                (logical_turn_id,),
+            ).fetchone()
+        return self._logical_turn_row(row)
+
+    def list_session_logical_turns(self, session_id: str) -> List[Dict[str, Any]]:
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                "SELECT * FROM logical_turns WHERE session_id = ? "
+                "ORDER BY created_at, logical_turn_id",
+                (session_id,),
+            ).fetchall()
+        return [turn for row in rows if (turn := self._logical_turn_row(row))]
+
+    def count_logical_turns(self, session_id: Optional[str] = None) -> int:
+        with self._read_ctx() as conn:
+            if session_id is None:
+                row = conn.execute("SELECT COUNT(*) FROM logical_turns").fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM logical_turns WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+        return int(row[0])
+
+    def claim_logical_turn(
+        self,
+        logical_turn_id: str,
+        *,
+        owner: str,
+        pid: Optional[int] = None,
+        ttl_seconds: float = 300.0,
+    ) -> Dict[str, Any]:
+        """Atomically allocate an attempt and the canonical session lease."""
+        if not owner:
+            raise ValueError("logical turn owner is required")
+        now = time.time()
+        expires_at = now + max(0.1, float(ttl_seconds))
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM logical_turns WHERE logical_turn_id = ?",
+                (logical_turn_id,),
+            ).fetchone()
+            turn = self._logical_turn_row(row)
+            if turn is None:
+                return {"outcome": "missing", "turn": None, "lease": None}
+            if turn["state"] in {
+                "completed",
+                "unrecoverable",
+                "cancelled",
+                "blocked",
+            }:
+                return {"outcome": "terminal", "turn": turn, "lease": None}
+
+            conversation_id = self._session_turn_lease_key_on_conn(
+                conn, turn["session_id"]
+            )
+            conn.execute(
+                "DELETE FROM session_turn_leases "
+                "WHERE conversation_id = ? AND expires_at <= ?",
+                (conversation_id, now),
+            )
+            lease_row = conn.execute(
+                "SELECT * FROM session_turn_leases WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if lease_row is not None:
+                return {
+                    "outcome": "busy",
+                    "turn": turn,
+                    "lease": dict(lease_row),
+                }
+
+            attempt_id = uuid.uuid4().hex
+            lease_holder = f"{owner}:logical_turn={logical_turn_id}:attempt={attempt_id}"
+            conn.execute(
+                "INSERT INTO session_turn_leases "
+                "(conversation_id, holder, acquired_at, expires_at) "
+                "VALUES (?, ?, ?, ?)",
+                (conversation_id, lease_holder, now, expires_at),
+            )
+            conn.execute(
+                "UPDATE logical_turns SET state = 'claimed', updated_at = ?, "
+                "attempt_count = attempt_count + 1, current_attempt_id = ?, "
+                "owner = ?, owner_pid = ?, lease_holder = ?, "
+                "lease_conversation_id = ?, error = NULL "
+                "WHERE logical_turn_id = ?",
+                (
+                    now,
+                    attempt_id,
+                    owner,
+                    int(pid or 0),
+                    lease_holder,
+                    conversation_id,
+                    logical_turn_id,
+                ),
+            )
+            claimed = self._logical_turn_row(
+                conn.execute(
+                    "SELECT * FROM logical_turns WHERE logical_turn_id = ?",
+                    (logical_turn_id,),
+                ).fetchone()
+            )
+            return {
+                "outcome": "claimed",
+                "turn": claimed,
+                "attempt_id": attempt_id,
+                "lease": {
+                    "conversation_id": conversation_id,
+                    "holder": lease_holder,
+                    "acquired_at": now,
+                    "expires_at": expires_at,
+                },
+            }
+
+        result = self._execute_write(_do)
+        if result.get("outcome") == "claimed" and result.get("lease"):
+            bind_preacquired_logical_turn_lease(
+                str((result.get("turn") or {}).get("session_id") or ""),
+                result["lease"],
+            )
+        return result
+
+    def mark_logical_turn_started(
+        self, logical_turn_id: str, attempt_id: str
+    ) -> bool:
+        now = time.time()
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE logical_turns SET state = 'executing', "
+                "started_at = COALESCE(started_at, ?), heartbeat_at = ?, "
+                "updated_at = ? WHERE logical_turn_id = ? "
+                "AND current_attempt_id = ? AND state = 'claimed'",
+                (now, now, now, logical_turn_id, attempt_id),
+            )
+            return cursor.rowcount == 1
+
+        return bool(self._execute_write(_do))
+
+    def heartbeat_logical_turn(
+        self,
+        logical_turn_id: str,
+        attempt_id: str,
+        *,
+        ttl_seconds: float = 300.0,
+    ) -> bool:
+        now = time.time()
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT lease_conversation_id, lease_holder FROM logical_turns "
+                "WHERE logical_turn_id = ? AND current_attempt_id = ? "
+                "AND state IN ('claimed', 'executing')",
+                (logical_turn_id, attempt_id),
+            ).fetchone()
+            if row is None:
+                return False
+            cursor = conn.execute(
+                "UPDATE session_turn_leases SET expires_at = ? "
+                "WHERE conversation_id = ? AND holder = ?",
+                (
+                    now + max(0.1, float(ttl_seconds)),
+                    row["lease_conversation_id"],
+                    row["lease_holder"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                return False
+            conn.execute(
+                "UPDATE logical_turns SET heartbeat_at = ?, updated_at = ? "
+                "WHERE logical_turn_id = ?",
+                (now, now, logical_turn_id),
+            )
+            return True
+
+        return bool(self._execute_write(_do))
+
+    def next_queued_logical_turn(
+        self, session_id: str
+    ) -> Optional[Dict[str, Any]]:
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT * FROM logical_turns WHERE session_id = ? "
+                "AND state IN ('queued', 'retry') "
+                "ORDER BY created_at, logical_turn_id LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        return self._logical_turn_row(row)
+
+    def claim_next_logical_turn(
+        self,
+        session_id: str,
+        *,
+        owner: str,
+        pid: Optional[int] = None,
+        ttl_seconds: float = 300.0,
+    ) -> Dict[str, Any]:
+        turn = self.next_queued_logical_turn(session_id)
+        if turn is None:
+            return {
+                "outcome": "empty",
+                "turn": None,
+                "lease": self.get_session_turn_lease(session_id),
+            }
+        return self.claim_logical_turn(
+            turn["logical_turn_id"],
+            owner=owner,
+            pid=pid,
+            ttl_seconds=ttl_seconds,
+        )
+
+    def list_ready_logical_turns(
+        self,
+        *,
+        limit: int = 100,
+        event_types: Optional[Iterable[str]] = None,
+        event_type_prefixes: Optional[Iterable[str]] = None,
+        session_id: Optional[str] = None,
+        payload_equals: Optional[Mapping[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return only eligible rows, applying producer filters before LIMIT."""
+        selected_types = tuple(dict.fromkeys(str(v) for v in (event_types or ())))
+        selected_prefixes = tuple(
+            dict.fromkeys(str(v) for v in (event_type_prefixes or ()))
+        )
+        clauses = ["state IN ('queued', 'retry')"]
+        params: List[Any] = []
+        event_clauses: List[str] = []
+        event_expr = "COALESCE(json_extract(payload_json, '$.event_type'), '')"
+        if selected_types:
+            placeholders = ", ".join("?" for _ in selected_types)
+            event_clauses.append(f"{event_expr} IN ({placeholders})")
+            params.extend(selected_types)
+        for prefix in selected_prefixes:
+            event_clauses.append(f"substr({event_expr}, 1, ?) = ?")
+            params.extend((len(prefix), prefix))
+        if event_clauses:
+            clauses.append("(" + " OR ".join(event_clauses) + ")")
+        if session_id is not None:
+            clauses.append("session_id = ?")
+            params.append(str(session_id))
+        for key, value in (payload_equals or {}).items():
+            safe_key = str(key).replace('"', '""')
+            clauses.append(f"json_extract(payload_json, '$.\"{safe_key}\"') = ?")
+            params.append(value)
+        params.append(max(1, int(limit)))
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                "SELECT * FROM logical_turns WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY created_at, logical_turn_id LIMIT ?",
+                tuple(params),
+            ).fetchall()
+        return [turn for row in rows if (turn := self._logical_turn_row(row))]
+
+    def list_active_logical_turns(
+        self,
+        *,
+        limit: int = 100,
+        event_types: Optional[Iterable[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        selected_types = tuple(dict.fromkeys(str(v) for v in (event_types or ())))
+        clauses = ["state IN ('claimed', 'executing')"]
+        params: List[Any] = []
+        if selected_types:
+            placeholders = ", ".join("?" for _ in selected_types)
+            clauses.append(
+                "COALESCE(json_extract(payload_json, '$.event_type'), '') "
+                f"IN ({placeholders})"
+            )
+            params.extend(selected_types)
+        params.append(max(1, int(limit)))
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                "SELECT * FROM logical_turns WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY updated_at, logical_turn_id LIMIT ?",
+                tuple(params),
+            ).fetchall()
+        return [turn for row in rows if (turn := self._logical_turn_row(row))]
+
+    def complete_logical_turn(
+        self,
+        logical_turn_id: str,
+        attempt_id: str,
+        result: Optional[Dict[str, Any]] = None,
+        *,
+        delivery_required: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Close execution without conflating it with response delivery."""
+        now = time.time()
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM logical_turns WHERE logical_turn_id = ?",
+                (logical_turn_id,),
+            ).fetchone()
+            turn = self._logical_turn_row(row)
+            if turn is None or turn["current_attempt_id"] != attempt_id:
+                return turn
+            if turn["state"] in {"completed", "unrecoverable", "cancelled"}:
+                return turn
+            delivery_state = "pending" if delivery_required else "not_required"
+            conn.execute(
+                "UPDATE logical_turns SET state = 'completed', completed_at = ?, "
+                "updated_at = ?, result_json = ?, delivery_state = ?, "
+                "delivery_updated_at = ?, delivery_error = NULL "
+                "WHERE logical_turn_id = ? AND current_attempt_id = ?",
+                (
+                    now,
+                    now,
+                    json.dumps(result or {}, sort_keys=True, default=str),
+                    delivery_state,
+                    now,
+                    logical_turn_id,
+                    attempt_id,
+                ),
+            )
+            conn.execute(
+                "DELETE FROM session_turn_leases "
+                "WHERE conversation_id = ? AND holder = ?",
+                (turn["lease_conversation_id"], turn["lease_holder"]),
+            )
+            return self._logical_turn_row(
+                conn.execute(
+                    "SELECT * FROM logical_turns WHERE logical_turn_id = ?",
+                    (logical_turn_id,),
+                ).fetchone()
+            )
+
+        return self._execute_write(_do)
+
+    def fail_logical_turn(
+        self,
+        logical_turn_id: str,
+        attempt_id: str,
+        error: str,
+        *,
+        retryable: bool,
+    ) -> Optional[Dict[str, Any]]:
+        now = time.time()
+        next_state = "retry" if retryable else "unrecoverable"
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM logical_turns WHERE logical_turn_id = ?",
+                (logical_turn_id,),
+            ).fetchone()
+            turn = self._logical_turn_row(row)
+            if turn is None or turn["current_attempt_id"] != attempt_id:
+                return turn
+            if turn["state"] in {"completed", "unrecoverable", "cancelled"}:
+                return turn
+            conn.execute(
+                "UPDATE logical_turns SET state = ?, updated_at = ?, "
+                "failed_at = ?, error = ? WHERE logical_turn_id = ? "
+                "AND current_attempt_id = ?",
+                (
+                    next_state,
+                    now,
+                    now,
+                    str(error),
+                    logical_turn_id,
+                    attempt_id,
+                ),
+            )
+            conn.execute(
+                "DELETE FROM session_turn_leases "
+                "WHERE conversation_id = ? AND holder = ?",
+                (turn["lease_conversation_id"], turn["lease_holder"]),
+            )
+            return self._logical_turn_row(
+                conn.execute(
+                    "SELECT * FROM logical_turns WHERE logical_turn_id = ?",
+                    (logical_turn_id,),
+                ).fetchone()
+            )
+
+        return self._execute_write(_do)
+
+    def reconcile_logical_turns(self) -> int:
+        """Reconcile active attempts only after their durable lease is absent.
+
+        A claimed turn has not entered model/tool execution and is therefore
+        safe to retry.  Executing work is ambiguous after process loss: only
+        producers that persisted an explicit ``auto_retry`` recovery policy
+        may be replayed automatically.  All other executing turns become
+        blocked for producer-specific effect reconciliation instead of being
+        blindly executed twice.
+        """
+        now = time.time()
+
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM session_turn_leases WHERE expires_at <= ?", (now,)
+            )
+            claimed = conn.execute(
+                "UPDATE logical_turns SET state = 'retry', updated_at = ?, "
+                "error = COALESCE(error, 'reconciled after missing lease') "
+                "WHERE state = 'claimed' AND NOT EXISTS ("
+                "SELECT 1 FROM session_turn_leases lease "
+                "WHERE lease.conversation_id = logical_turns.lease_conversation_id "
+                "AND lease.holder = logical_turns.lease_holder)",
+                (now,),
+            )
+            retrying = conn.execute(
+                "UPDATE logical_turns SET state = 'retry', updated_at = ?, "
+                "error = COALESCE(error, 'reconciled auto-retry after missing lease') "
+                "WHERE state = 'executing' "
+                "AND COALESCE(json_extract(payload_json, '$.recovery_policy'), '') "
+                "= 'auto_retry' AND NOT EXISTS ("
+                "SELECT 1 FROM session_turn_leases lease "
+                "WHERE lease.conversation_id = logical_turns.lease_conversation_id "
+                "AND lease.holder = logical_turns.lease_holder)",
+                (now,),
+            )
+            blocked = conn.execute(
+                "UPDATE logical_turns SET state = 'blocked', updated_at = ?, "
+                "error = COALESCE(error, "
+                "'execution lease disappeared; effect reconciliation required') "
+                "WHERE state = 'executing' AND NOT EXISTS ("
+                "SELECT 1 FROM session_turn_leases lease "
+                "WHERE lease.conversation_id = logical_turns.lease_conversation_id "
+                "AND lease.holder = logical_turns.lease_holder)",
+                (now,),
+            )
+            return claimed.rowcount + retrying.rowcount + blocked.rowcount
+
+        return int(self._execute_write(_do) or 0)
+
+    def begin_logical_turn_delivery(
+        self, logical_turn_id: str, attempt_id: str
+    ) -> Optional[Dict[str, Any]]:
+        return self._update_logical_turn_delivery(
+            logical_turn_id, attempt_id, state="delivering", increment=True
+        )
+
+    def acknowledge_logical_turn_delivery(
+        self, logical_turn_id: str, attempt_id: str
+    ) -> Optional[Dict[str, Any]]:
+        return self._update_logical_turn_delivery(
+            logical_turn_id, attempt_id, state="delivered", increment=True
+        )
+
+    def record_logical_turn_transport_accepted(
+        self, logical_turn_id: str, attempt_id: str
+    ) -> Optional[Dict[str, Any]]:
+        return self._update_logical_turn_delivery(
+            logical_turn_id,
+            attempt_id,
+            state="transport_accepted",
+            increment=True,
+        )
+
+    def fail_logical_turn_delivery(
+        self, logical_turn_id: str, attempt_id: str, error: str
+    ) -> Optional[Dict[str, Any]]:
+        return self._update_logical_turn_delivery(
+            logical_turn_id,
+            attempt_id,
+            state="pending",
+            error=str(error),
+        )
+
+    def _update_logical_turn_delivery(
+        self,
+        logical_turn_id: str,
+        attempt_id: str,
+        *,
+        state: str,
+        increment: bool = False,
+        error: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        now = time.time()
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM logical_turns WHERE logical_turn_id = ?",
+                (logical_turn_id,),
+            ).fetchone()
+            turn = self._logical_turn_row(row)
+            if (
+                turn is None
+                or turn["state"] != "completed"
+                or turn["current_attempt_id"] != attempt_id
+                or turn["delivery_state"] == "delivered"
+            ):
+                return turn
+            conn.execute(
+                "UPDATE logical_turns SET delivery_state = ?, "
+                "delivery_attempts = delivery_attempts + ?, "
+                "delivery_updated_at = ?, delivery_error = ? "
+                "WHERE logical_turn_id = ?",
+                (
+                    state,
+                    1 if increment else 0,
+                    now,
+                    error,
+                    logical_turn_id,
+                ),
+            )
+            return self._logical_turn_row(
+                conn.execute(
+                    "SELECT * FROM logical_turns WHERE logical_turn_id = ?",
+                    (logical_turn_id,),
+                ).fetchone()
+            )
+
+        return self._execute_write(_do)
+
+    def list_pending_logical_turn_deliveries(
+        self,
+        *,
+        limit: int = 100,
+        include_transport_accepted: bool = False,
+        session_id: Optional[str] = None,
+        event_types: Optional[Iterable[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        states = ["pending", "delivering"]
+        if include_transport_accepted:
+            states.append("transport_accepted")
+        placeholders = ", ".join("?" for _ in states)
+        clauses = ["state = 'completed'", f"delivery_state IN ({placeholders})"]
+        params: List[Any] = list(states)
+        selected_types = tuple(
+            dict.fromkeys(str(value) for value in (event_types or ()))
+        )
+        if selected_types:
+            type_placeholders = ", ".join("?" for _ in selected_types)
+            clauses.append(
+                "COALESCE(json_extract(payload_json, '$.event_type'), '') "
+                f"IN ({type_placeholders})"
+            )
+            params.extend(selected_types)
+        if session_id is not None:
+            clauses.append("session_id = ?")
+            params.append(session_id)
+        params.append(max(1, int(limit)))
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                "SELECT * FROM logical_turns WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY completed_at, logical_turn_id LIMIT ?",
+                tuple(params),
+            ).fetchall()
+        return [turn for row in rows if (turn := self._logical_turn_row(row))]
 
     def get_compression_lock_holder(self, session_id: str) -> Optional[str]:
         """Return the current (non-expired) holder for ``session_id``, or None.
@@ -10989,13 +11690,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     )
             elif lease is not None:
                 current_holder = lease["holder"]
-                if (
-                    float(lease["expires_at"]) <= now
-                    or _compression_lock_holder_process_is_dead(current_holder)
-                ):
-                    # Match acquisition semantics: an expired or provably dead
-                    # owner is reclaimable. Deleting it inside this BEGIN IMMEDIATE
-                    # transaction also fences a stale late flush after the mutation.
+                if float(lease["expires_at"]) <= now:
+                    # Match acquisition semantics: only expiry makes a turn
+                    # owner reclaimable.  Deleting it inside this BEGIN
+                    # IMMEDIATE transaction also fences a stale late flush
+                    # after the mutation.
                     conn.execute(
                         "DELETE FROM session_turn_leases "
                         "WHERE conversation_id = ? AND holder = ?",
