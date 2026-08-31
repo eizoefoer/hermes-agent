@@ -105,6 +105,48 @@ async def test_status_command_reads_token_totals_from_session_db():
 
 
 @pytest.mark.asyncio
+async def test_status_command_reports_durable_ownership_separately(tmp_path):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    runner._session_db = AsyncSessionDB(db)
+    try:
+        db.create_session("sess-1", "telegram", user_id="u1")
+        first = db.admit_session_event(
+            session_id="sess-1",
+            session_key=session_entry.session_key,
+            source_identity="telegram:update:c1:one",
+            event_type="gateway-inbound",
+        )
+        claim = db.claim_logical_turn(first["logical_turn_id"], owner="gateway:99")
+        db.mark_logical_turn_started(first["logical_turn_id"], claim["attempt_id"])
+        db.admit_session_event(
+            session_id="sess-1",
+            session_key=session_entry.session_key,
+            source_identity="telegram:update:c1:two",
+            event_type="gateway-inbound",
+        )
+
+        result = await runner._handle_message(_make_event("/status"))
+
+        assert "**Agent Running:** No" in result
+        assert "**Process-local agent running:** No" in result
+        assert "**Durable turn state:** executing" in result
+        assert "**Lease state:** Active" in result
+        assert "**Lease expiry:**" in result and "none" not in result.split("**Lease expiry:**", 1)[1].splitlines()[0]
+        assert "**Queued turns:** 1" in result
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
 async def test_status_command_includes_live_agent_model_and_context():
     session_entry = SessionEntry(
         session_key=build_session_key(_make_source()),

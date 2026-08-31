@@ -612,6 +612,10 @@ class GatewaySlashCommandsMixin:
         # without duplicating token writes into two stores.
         db_total_tokens = 0
         persisted_route: dict[str, Any] = {}
+        durable_turn_state = "none"
+        durable_lease_state = "None"
+        durable_lease_expiry = "none"
+        durable_queue_depth = 0
         if self._session_db:
             try:
                 title = await self._session_db.get_session_title(session_entry.session_id)
@@ -638,6 +642,37 @@ class GatewaySlashCommandsMixin:
                     persisted_route = route
             except Exception:
                 persisted_route = {}
+            try:
+                turns = await self._session_db.list_session_logical_turns(
+                    session_entry.session_id
+                )
+                durable_queue_depth = sum(
+                    1 for turn in turns if turn.get("state") in {"queued", "retry"}
+                )
+                active_turn = next(
+                    (
+                        turn
+                        for turn in reversed(turns)
+                        if turn.get("state") in {"claimed", "executing"}
+                    ),
+                    None,
+                )
+                latest_turn = active_turn or (turns[-1] if turns else None)
+                if latest_turn:
+                    durable_turn_state = str(latest_turn.get("state") or "unknown")
+                lease = await self._session_db.inspect_session_turn_lease(
+                    session_entry.session_id
+                )
+                if lease:
+                    expires_at = float(lease.get("expires_at") or 0.0)
+                    durable_lease_state = (
+                        "Active" if expires_at > time.time() else "Expired"
+                    )
+                    durable_lease_expiry = datetime.fromtimestamp(
+                        expires_at, tz=datetime.now().astimezone().tzinfo
+                    ).isoformat()
+            except Exception:
+                logger.debug("Could not read durable /status diagnostics", exc_info=True)
 
         # Resolve model/context for cockpit-style status. Prefer the live or
         # cached agent because it carries the actual runtime route and context
@@ -744,6 +779,11 @@ class GatewaySlashCommandsMixin:
         lines.extend([
             t("gateway.status.tokens", tokens=f"{db_total_tokens:,}"),
             t("gateway.status.agent_running", state=t("gateway.status.state_yes") if is_running else t("gateway.status.state_no")),
+            t("gateway.status.process_local_running", state=t("gateway.status.state_yes") if is_running else t("gateway.status.state_no")),
+            t("gateway.status.durable_turn_state", state=durable_turn_state),
+            t("gateway.status.lease_state", state=durable_lease_state),
+            t("gateway.status.lease_expiry", timestamp=durable_lease_expiry),
+            t("gateway.status.durable_queued", count=durable_queue_depth),
         ])
         if queue_depth:
             lines.append(t("gateway.status.queued", count=queue_depth))
