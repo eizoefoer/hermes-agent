@@ -30,6 +30,7 @@ def test_worker_spawn_tags_session_source_kanban(monkeypatch, tmp_path):
         pid = 4321
 
     def _fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
         captured["env"] = kwargs["env"]
         return _Proc()
 
@@ -60,6 +61,8 @@ def test_worker_spawn_tags_session_source_kanban(monkeypatch, tmp_path):
     kb._default_spawn(task, workspace)
 
     assert captured["env"]["HERMES_SESSION_SOURCE"] == "kanban"
+    source_index = captured["cmd"].index("--source")
+    assert captured["cmd"][source_index + 1] == "kanban"
 
 
 def test_kanban_rows_stay_out_of_the_session_list(db):
