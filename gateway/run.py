@@ -1126,6 +1126,8 @@ def _exec_approval_metadata(ctx, approval_data: dict, cmd: str, desc: str) -> di
             "worktree": ctx.worktree,
             "parent_logical_turn_id": ctx.parent_logical_turn_id,
             "process_local_fast_path": True,
+            "allow_session": approval_data.get("allow_session", True) and not approval_data.get("smart_denied", False),
+            "allow_permanent": approval_data.get("allow_permanent", True) and not approval_data.get("smart_denied", False),
         },
         # This fresh identifier is persisted before Telegram
         # delivery. Replayed callback data resolves the same

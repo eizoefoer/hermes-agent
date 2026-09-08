@@ -153,12 +153,13 @@ JUDGE_SYSTEM_PROMPT = (
     "You are a strict judge evaluating whether an autonomous agent has "
     "achieved a user's stated goal. You receive the goal text, the agent's "
     "most recent response, and — when present — a list of background "
-    "processes the agent has running. Decide one of three verdicts.\n\n"
+    "processes the agent has running. Decide one of four verdicts.\n\n"
     "DONE — the goal is fully satisfied:\n"
     "- The response explicitly confirms the goal was completed, OR\n"
     "- The response clearly shows the final deliverable was produced, OR\n"
-    "- The response explains the goal is unachievable / blocked / needs "
-    "user input (treat this as DONE with reason describing the block).\n\n"
+    "BLOCKED — the goal remains incomplete and cannot progress without "
+    "user input or an external dependency. Never report this as DONE. "
+    "If a safe concrete action remains, choose CONTINUE instead.\n\n"
     "WAIT — the goal is NOT done, but the next step is to wait for async "
     "work to finish rather than act again. Choose this ONLY when the agent's "
     "progress is genuinely gated on something running on its own:\n"
@@ -180,6 +181,7 @@ JUDGE_SYSTEM_PROMPT = (
     "take right now. This is the default when in doubt.\n\n"
     "Reply ONLY with a single JSON object on one line. Shapes:\n"
     '{"verdict": "done", "reason": "<one sentence>"}\n'
+    '{"verdict": "blocked", "reason": "<specific unresolved dependency>"}\n'
     '{"verdict": "continue", "reason": "<one sentence>"}\n'
     '{"verdict": "wait", "wait_on_session": "<id>", "reason": "<one sentence>"}\n'
     '{"verdict": "wait", "wait_on_pid": <int>, "reason": "<one sentence>"}\n'
@@ -248,8 +250,8 @@ JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "verification and it's still running), return WAIT on that process "
     "instead of re-poking — re-poking now would be pure busy-work.\n"
     "- If the response explains the work is blocked / unachievable / needs "
-    "user input (e.g. the stated Stop condition was hit), treat it as DONE "
-    "with the reason describing the block.\n"
+    "user input (e.g. the stated Stop condition was hit), return BLOCKED "
+    "with the unresolved dependency; the goal is not achieved.\n"
     "- Otherwise the goal is NOT done — CONTINUE.\n\n"
     "Is the goal satisfied per its completion contract — done, continue, or wait?"
 )
@@ -1084,7 +1086,7 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
             done = bool(done_val)
         verdict = "done" if done else "continue"
 
-    if verdict not in {"done", "continue", "wait"}:
+    if verdict not in {"done", "continue", "wait", "blocked"}:
         verdict = "continue"
 
     if verdict != "wait":
@@ -1999,6 +2001,16 @@ class GoalManager:
                 "message": f"⏳ Goal parked (judge) — waiting on {tgt}: {reason}",
             }
 
+        if verdict == "blocked":
+            state.status = "paused"
+            state.paused_reason = reason
+            save_goal(self.session_id, state)
+            return {
+                "status": "paused", "should_continue": False,
+                "continuation_prompt": None, "verdict": "blocked", "reason": reason,
+                "message": f"⏸ Goal blocked — incomplete: {reason}",
+            }
+
         if verdict == "done":
             state.status = "done"
             save_goal(self.session_id, state)
@@ -2254,6 +2266,13 @@ def run_kanban_goal_loop(
         # via kanban_complete / kanban_block, not by parking), so a WAIT
         # verdict is treated as CONTINUE here.
         verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(goal_text, last_response)
+        if verdict == "blocked":
+            try:
+                block_fn(f"Goal remains incomplete: {reason}")
+            except Exception as exc:
+                _log(f"kanban goal loop: block_fn failed ({exc})")
+                return {"outcome": "stopped", "turns_used": turns_used, "reason": str(exc)}
+            return {"outcome": "blocked_by_worker", "turns_used": turns_used, "reason": reason}
         if verdict == "wait":
             verdict = "continue"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")

@@ -798,3 +798,19 @@ class TestContractAndBackgroundCompose:
         assert verdict == "wait"
         assert wait_directive and wait_directive.get("pid") == 4242
 
+
+
+def test_blocked_judge_result_does_not_mark_goal_achieved(hermes_home):
+    from hermes_cli import goals
+    verdict, reason, failed, directive = goals._parse_judge_response(
+        '{"verdict": "blocked", "reason": "Source dependency unresolved"}')
+    assert verdict == "blocked"
+    mgr = goals.GoalManager("blocked-regression")
+    mgr.set("Repair and deploy the worker")
+    with patch.object(goals, "judge_goal", return_value=(verdict, reason, False, None, False)):
+        result = mgr.evaluate_after_turn("Blocked; stopping.")
+    assert result["status"] == "paused"
+    assert result["verdict"] == "blocked"
+    assert result["should_continue"] is False
+    assert "achieved" not in result["message"].lower()
+    assert goals.load_goal("blocked-regression").status == "paused"

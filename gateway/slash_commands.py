@@ -6131,6 +6131,35 @@ class GatewaySlashCommandsMixin:
         lines.append("Invoke a bundle with `/<slug>` to load all its skills.")
         return "\n".join(lines)
 
+    def _resolve_durable_telegram_command(self, event, session_key, *, deny=False):
+        """Typed decisions use the same persisted continuation as card buttons."""
+        adapter = self.adapters.get(event.source.platform)
+        if getattr(type(adapter), "_get_telegram_approval_service", None) is None:
+            return None
+        service = adapter._get_telegram_approval_service()
+        actor = str(getattr(event.source, "user_id", None) or "")
+        pending = [request for request in service.store.pending_requests(session_key)
+                   if request.payload.get("approval_user_id") == actor and actor]
+        if not pending:
+            return None
+        args = event.get_command_args().strip().lower().split()
+        choice = "deny" if deny else "once"
+        if not deny:
+            if any(arg in {"always", "permanent", "permanently"} for arg in args):
+                choice = "always"
+            elif any(arg in {"session", "ses"} for arg in args):
+                choice = "session"
+        selected = pending if "all" in args else pending[:1]
+        if any((choice == "session" and not request.payload.get("allow_session", False)) or
+               (choice == "always" and not request.payload.get("allow_permanent", False))
+               for request in selected):
+            return "This approval permits one operation only. Reply /approve or /deny."
+        for request in selected:
+            service.decide(request.request_id, choice, decided_by=actor)
+        return ("Denied" if deny else "Approved") + f" {len(selected)} command(s). " + (
+            "The saved decision will be delivered to the task." if deny else
+            "The task will resume from its saved approval.")
+
     async def _handle_approve_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /approve command — unblock waiting agent thread(s).
 
@@ -6157,6 +6186,10 @@ class GatewaySlashCommandsMixin:
         from tools.approval import (
             resolve_gateway_approval, has_blocking_approval,
         )
+
+        durable = self._resolve_durable_telegram_command(event, session_key, deny=False)
+        if durable is not None:
+            return durable
 
         if not has_blocking_approval(session_key):
             if session_key in self._pending_approvals:
@@ -6234,6 +6267,10 @@ class GatewaySlashCommandsMixin:
         from tools.approval import (
             resolve_gateway_approval, has_blocking_approval,
         )
+
+        durable = self._resolve_durable_telegram_command(event, session_key, deny=True)
+        if durable is not None:
+            return durable
 
         if not has_blocking_approval(session_key):
             if session_key in self._pending_approvals:

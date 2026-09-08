@@ -245,6 +245,15 @@ class ApprovalStore:
             ).fetchone()
         return self._approval(row) if row else None
 
+    def pending_requests(self, session_key: str) -> list[ApprovalRequest]:
+        """Return only undecided requests in this conversation, oldest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM approval_requests WHERE session_key=? AND decision IS NULL ORDER BY created_at, rowid",
+                (session_key,),
+            ).fetchall()
+        return [self._approval(row) for row in rows]
+
     def decide(
         self,
         request_id: str,
