@@ -1100,6 +1100,43 @@ async def _send_or_update_status_coro(adapter, chat_id, status_key, content, met
     return await adapter.send(chat_id, content, metadata=metadata)
 
 
+def _exec_approval_metadata(ctx, approval_data: dict, cmd: str, desc: str) -> dict:
+    """Bind a durable approval to the current turn and requesting user."""
+    approval_metadata = dict(ctx._status_thread_metadata or {})
+    approval_metadata["approval_continuation"] = {
+        "kind": "hermes_session",
+        "payload": {
+            "session_id": ctx.session_id,
+            "command": cmd,
+            "description": desc,
+            "pattern_key": approval_data.get("pattern_key"),
+            "pattern_keys": list(
+                approval_data.get("pattern_keys") or []
+            ),
+            "permanent_pattern_keys": list(
+                approval_data.get("permanent_pattern_keys") or []
+            ),
+            "task_id": ctx.task_id,
+            "goal_id": ctx.goal_id,
+            "approval_user_id": str(
+                getattr(ctx.source, "user_id", None)
+                or ctx._status_chat_id
+            ),
+            "branch": ctx.branch,
+            "worktree": ctx.worktree,
+            "parent_logical_turn_id": ctx.parent_logical_turn_id,
+            "process_local_fast_path": True,
+        },
+        # This fresh identifier is persisted before Telegram
+        # delivery. Replayed callback data resolves the same
+        # request; later legitimate approvals get a new key.
+        "idempotency_key": (
+            f"gateway-approval:{ctx.session_id}:{uuid.uuid4().hex}"
+        ),
+    }
+    return approval_metadata
+
+
 def _approval_send_outcome(future, timeout: float) -> str:
     """Classify an approval prompt send as ``sent`` / ``failed`` / ``ambiguous``.
 
@@ -6589,38 +6626,7 @@ class TurnRunner:
             # false positives from MagicMock auto-attribute creation in tests.
             if getattr(type(ctx._status_adapter), "send_exec_approval", None) is not None:
                 try:
-                    approval_metadata = dict(ctx._status_thread_metadata or {})
-                    approval_metadata["approval_continuation"] = {
-                        "kind": "hermes_session",
-                        "payload": {
-                            "session_id": ctx.session_id,
-                            "command": cmd,
-                            "description": desc,
-                            "pattern_key": approval_data.get("pattern_key"),
-                            "pattern_keys": list(
-                                approval_data.get("pattern_keys") or []
-                            ),
-                            "permanent_pattern_keys": list(
-                                approval_data.get("permanent_pattern_keys") or []
-                            ),
-                            "task_id": ctx.task_id,
-                            "goal_id": ctx.goal_id,
-                            "approval_user_id": str(
-                                getattr(event.source, "user_id", None)
-                                or ctx._status_chat_id
-                            ),
-                            "branch": ctx.branch,
-                            "worktree": ctx.worktree,
-                            "parent_logical_turn_id": ctx.parent_logical_turn_id,
-                            "process_local_fast_path": True,
-                        },
-                        # This fresh identifier is persisted before Telegram
-                        # delivery. Replayed callback data resolves the same
-                        # request; later legitimate approvals get a new key.
-                        "idempotency_key": (
-                            f"gateway-approval:{ctx.session_id}:{uuid.uuid4().hex}"
-                        ),
-                    }
+                    approval_metadata = _exec_approval_metadata(ctx, approval_data, cmd, desc)
                     _approval_fut = safe_schedule_threadsafe(
                         ctx._status_adapter.send_exec_approval(
                             chat_id=ctx._status_chat_id,
