@@ -10853,10 +10853,6 @@ def _default_spawn(
         *_resolve_hermes_argv(),
         "-p", profile_arg,
         "--cli",
-        # main.py applies the CLI default source ("cli") after process env.
-        # Pass this explicitly so every worker creates an isolated kanban
-        # session instead of inheriting/resuming a profile's CLI turn lease.
-        "--source", "kanban",
         # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
         # so they see that profile's shell-hook allowlist instead of the
         # dispatcher's root allowlist. Pass --accept-hooks explicitly so
@@ -10890,6 +10886,9 @@ def _default_spawn(
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
         "chat",
+        # --source belongs to the chat subparser, not the top-level parser.
+        # Tag workers explicitly without treating "kanban" as a command.
+        "--source", "kanban",
         "-q", prompt,
     ])
     if task.goal_mode:

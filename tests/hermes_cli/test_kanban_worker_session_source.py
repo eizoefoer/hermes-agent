@@ -63,6 +63,14 @@ def test_worker_spawn_tags_session_source_kanban(monkeypatch, tmp_path):
     assert captured["env"]["HERMES_SESSION_SOURCE"] == "kanban"
     source_index = captured["cmd"].index("--source")
     assert captured["cmd"][source_index + 1] == "kanban"
+    from hermes_cli._parser import build_top_level_parser
+    # main consumes the profile selector before invoking this parser.
+    parser, _, _ = build_top_level_parser()
+    args = parser.parse_args(captured["cmd"][captured["cmd"].index("-p") + 2:])
+    assert args.command == "chat"
+    assert args.source == "kanban"
+    assert task.id in args.query
+
 
 
 def test_kanban_rows_stay_out_of_the_session_list(db):
