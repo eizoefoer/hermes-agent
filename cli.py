@@ -16733,6 +16733,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
+    @staticmethod
+    def _start_cli_agent_thread(target):
+        """Carry the admitted logical-turn lease into the model thread."""
+        import contextvars
+        context = contextvars.copy_context()
+        thread = threading.Thread(target=context.run, args=(target,), daemon=True)
+        thread.start()
+        return thread
+
     def _admit_cli_logical_turn(
         self,
         message: Any,
@@ -16749,15 +16758,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             raise RuntimeError(
                 "SessionDB is unavailable; refusing unmanaged persistent CLI work"
             )
+        session_source = os.environ.get("HERMES_SESSION_SOURCE") or "cli"
         if not state.get_session(self.session_id):
-            state.create_session(self.session_id, "cli")
+            state.create_session(self.session_id, session_source)
         accepted_source = source_identity or f"cli:{event_type}:{uuid.uuid4().hex}"
         admitted = state.admit_session_event(
             session_id=self.session_id,
-            session_key=f"cli:{self.session_id}",
+            session_key=f"{session_source}:{self.session_id}",
             source_identity=accepted_source,
             event_type=event_type,
-            payload={"text": str(message), "source": "cli", **(payload or {})},
+            payload={"text": str(message), "source": session_source, **(payload or {})},
             task_id=task_id,
             goal_id=goal_id,
             worktree=os.getcwd(),
@@ -17286,8 +17296,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # finishes; reset on the next turn.
             self._prompt_start_time = time.time()
             self._prompt_duration = 0.0
-            agent_thread = threading.Thread(target=run_agent, daemon=True)
-            agent_thread.start()
+            agent_thread = self._start_cli_agent_thread(run_agent)
 
             # Ambient "thinking" sound: calm bubble blips while the agent
             # works in voice mode with no audio flowing, so the user knows

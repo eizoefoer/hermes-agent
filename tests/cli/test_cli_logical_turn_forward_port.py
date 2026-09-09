@@ -203,3 +203,34 @@ def test_identical_background_commands_are_distinct_but_exact_replay_is_stable(
 class SimpleConsole:
     def print(self, *_args, **_kwargs):
         return None
+
+
+def test_model_thread_inherits_actual_admitted_lease(tmp_path):
+    from hermes_state import consume_preacquired_logical_turn_lease
+    db = SessionDB(tmp_path / "state.db")
+    cli = _cli(db, "worker-thread")
+    claim = cli._admit_cli_logical_turn("verify task")
+    observed = []
+    def model_turn():
+        lease = consume_preacquired_logical_turn_lease(cli.session_id)
+        observed.append(lease)
+        assert lease["holder"] == db.get_session_turn_lease(cli.session_id)["holder"]
+    thread = cli._start_cli_agent_thread(model_turn)
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert observed and observed[0]["holder"] == claim["lease"]["holder"]
+    cli._finish_cli_logical_turn(claim, {"final_response": "verified"})
+    assert db.get_session_turn_lease(cli.session_id) is None
+
+
+def test_worker_admission_preserves_kanban_source(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+    db = SessionDB(tmp_path / "state.db")
+    cli = HermesCLI.__new__(HermesCLI)
+    cli._session_db = db
+    cli.session_id = "new-kanban-worker"
+    claim = cli._admit_cli_logical_turn("verify task")
+    assert db.get_session(cli.session_id)["source"] == "kanban"
+    turn = db.get_logical_turn(claim["logical_turn_id"])
+    assert turn["session_key"] == "kanban:new-kanban-worker"
+    cli._finish_cli_logical_turn(claim, {"final_response": "verified"})
