@@ -10621,6 +10621,14 @@ def _resolve_hermes_argv() -> list[str]:
             return _hermes_path_argv(resolved_env_bin)
         return _module_hermes_argv()
 
+    # A pinned source deployment must not escape through a system wrapper
+    # that can discard PYTHONPATH (and the worker profile environment).
+    source_root = Path(__file__).resolve().parent.parent
+    python_roots = [Path(p).expanduser().resolve() for p in
+                    os.environ.get("PYTHONPATH", "").split(os.pathsep) if p]
+    if source_root in python_roots:
+        return _module_hermes_argv()
+
     hermes_bin = _safe_which_no_cwd("hermes") if _IS_WINDOWS else shutil.which("hermes")
     if hermes_bin:
         return _hermes_path_argv(hermes_bin)

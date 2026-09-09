@@ -161,3 +161,13 @@ toolsets:
     assert "web" in resolved
     assert "kanban" in resolved  # recovered worker lifecycle surface
     assert resolved != ["kanban"]
+
+
+def test_pinned_source_uses_current_interpreter(monkeypatch):
+    from hermes_cli import kanban_db
+    from pathlib import Path
+    import sys
+    monkeypatch.delenv("HERMES_BIN", raising=False)
+    monkeypatch.setenv("PYTHONPATH", str(Path(kanban_db.__file__).resolve().parent.parent))
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/local/bin/hermes")
+    assert kanban_db._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
