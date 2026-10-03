@@ -2271,6 +2271,9 @@ class TestSharedBoardPaths:
         )
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
+        assert "--cli" in captured["cmd"]
+        source_index = captured["cmd"].index("--source")
+        assert captured["cmd"][source_index + 1] == "kanban"
 
 
 # ---------------------------------------------------------------------------
