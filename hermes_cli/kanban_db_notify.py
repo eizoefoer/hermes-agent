@@ -31,6 +31,11 @@ _SCALAR_TYPES = (str, int, float, bool)
 # ``(task_id, platform, chat_id, thread_id or "")`` against it.
 _SUB_KEY_WHERE = "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?"
 
+# A lost process must not strand its advanced cursor forever. Delivery is
+# at-least-once: a crash between remote acceptance and ping checkpoint can
+# still duplicate a ping; Telegram has no idempotency key for sendMessage.
+NOTIFY_CLAIM_LEASE_SECONDS = 300
+
 
 def _sub_key(task_id: str, platform: str, chat_id: str, thread_id: Optional[str]) -> tuple:
     return (task_id, platform, chat_id, thread_id or "")
@@ -357,6 +362,7 @@ def claim_unseen_events_for_sub(
     chat_id: str,
     thread_id: Optional[str] = None,
     kinds: Optional[Iterable[str]] = None,
+    claim_metadata: Optional[dict] = None,
 ) -> tuple[int, int, list[Event]]:
     """Atomically claim unseen events for one subscription.
 
@@ -368,9 +374,20 @@ def claim_unseen_events_for_sub(
     delivery failure.
     """
     with _kb.write_txn(conn):
-        old_cursor = _notify_cursor(conn, task_id, platform, chat_id, thread_id)
-        if old_cursor is None:
+        key = _sub_key(task_id, platform, chat_id, thread_id)
+        row = conn.execute("SELECT last_event_id, claim_old_cursor, claim_expires_at FROM kanban_notify_subs "
+                           + _SUB_KEY_WHERE, key).fetchone()
+        if row is None:
             return 0, 0, []
+        old_cursor = int(row["last_event_id"])
+        if row["claim_old_cursor"] is None and int(row["claim_expires_at"]) > int(time.time()):
+            return old_cursor, old_cursor, []
+        if row["claim_old_cursor"] is not None:
+            if int(row["claim_expires_at"]) > int(time.time()):
+                return old_cursor, old_cursor, []
+            old_cursor = int(row["claim_old_cursor"])
+            conn.execute("UPDATE kanban_notify_subs SET last_event_id = ?, claim_old_cursor = NULL, claim_expires_at = 0 "
+                         + _SUB_KEY_WHERE, (old_cursor, *key))
         new_cursor, events = unseen_events_for_sub(
             conn, task_id=task_id, platform=platform, chat_id=chat_id,
             thread_id=thread_id, kinds=kinds,
@@ -378,6 +395,15 @@ def claim_unseen_events_for_sub(
         if not events:
             return old_cursor, old_cursor, []
         _cas_cursor(conn, _sub_key(task_id, platform, chat_id, thread_id), new_cursor, old_cursor)
+        if platform.lower() == "tui":
+            # The in-process UI poller consumes a claim immediately and has no
+            # asynchronous settlement leg. Preserve its existing cursor contract.
+            return old_cursor, new_cursor, events
+        expires_at = int(time.time()) + NOTIFY_CLAIM_LEASE_SECONDS
+        conn.execute("UPDATE kanban_notify_subs SET claim_old_cursor = ?, claim_expires_at = ? " + _SUB_KEY_WHERE,
+                     (old_cursor, expires_at, *key))
+        if claim_metadata is not None:
+            claim_metadata["claim_expires_at"] = expires_at
         return old_cursor, new_cursor, events
 
 
@@ -397,24 +423,29 @@ def advance_notify_cursor(
     chat_id: str,
     thread_id: Optional[str] = None,
     new_cursor: int,
+    expected_claim_expires_at: Optional[int] = None,
 ) -> None:
+    guard, params = _claim_guard(expected_claim_expires_at)
     with _kb.write_txn(conn):
         conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? " + _SUB_KEY_WHERE,
-            (int(new_cursor), *_sub_key(task_id, platform, chat_id, thread_id)),
+            "UPDATE kanban_notify_subs SET last_event_id = ?, claim_old_cursor = NULL, claim_expires_at = 0 "
+            + _SUB_KEY_WHERE + guard,
+            (int(new_cursor), *_sub_key(task_id, platform, chat_id, thread_id), *params),
         )
 
 
 def record_notify_ping(
     conn: sqlite3.Connection, *, task_id: str, platform: str, chat_id: str,
     thread_id: Optional[str] = None, event_id: int,
+    expected_claim_expires_at: Optional[int] = None,
 ) -> None:
     """Checkpoint a sent ping independently of the retryable wake cursor."""
+    guard, params = _claim_guard(expected_claim_expires_at)
     with _kb.write_txn(conn):
         conn.execute(
             "UPDATE kanban_notify_subs SET last_ping_event_id = MAX(last_ping_event_id, ?) "
-            + _SUB_KEY_WHERE,
-            (int(event_id), *_sub_key(task_id, platform, chat_id, thread_id)),
+            + _SUB_KEY_WHERE + guard,
+            (int(event_id), *_sub_key(task_id, platform, chat_id, thread_id), *params),
         )
 
 
@@ -427,13 +458,43 @@ def rewind_notify_cursor(
     thread_id: Optional[str] = None,
     claimed_cursor: int,
     old_cursor: int,
+    retry_delay_seconds: int = 0,
+    expected_claim_expires_at: Optional[int] = None,
 ) -> bool:
     """Undo a claim when delivery fails. The CAS guard only rewinds if no later
     notifier advanced the row, so retries never clobber newer progress.
     """
     with _kb.write_txn(conn):
+        if expected_claim_expires_at is not None:
+            row = conn.execute("SELECT claim_expires_at FROM kanban_notify_subs " + _SUB_KEY_WHERE,
+                               _sub_key(task_id, platform, chat_id, thread_id)).fetchone()
+            if row is None or int(row["claim_expires_at"]) != expected_claim_expires_at:
+                return False
         cur = _cas_cursor(conn, _sub_key(task_id, platform, chat_id, thread_id), old_cursor, claimed_cursor)
+        if cur.rowcount:
+            conn.execute("UPDATE kanban_notify_subs SET claim_old_cursor = NULL, claim_expires_at = ? " + _SUB_KEY_WHERE,
+                         (int(time.time()) + retry_delay_seconds if retry_delay_seconds else 0,
+                          *_sub_key(task_id, platform, chat_id, thread_id)))
     return cur.rowcount > 0
+
+
+def _claim_guard(expected_claim_expires_at: Optional[int]) -> tuple[str, tuple]:
+    if expected_claim_expires_at is None:
+        return "", ()
+    return " AND claim_expires_at = ? AND claim_old_cursor IS NOT NULL", (expected_claim_expires_at,)
+
+
+def notify_claim_is_current(
+    conn: sqlite3.Connection, *, task_id: str, platform: str, chat_id: str,
+    thread_id: Optional[str] = None, expected_claim_expires_at: int,
+) -> bool:
+    """Fence a delayed batch before it sends or wakes; expired leases are not authority."""
+    row = conn.execute(
+        "SELECT 1 FROM kanban_notify_subs " + _SUB_KEY_WHERE
+        + " AND claim_old_cursor IS NOT NULL AND claim_expires_at = ? AND claim_expires_at > ?",
+        (*_sub_key(task_id, platform, chat_id, thread_id), expected_claim_expires_at, int(time.time())),
+    ).fetchone()
+    return row is not None
 
 
 # Late-bound origin namespace (see module docstring); imported LAST so this
