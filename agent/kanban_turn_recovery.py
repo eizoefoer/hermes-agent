@@ -50,6 +50,18 @@ from typing import Any, Callable, Optional
 
 from agent.error_classifier import FailoverReason
 
+# Import fingerprint functions for PID recycling detection
+try:
+    from gateway.drain_control import current_instantiation_epoch
+    from gateway.status import get_process_start_time
+except ImportError:
+    # Fallback for environments where gateway is not available
+    def current_instantiation_epoch():
+        return 0
+    
+    def get_process_start_time(pid):
+        return None
+
 logger = logging.getLogger(__name__)
 
 #: Recovery attempts when ``HERMES_KANBAN_TURN_RECOVERY`` is unset.
@@ -198,10 +210,16 @@ def worker_claim_is_live() -> bool:
     the reconciler processes the row; a NULL expiry is not a provable live
     lease either and fails closed.
 
+    EVIDENCE-BASED DEAD PID DETECTION: Verify PID plus start identity/cgroup
+    ownership to distinguish between live workers and recycled PIDs.
+    Uses process fingerprinting (instantiation epoch + start time) for robust
+    PID recycling detection.
+
     FAIL-CLOSED: any missing coordinate, missing/unreadable DB, mismatched
-    run/lock/pid, closed run, or expired lease returns False and the caller
-    does not re-enter the model — an honest non-zero exit is always available,
-    whereas mutating state under a released or expired claim is not recoverable.
+    run/lock/pid, closed run, expired lease, or failed PID identity verification
+    returns False and the caller does not re-enter the model — an honest
+    non-zero exit is always available, whereas mutating state under a released
+    or expired claim is not recoverable.
     """
     task_id = kanban_task_id()
     if task_id is None:
@@ -224,7 +242,7 @@ def worker_claim_is_live() -> bool:
         try:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
-                "SELECT status, worker_pid, current_run_id, claim_lock, claim_expires "
+                "SELECT status, worker_pid, current_run_id, claim_lock, claim_expires, worker_started_at "
                 "FROM tasks WHERE id = ?",
                 (task_id,),
             ).fetchone()
@@ -246,6 +264,42 @@ def worker_claim_is_live() -> bool:
                 return False
             if row["claim_expires"] is None or int(row["claim_expires"]) < now:
                 return False
+            # EVIDENCE-BASED PID LIVENESS: Verify process fingerprint matches recorded start identity
+            recorded_started_at = row["worker_started_at"]
+            if recorded_started_at is not None:
+                # Verify PID hasn't been recycled by checking process fingerprint
+                try:
+                    current_start_time = get_process_start_time(os.getpid())
+                    if current_start_time is None:
+                        logger.warning("kanban claim check: unable to get start time for PID %d — not retrying in place", os.getpid())
+                        return False
+                    # For legacy rows without full fingerprint, check start time only
+                    if isinstance(recorded_started_at, int) and recorded_started_at != 0:
+                        # Legacy fingerprint format: just start time
+                        if int(recorded_started_at) != current_start_time:
+                            logger.warning("kanban claim check: PID %d start time mismatch (recorded %d, current %d) — not retrying in place", 
+                                         os.getpid(), int(recorded_started_at), current_start_time)
+                            return False
+                    elif isinstance(recorded_started_at, str) and "|" in recorded_started_at:
+                        # Full fingerprint format: instantiation_epoch|start_time
+                        try:
+                            recorded_epoch, recorded_start = recorded_started_at.split("|", 1)
+                            current_epoch = current_instantiation_epoch()
+                            if int(recorded_epoch) != current_epoch or int(recorded_start) != current_start_time:
+                                logger.warning("kanban claim check: PID %d fingerprint mismatch — not retrying in place", os.getpid())
+                                return False
+                        except (ValueError, IndexError):
+                            logger.warning("kanban claim check: PID %d malformed fingerprint %s — not retrying in place", 
+                                         os.getpid(), recorded_started_at)
+                            return False
+                    else:
+                        # UNVERIFIED or other special values - fall back to basic PID check
+                        pass
+                except Exception as e:
+                    logger.warning("kanban claim check: PID %d fingerprint verification failed: %s — not retrying in place", 
+                                 os.getpid(), str(e))
+                    return False
+            
             run = conn.execute(
                 "SELECT ended_at, worker_pid, claim_expires FROM task_runs WHERE id = ?",
                 (int(current_run_id),),
