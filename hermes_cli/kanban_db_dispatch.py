@@ -641,7 +641,18 @@ def _defer_reclaim_for_live_worker_with_cooperative_steering(
             payload["timeout_seconds"] = timeout_seconds
         if termination:
             payload.update(termination)
-        _kb._append_event(conn, task_id, "cooperative_steering_applied", payload, run_id=run_id)
+        noticed = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? AND run_id IS ? "
+            "AND kind='cooperative_steering_applied' LIMIT 1", (task_id, run_id),
+        ).fetchone()
+        if noticed is None:
+            _kb._append_event(conn, task_id, "cooperative_steering_applied", payload, run_id=run_id)
+            # Workers consume native comments cooperatively at the next activity boundary.
+            _kb.add_comment(conn, task_id, author="recovery-supervisor", body=(
+                "Recovery checkpoint requested: heartbeat is stale, but your live owner is preserved. "
+                "At the next safe boundary record progress/checkpoint and continue within the "
+                "existing approval scope. No interruption or duplicate worker was requested."
+            ))
 
 
 def _defer_reclaim_for_live_worker(
@@ -841,7 +852,7 @@ def detect_stale_running(
     reclaimed: list[str] = []
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.worker_started_at, t.last_heartbeat_at, t.claim_lock, "
+        "SELECT t.id, t.worker_pid, t.worker_started_at, t.current_run_id, t.last_heartbeat_at, t.claim_lock, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -864,98 +875,26 @@ def detect_stale_running(
         tid = row["id"]
         lock = row["claim_lock"] or ""
         
-        # EVIDENCE-BASED DEAD PID DETECTION: Verify worker is actually dead before reclaiming
-        # Never reclaim based on elapsed time alone - only on verified PID recycling/process death
-        worker_is_dead = False
-        try:
-            # Check if process is alive
-            if not _kb._pid_alive(pid):
-                worker_is_dead = True
-                termination = {"host_local": True, "terminated": True, "pid": pid}
-            else:
-                # Process is alive, check if PID has been recycled using start identity
-                recorded_started_at = _kb._row_get(row, "worker_started_at")
-                if recorded_started_at is not None and recorded_started_at != UNVERIFIED_WORKER_FINGERPRINT:
-                    # Verify PID hasn't been recycled by checking process fingerprint
-                    try:
-                        current_start_time = get_process_start_time(pid)
-                        if current_start_time is None:
-                            # Cannot verify start time, conservatively assume alive
-                            worker_is_dead = False
-                        else:
-                            # For legacy rows without full fingerprint, check start time only
-                            if isinstance(recorded_started_at, int) and recorded_started_at != 0:
-                                # Legacy fingerprint format: just start time
-                                if int(recorded_started_at) != current_start_time:
-                                    worker_is_dead = True  # PID recycled
-                                    termination = {"host_local": True, "pid_recycled": True, "pid": pid}
-                                else:
-                                    worker_is_dead = False  # Same PID, same start time
-                            elif isinstance(recorded_started_at, str) and "|" in recorded_started_at:
-                                # Full fingerprint format: instantiation_epoch|start_time
-                                try:
-                                    recorded_epoch, recorded_start = recorded_started_at.split("|", 1)
-                                    current_epoch = current_instantiation_epoch()
-                                    if int(recorded_epoch) != current_epoch or int(recorded_start) != current_start_time:
-                                        worker_is_dead = True  # PID recycled
-                                        termination = {"host_local": True, "pid_recycled": True, "pid": pid}
-                                    else:
-                                        worker_is_dead = False  # Same PID, same fingerprint
-                                except (ValueError, IndexError):
-                                    # Malformed fingerprint, conservatively assume alive
-                                    worker_is_dead = False
-                            else:
-                                # UNVERIFIED or other special values - fall back to basic PID check (already done above)
-                                worker_is_dead = False
-                    except Exception:
-                        # Error in verification, conservatively assume alive
-                        worker_is_dead = False
-                else:
-                    # UNVERIFIED fingerprint or None - can't reliably detect recycling, conservatively assume alive
-                    worker_is_dead = False
-                    
-                if not worker_is_dead:
-                    # Worker is alive and PID not recycled - use cooperative steering instead of reclamation
-                    _defer_reclaim_for_live_worker_with_cooperative_steering(
-                        conn, tid, lock, now, 
-                        reason="heartbeat_stale_worker_alive_cooperative_steering",
-                        elapsed_seconds=elapsed,
-                        heartbeat_age_seconds=_kb._opt_int(hb_age) if hb_age is not None else None,
-                        timeout_seconds=stale_timeout_seconds
-                    )
-                    continue
-                    
-        except Exception:
-            # Error in worker death detection, conservatively assume alive and use cooperative steering
+        # A remote claim's PID is not evidence on this host. Use the same boot/start
+        # identity as every other native lifecycle path, never parse a boot UUID as int.
+        if not lock.startswith(_kb._host_prefix()):
+            continue
+        fingerprint = row["worker_started_at"]
+        if _worker_alive(pid, fingerprint):
             _defer_reclaim_for_live_worker_with_cooperative_steering(
                 conn, tid, lock, now,
-                reason="heartbeat_stale_worker_alive_cooperative_steering_error",
+                reason="heartbeat_stale_worker_alive_cooperative_steering",
                 elapsed_seconds=elapsed,
-                heartbeat_age_seconds=_kb._opt_int(hb_age) if hb_age is not None else None,
-                timeout_seconds=stale_timeout_seconds
+                heartbeat_age_seconds=_kb._opt_int(hb_age),
+                timeout_seconds=stale_timeout_seconds,
             )
             continue
 
-        # Only reclaim if we have evidence the worker is actually dead
-        if worker_is_dead:
-            termination = _kb._terminate_reclaimed_worker(
-                pid, lock, signal_fn=signal_fn, started_at=_kb._row_get(row, "worker_started_at"))
-            
-            # Double-check that termination actually worked
-            if _worker_survived_termination(termination):
-                # Worker survived termination attempt - this shouldn't happen with our evidence-based approach
-                # but handle gracefully by deferring with cooperative steering
-                _defer_reclaim_for_live_worker_with_cooperative_steering(
-                    conn, tid, lock, now,
-                    reason="heartbeat_stale_worker_survived_termination",
-                    elapsed_seconds=elapsed,
-                    heartbeat_age_seconds=_kb._opt_int(hb_age) if hb_age is not None else None,
-                    timeout_seconds=stale_timeout_seconds,
-                    termination=termination
-                )
-                continue
-            
-            # Proceed with normal reclamation for verified dead workers
+        # Staleness grants no signal authority. The owner is already gone/foreign;
+        # snapshot CAS also binds PID, fingerprint and run, even if lock is reused.
+        termination = {"host_local": True, "termination_attempted": False,
+                       "terminated": True, "pid_recycled": bool(_kb._pid_alive(pid))}
+        if not _worker_alive(pid, fingerprint):
             with _kb.write_txn(conn):
                 retry_status = _kb._retry_status_for_run(conn, tid)
                 cur = conn.execute(
@@ -963,8 +902,9 @@ def detect_stale_running(
                     "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                     "last_heartbeat_at = NULL "
                     "WHERE id = ? AND status = 'running' "
-                    "  AND claim_lock IS ?",
-                    (retry_status, tid, row["claim_lock"]),
+                    "  AND claim_lock IS ? AND worker_pid IS ? "
+                    "  AND worker_started_at IS ? AND current_run_id IS ?",
+                    (retry_status, tid, row["claim_lock"], pid, fingerprint, row["current_run_id"]),
                 )
                 if cur.rowcount != 1:
                     continue
