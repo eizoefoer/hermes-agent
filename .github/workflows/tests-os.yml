@@ -88,13 +88,17 @@ jobs:
             runner: macos-latest
             marker: macos
             slice: 2/2
+          # Standard public-repository runners retain both native architectures.
           - name: Windows-only tests
-            runner: windows-latest-32-core
+            runner: windows-latest
             marker: windows
+            workers: 4
+            timeout: 120
           - name: Windows-only tests (arm64)
-            runner: windows-latest-32-arm-core
+            runner: windows-11-arm
             marker: windows
-            timeout: 60
+            workers: 4
+            timeout: 120
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -187,7 +191,7 @@ jobs:
         env:
           # These files spawn nested PowerShell trees. CPU-count parallelism
           # starves cold child startup before the fixture's idle deadline.
-          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && (runner.arch == 'ARM64' && '16' || '16') || '' }}
+          HERMES_TEST_WORKERS: ${{ matrix.workers || '' }}
           HERMES_TEST_SLICE: ${{ matrix.slice || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
