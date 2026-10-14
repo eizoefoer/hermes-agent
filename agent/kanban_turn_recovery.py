@@ -191,6 +191,56 @@ def _now() -> int:
     return int(time.time())
 
 
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _select_task_claim_row(conn: sqlite3.Connection, task_id: str) -> sqlite3.Row | None:
+    """Read the task claim row across current and legacy Kanban schemas."""
+    task_cols = _table_columns(conn, "tasks")
+    worker_started_at = "worker_started_at" if "worker_started_at" in task_cols else "NULL AS worker_started_at"
+    return conn.execute(
+        "SELECT status, worker_pid, current_run_id, claim_lock, claim_expires, "
+        f"{worker_started_at} FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+
+
+def _recorded_worker_start_matches(recorded_started_at: Any, pid: int) -> bool:
+    """Verify PID start identity when the board recorded one; legacy NULL/0 is inert."""
+    if recorded_started_at in (None, "", 0, "0"):
+        return True
+    current_start_time = get_process_start_time(pid)
+    if current_start_time is None:
+        logger.warning("kanban claim check: unable to get start time for PID %d — not retrying in place", pid)
+        return False
+    text = str(recorded_started_at)
+    if "|" in text:
+        try:
+            recorded_epoch, recorded_start = text.split("|", 1)
+            if int(recorded_epoch) != current_instantiation_epoch() or int(recorded_start) != current_start_time:
+                logger.warning("kanban claim check: PID %d fingerprint mismatch — not retrying in place", pid)
+                return False
+        except (TypeError, ValueError):
+            logger.warning("kanban claim check: PID %d malformed fingerprint %s — not retrying in place", pid, text)
+            return False
+        return True
+    try:
+        recorded_start = int(text)
+    except (TypeError, ValueError):
+        logger.warning("kanban claim check: PID %d malformed start time %s — not retrying in place", pid, text)
+        return False
+    if recorded_start and recorded_start != current_start_time:
+        logger.warning(
+            "kanban claim check: PID %d start time mismatch (recorded %d, current %d) — not retrying in place",
+            pid,
+            recorded_start,
+            current_start_time,
+        )
+        return False
+    return True
+
+
 def worker_claim_is_live() -> bool:
     """True when THIS process still owns a live, unexpired run/claim lease.
 
@@ -241,11 +291,7 @@ def worker_claim_is_live() -> bool:
         conn = sqlite3.connect(f"{Path(db_path).absolute().as_uri()}?mode=ro", uri=True)
         try:
             conn.row_factory = sqlite3.Row
-            row = conn.execute(
-                "SELECT status, worker_pid, current_run_id, claim_lock, claim_expires, worker_started_at "
-                "FROM tasks WHERE id = ?",
-                (task_id,),
-            ).fetchone()
+            row = _select_task_claim_row(conn, task_id)
             if row is None:
                 return False
             if (row["status"] or "") != "running":
@@ -264,42 +310,10 @@ def worker_claim_is_live() -> bool:
                 return False
             if row["claim_expires"] is None or int(row["claim_expires"]) < now:
                 return False
-            # EVIDENCE-BASED PID LIVENESS: Verify process fingerprint matches recorded start identity
             recorded_started_at = row["worker_started_at"]
-            if recorded_started_at is not None:
-                # Verify PID hasn't been recycled by checking process fingerprint
-                try:
-                    current_start_time = get_process_start_time(os.getpid())
-                    if current_start_time is None:
-                        logger.warning("kanban claim check: unable to get start time for PID %d — not retrying in place", os.getpid())
-                        return False
-                    # For legacy rows without full fingerprint, check start time only
-                    if isinstance(recorded_started_at, int) and recorded_started_at != 0:
-                        # Legacy fingerprint format: just start time
-                        if int(recorded_started_at) != current_start_time:
-                            logger.warning("kanban claim check: PID %d start time mismatch (recorded %d, current %d) — not retrying in place", 
-                                         os.getpid(), int(recorded_started_at), current_start_time)
-                            return False
-                    elif isinstance(recorded_started_at, str) and "|" in recorded_started_at:
-                        # Full fingerprint format: instantiation_epoch|start_time
-                        try:
-                            recorded_epoch, recorded_start = recorded_started_at.split("|", 1)
-                            current_epoch = current_instantiation_epoch()
-                            if int(recorded_epoch) != current_epoch or int(recorded_start) != current_start_time:
-                                logger.warning("kanban claim check: PID %d fingerprint mismatch — not retrying in place", os.getpid())
-                                return False
-                        except (ValueError, IndexError):
-                            logger.warning("kanban claim check: PID %d malformed fingerprint %s — not retrying in place", 
-                                         os.getpid(), recorded_started_at)
-                            return False
-                    else:
-                        # UNVERIFIED or other special values - fall back to basic PID check
-                        pass
-                except Exception as e:
-                    logger.warning("kanban claim check: PID %d fingerprint verification failed: %s — not retrying in place", 
-                                 os.getpid(), str(e))
-                    return False
-            
+            if not _recorded_worker_start_matches(recorded_started_at, os.getpid()):
+                return False
+
             run = conn.execute(
                 "SELECT ended_at, worker_pid, claim_expires FROM task_runs WHERE id = ?",
                 (int(current_run_id),),
