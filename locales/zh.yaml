@@ -231,6 +231,7 @@ gateway:
       guidance: "这是自动任务状态通知，不是再次分解任务的请求。创建后续任务前请先检查当前看板；不要重复创建已存在的任务或任务图。"
     ping:
       completed: "✔ {head} 已完成——{title}{handoff}"
+      progress: "⏳ {head} still running — {title} ({minutes} minutes elapsed; not completed)"
       review_requested: "👀 {head} 待审核——{title}{handoff}"
       changes_default_reason: "审核反馈要求修改"
       reviewer_suffix: " ——审核人 @{reviewer}"
