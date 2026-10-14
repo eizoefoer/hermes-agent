@@ -92,12 +92,12 @@ jobs:
           - name: Windows-only tests
             runner: windows-latest
             marker: windows
-            workers: 4
+            workers: 2
             timeout: 120
           - name: Windows-only tests (arm64)
             runner: windows-11-arm
             marker: windows
-            workers: 4
+            workers: 2
             timeout: 120
     steps:
       - name: Checkout code
@@ -192,6 +192,10 @@ jobs:
           # These files spawn nested PowerShell trees. CPU-count parallelism
           # starves cold child startup before the fixture's idle deadline.
           HERMES_TEST_WORKERS: ${{ matrix.workers || '' }}
+          # Native PowerShell suites spawn many cold processes per file.
+          # On standard runners the complete file can exceed the 300s default;
+          # retain a finite deadline and propagate timeouts as failures.
+          HERMES_TEST_FILE_TIMEOUT: '900'
           HERMES_TEST_SLICE: ${{ matrix.slice || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.

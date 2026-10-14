@@ -13,6 +13,11 @@ Nix and native Windows x64/ARM64 unit coverage. These runners are free for
 public repositories according to GitHub's hosted-runner reference. Both Python
 slices and all test selections remain; workers are bounded to available CPUs,
 JS checks serialize, and time budgets increase rather than dropping tests.
+The first standard-runner receipt exposed Windows files killed at the default
+300-second file deadline (not a passing run despite its zero-failed summary).
+Native Windows uses two file workers and a finite 900-second file deadline to
+leave CPU headroom for nested PowerShell trees; all timeout/nonzero exits still
+fail CI. This is runner scheduling, not permission to suppress desktop tests.
 Workflow edits conservatively activate all classifier lanes. Docker publication
 retains its existing upstream-only boundary; slow E2E lanes remain under the
 existing release/dispatch policy, not silently enabled on PRs. This repair is

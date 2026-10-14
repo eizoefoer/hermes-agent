@@ -66,6 +66,8 @@ def test_required_pr_test_lanes_have_standard_runners_and_bounded_workers():
         "windows-latest", "windows-11-arm",
     }
     assert all(r.get("workers", 3) <= 4 for r in rows)
+    os_run = next(s for s in os_job["steps"] if s.get("name") == "Run ${{ matrix.marker }} tests")
+    assert 900 <= int(os_run["env"]["HERMES_TEST_FILE_TIMEOUT"]) <= 1800
     for name, job in [("js-tests.yml", "check"), ("rust-tests.yml", "bootstrap-installer"),
                       ("nix.yml", "flake-check")]:
         assert workflow(name)["jobs"][job]["runs-on"] == "ubuntu-latest"
