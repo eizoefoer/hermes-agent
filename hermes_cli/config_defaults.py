@@ -1782,10 +1782,10 @@ DEFAULT_CONFIG = {
         # suppress, or auto-approve commands outside a correlated human response.
         "approval": {"transport": "builtin", "transport_fallback": "deny"},
         # Writes to agent-instruction files (AGENTS.md/CLAUDE.md/SOUL.md/.cursorrules, project-local
-        # .hermes config) always need human approval, even under yolo. Extra patterns are fnmatch
-        # globs on the basename (e.g. "*.mdc").
+        # .hermes config) require approval unless an exact transform matches; extra patterns are basename globs.
         "protected_instruction_files": True,
         "protected_instruction_extra_patterns": [],
+        "protected_instruction_exact_transforms": [],
         "website_blocklist": {"enabled": False, "domains": [], "shared_files": []},
         # IDs of supply-chain advisories the user has read and acted on; acked ones stop the startup
         # banner. Add via `hermes doctor --ack <id>`; remove by editing the list. Catalog:

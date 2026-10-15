@@ -11,6 +11,10 @@ whole-file overwrite of content this task never saw or that changed since.
 """
 
 import fnmatch
+import hashlib
+import json
+import logging
+from datetime import UTC, datetime
 import os
 from pathlib import Path
 
@@ -190,22 +194,36 @@ _PROTECTED_INSTRUCTION_BASENAMES = frozenset({
     "agents.md", "claude.md", "soul.md", ".cursorrules"})
 
 
+def _protected_instruction_policy() -> tuple[bool, list[str], list[dict]]:
+    """Read the exact-transform allowlist; invalid settings grant nothing."""
+    try:
+        from hermes_cli.config import FailedConfigRead, cfg_get, load_config_readonly
+        config = load_config_readonly()
+        if isinstance(config, FailedConfigRead):
+            _, extra = _protected_instruction_config()
+            return True, extra, []
+        rules = cfg_get(config, "security", "protected_instruction_exact_transforms", default=[])
+    except Exception:
+        logging.getLogger(__name__).exception("Unable to load protected-instruction policy")
+        _, extra = _protected_instruction_config()
+        return True, extra, []
+    if not isinstance(rules, list) or len(rules) > 64:
+        rules = []
+    enabled, extra = _protected_instruction_config()
+    return enabled, extra, rules
+
+
 def _protected_instruction_config() -> tuple[bool, list[str]]:
-    """Return ``(enabled, extra_patterns)`` from ``security.protected_instruction_files`` /
-    ``security.protected_instruction_extra_patterns`` (fnmatch on basename). Config read
-    failures keep the gate ON — fail-safe for a security boundary."""
+    """Read existing protected-file settings, defaulting to protected on failure."""
     try:
         from hermes_cli.config import load_config, cfg_get
         cfg = load_config()
         enabled = cfg_get(cfg, "security", "protected_instruction_files", default=True)
         extra = cfg_get(cfg, "security", "protected_instruction_extra_patterns", default=[])
+        return (enabled if isinstance(enabled, bool) else True,
+                [str(p) for p in extra if isinstance(p, str) and p] if isinstance(extra, list) else [])
     except Exception:
         return True, []
-    if not isinstance(enabled, bool):
-        enabled = True
-    if not isinstance(extra, list):
-        extra = []
-    return enabled, [str(p) for p in extra if p]
 
 
 def _protected_instruction_reason(filepath: str, task_id: str = "default",
@@ -219,7 +237,9 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     is neutralized by normpath/realpath before the basename compare.
     """
     if enabled is None or extra_patterns is None:
-        enabled, extra_patterns = _protected_instruction_config()
+        configured_enabled, configured_extra, _rules = _protected_instruction_policy()
+        enabled = configured_enabled if enabled is None else enabled
+        extra_patterns = configured_extra if extra_patterns is None else extra_patterns
     if not enabled:
         return None
 
@@ -257,12 +277,87 @@ _APPROVAL_UNAVAILABLE = "requires approval but the approval subsystem is unavail
 _NO_HUMAN = "requires approval but no interactive user or gateway is present to approve it."
 
 
+def _valid_transform_rule(rule, root, relative, before_hash, after_hash):
+    if not isinstance(rule, dict) or set(rule) - {
+            "id", "repo", "path", "before_sha256", "after_sha256", "enabled", "expires_at"}:
+        return False
+    if rule.get("enabled", True) is not True:
+        return False
+    if "id" in rule and (not isinstance(rule["id"], str) or len(rule["id"]) > 128):
+        return False
+    if rule.get("repo") != str(root) or rule.get("path") != relative:
+        return False
+    if rule.get("before_sha256") != before_hash or rule.get("after_sha256") != after_hash:
+        return False
+    if "expires_at" in rule:
+        try:
+            expiry = datetime.fromisoformat(rule["expires_at"])
+            if expiry.tzinfo is None or expiry <= datetime.now(UTC):
+                return False
+        except (ValueError, TypeError, AttributeError):
+            return False
+    return True
+
+
+def _scoped_agents_transform_approved(filepath: str, before: str, after: str,
+                                       rules: list[dict], repo_root: str) -> bool:
+    """Match an exact complete before/after transform at a bound repo path."""
+    try:
+        root = Path(repo_root).resolve(strict=True)
+        target = Path(filepath).resolve(strict=False)
+        relative = target.relative_to(root).as_posix()
+        before_hash = hashlib.sha256(before.encode("utf-8")).hexdigest()
+        after_hash = hashlib.sha256(after.encode("utf-8")).hexdigest()
+        if len(rules) > 64:
+            return False
+        for index, rule in enumerate(rules):
+            if not _valid_transform_rule(rule, root, relative, before_hash, after_hash):
+                continue
+            logging.getLogger(__name__).info(
+                "protected_instruction_exact_transform %s",
+                json.dumps({"rule": rule.get("id", str(index)), "repo": str(root), "path": relative,
+                            "before_sha256": before_hash, "after_sha256": after_hash}, sort_keys=True))
+            return True
+        return False
+    except (OSError, ValueError, TypeError, RuntimeError):
+        return False
+
+
+def _try_scoped_agents_approval(paths: list[str], reasons: list[str], task_id: str,
+                                rules: list[dict], after: str | None = None,
+                                before: str | None = None) -> bool:
+    if not rules or len(paths) != 1 or len(reasons) != 1 or after is None or before is None:
+        return False
+    if not isinstance(before, str) or not isinstance(after, str):
+        return False
+    path = paths[0]
+    if _terminal_env_type_for_task(task_id) != "local":
+        return False
+    if os.path.basename(path).lower() != "agents.md":
+        return False
+    resolved = _resolved_or_raw(path, task_id)
+    if not resolved or not isinstance(before, str):
+        return False
+    try:
+        from tools.file_tools_paths import _resolve_entry_for_task
+        entry = _resolve_entry_for_task(path, task_id)
+        if Path(entry).is_symlink():
+            return False
+        target = Path(resolved).resolve(strict=True)
+        root = next((parent for parent in target.parents if (parent / ".git").exists()), None)
+        if root is None:
+            return False
+        return _scoped_agents_transform_approved(resolved, before, after, rules, str(root))
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
 def _request_protected_instruction_approval(reasons: list[str], task_id: str = "default") -> str | None:
     """Ask the human to approve a write to protected instruction file(s); ``None`` when approved.
 
     Deliberately NOT routed through ``_run_approval_gate`` (honors --yolo and
     allowlists): this gate is one-operation approval EVERY time, no persisted
-    scope, fail-closed without a human channel.
+    scope outside the explicit exact-transform policy, fail-closed without a human channel.
     """
     targets = ", ".join(dict.fromkeys(reasons))
     description = (
@@ -343,15 +438,22 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
     return timed_out if timed else denied
 
 
-def _check_protected_instruction_write(paths: list[str], task_id: str = "default") -> str | None:
+def _check_protected_instruction_write(paths: list[str], task_id: str = "default",
+                                       after_by_path: dict[str, str] | None = None,
+                                       before_by_path: dict[str, str] | None = None) -> str | None:
     """Gate a write/patch touching protected instruction files. ONE protected file gates
     the ENTIRE multi-file patch (one prompt, all-or-nothing)."""
-    enabled, extra = _protected_instruction_config()
+    enabled, extra, rules = _protected_instruction_policy()
     if not enabled:
         return None
     reasons = [r for r in (_protected_instruction_reason(p, task_id, enabled=enabled, extra_patterns=extra)
                            for p in paths) if r]
     if not reasons:
+        return None
+    approved_after = after_by_path.get(paths[0]) if after_by_path is not None and len(paths) == 1 else None
+    approved_before = before_by_path.get(paths[0]) if before_by_path is not None and len(paths) == 1 else None
+    if approved_after is not None and approved_before is not None and _try_scoped_agents_approval(
+            paths, reasons, task_id, rules, approved_after, approved_before):
         return None
     return _request_protected_instruction_approval(reasons, task_id)
 

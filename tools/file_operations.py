@@ -105,16 +105,17 @@ class FileOperations(ABC):
         """Whole file as a plain string: no pagination, line numbers or clamping."""
 
     @abstractmethod
-    def write_file(self, path: str, content: str, pre_content: Optional[str] = None) -> WriteResult:
-        """Write content to a file, creating directories as needed."""
+    def write_file(self, path: str, content: str, pre_content: Optional[str] = None,
+                   expected_content: object = ...) -> WriteResult:
+        """Write content; if expected_content is supplied, reject a changed preimage."""
 
     @abstractmethod
     def patch_replace(self, path: str, old_string: str, new_string: str,
-                      replace_all: bool = False) -> PatchResult:
+                      replace_all: bool = False, approve_write=None) -> PatchResult:
         """Replace text in a file using fuzzy matching."""
 
     @abstractmethod
-    def patch_v4a(self, patch_content: str) -> PatchResult:
+    def patch_v4a(self, patch_content: str, expected_content: object = ...) -> PatchResult:
         """Apply a V4A format patch."""
 
     @abstractmethod
@@ -564,7 +565,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             arg = _msys_to_windows_path(arg).replace("\\", "/")
         return "'" + arg.replace("'", "'\"'\"'") + "'"
 
-    def _atomic_write(self, path: str, content: str) -> ExecuteResult:
+    def _atomic_write(self, path: str, content: str, expected_sha256: Optional[str] = None) -> ExecuteResult:
         """Write ``content`` atomically: stdin → temp file in the SAME directory →
         ``mv -f`` (same-FS rename; cross-device ``mv`` is copy+unlink, NOT atomic).
         ``mkdir -p`` folded in. Exit 0 = swap happened; non-zero = original intact.
@@ -577,6 +578,8 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         arithmetic (zsh parses leading-zero constants as decimal), quoted so zsh
         doesn't =word-expand. ``trap ... EXIT`` removes the temp on every failure.
         """
+        expected_arg = self._escape_shell_arg(expected_sha256 or "")
+        q_expected = expected_arg if expected_sha256 is not None else "''"
         q_path = self._escape_shell_arg(path)
         q_parent = self._escape_shell_arg(os.path.dirname(path) or ".")
         tmpl = self._escape_shell_arg(".hermes-tmp.XXXXXX")
@@ -597,7 +600,9 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             # (pre-fix behavior) if an exotic chmod rejects it. - `trap ... EXIT` guarantees the temp is
             # removed on every error path (cat failure, mv failure, signal) but NOT after a successful mv
             # (the temp no longer exists by then). - we `cat >` the temp, then `mv -f` it over the target.
-            f"d={q_parent}; t={q_path}; "
+            f'd={q_parent}; t={q_path}; expected={q_expected}; '
+            'if [ -n "$expected" ] && [ -L "$t" ]; then '
+            'echo "conditional write rejected: symlink target" >&2; exit 73; fi; '
             'if [ -L "$t" ]; then '
             'rt="$(readlink -f "$t" 2>/dev/null || realpath "$t" 2>/dev/null || true)"; '
             '[ -n "$rt" ] && { t="$rt"; d="$(dirname "$t")"; }; '
@@ -607,7 +612,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             '|| mktemp "$d/.hermes-tmp.$$.XXXXXX" 2>/dev/null '
             '|| { tmp="$d/.hermes-tmp.$$"; : > "$tmp" && echo "$tmp"; })"; '
             '[ -n "$tmp" ] || { echo "atomic write: could not create temp file" >&2; exit 1; }; '
-            "trap 'rm -f \\\"$tmp\\\"' EXIT; "
+            "trap 'rm -f \"$tmp\"' EXIT; "
             'if [ -e "$t" ]; then '
             'm="$(stat -c%a "$t" 2>/dev/null || stat -f%Lp "$t" 2>/dev/null || true)"; '
             '[ -n "$m" ] && chmod "$m" "$tmp" 2>/dev/null || true; '
@@ -616,6 +621,17 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             # new file: umask-default perms instead of mktemp's 0600 (#70856). Runs AFTER cat so a
             # write-masking umask can't EACCES the stream; quoted "=rw" so zsh doesn't =word-expand it.
             'if [ ! -e "$t" ]; then chmod "=rw" "$tmp" 2>/dev/null || true; fi; '
+            'if [ -n "$expected" ]; then '
+            '[ ! -L "$t" ] || { echo "conditional write rejected: symlink target" >&2; exit 73; }; '
+            'physical="$(cd -P "$d" && pwd -P)"; '
+            '[ "$physical" = "$d" ] || { echo "conditional write rejected: parent changed" >&2; exit 73; }; '
+            'if [ -e "$t" ]; then actual="$(sha256sum "$t" 2>/dev/null | cut -d" " -f1)"; '
+            '[ -n "$actual" ] || actual="$(shasum -a 256 "$t" 2>/dev/null | cut -d" " -f1)"; '
+            'if [ -z "$actual" ] && command -v python3 >/dev/null 2>&1; then actual="$(python3 -c \'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())\' "$t" 2>/dev/null)"; fi; '
+            '[ -n "$actual" ] || { echo "conditional write rejected: digest unavailable" >&2; exit 73; }; '
+            'else actual="__MISSING__"; fi; '
+            '[ "$actual" = "$expected" ] || { echo "conditional write rejected: target changed since approval" >&2; exit 73; }; '
+            'fi; '
             'mv -f "$tmp" "$t"; '
             "trap - EXIT")
         return self._exec(script, stdin_data=content)
@@ -1491,7 +1507,8 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             pass
         return None, None
 
-    def write_file(self, path: str, content: str, pre_content: Optional[str] = None) -> WriteResult:
+    def write_file(self, path: str, content: str, pre_content: Optional[str] = None,
+                   expected_content: object = ...) -> WriteResult:
         """Write content atomically, creating parent directories as needed.
 
         Order: deny list → lone-surrogate refusal → fail-closed syntax gate on the
@@ -1502,8 +1519,12 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         stdin: no ARG_MAX limit) → sha256 verification → lint delta → LSP
         diagnostics when syntax is clean. ``pre_content``: pre-edit content the
         caller already has (skips the read); BOM detection always probes disk.
+        ``expected_content`` binds the backend rename to this exact preimage.
         """
+        proposed_content = content
         path = self._expand_path(path)
+        from tools.file_operations_preconditions import expected_digest
+        expected_sha256 = expected_digest(expected_content)
         denied = get_write_denied_error(path)
         if denied:
             return WriteResult(error=denied)
@@ -1538,7 +1559,12 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         # this content, so these are the bytes on disk; the early rejection above
         # guarantees this cannot raise.
         content_bytes = content.encode("utf-8", "surrogateescape")
-        write_result = self._atomic_write(path, content)
+        if expected_sha256 is not None and content != proposed_content:
+            return WriteResult(error="Conditional write rejected: candidate requires byte normalization.")
+        if expected_sha256 is None:
+            write_result = self._atomic_write(path, content)
+        else:
+            write_result = self._atomic_write(path, content, expected_sha256=expected_sha256)
         if write_result.exit_code != 0:
             return WriteResult(error=f"Failed to write file: {write_result.stdout}")
         content_verified, verify_error = self._verify_written_hash(path, content_bytes)
@@ -1601,7 +1627,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         return None
 
     def patch_replace(self, path: str, old_string: str, new_string: str,
-                      replace_all: bool = False) -> PatchResult:
+                      replace_all: bool = False, approve_write=None) -> PatchResult:
         """Replace text in a file using fuzzy matching (``old_string`` must be
         unique unless ``replace_all``). Returns a PatchResult with diff + lint."""
         path = self._expand_path(path)
@@ -1629,7 +1655,14 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         file_ending = _detect_line_ending(content)
         if file_ending:
             new_content = _normalize_line_endings(new_content, file_ending)
-        write_result = self.write_file(path, new_content, pre_content=raw_content)
+        if approve_write is not None:
+            error = approve_write(raw_content, new_content)
+            if error:
+                return PatchResult(error=error)
+            write_result = self.write_file(path, new_content, pre_content=raw_content,
+                                           expected_content=raw_content)
+        else:
+            write_result = self.write_file(path, new_content, pre_content=raw_content)
         if write_result.error:
             return PatchResult(error=f"Failed to write changes: {write_result.error}")
         verify_error = self._verify_patch_persisted(path, new_content)
@@ -1644,13 +1677,17 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             lsp_diagnostics=write_result.lsp_diagnostics,
             _writes=[(path, hashlib.sha256(data).hexdigest(), write_result._content_sha256)])
 
-    def patch_v4a(self, patch_content: str) -> PatchResult:
-        """Apply a V4A format patch (``*** Begin Patch`` / ``*** Update File:`` /
-        ``@@ hint @@`` hunks / ``*** End Patch``)."""
+    def patch_v4a(self, patch_content: str, expected_content: object = ...) -> PatchResult:
+        """Apply V4A patch, optionally requiring its sole update target preimage."""
         from tools.patch_parser import parse_v4a_patch, apply_v4a_operations
         operations, parse_error = parse_v4a_patch(patch_content)
         if parse_error:
             return PatchResult(error=f"Failed to parse patch: {parse_error}")
+        if expected_content is not ...:
+            from tools.file_operations_preconditions import ConditionalPatchOps
+            if len(operations) != 1 or operations[0].operation.value != "update":
+                return PatchResult(error="Conditional patch requires one update operation.")
+            return apply_v4a_operations(operations, ConditionalPatchOps(self, expected_content))
         return apply_v4a_operations(operations, self)
 
     # --- SEARCH -------------------------------------------------------------

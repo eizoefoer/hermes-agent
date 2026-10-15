@@ -1004,3 +1004,51 @@ For missing dependencies, use `hermes tools` and `hermes doctor` to identify
 the requirement. Do not run pip against a signed payload or the system Python.
 See [Package management](../reference/package-management.md) for installation
 ownership, diagnostics, and command boundaries.
+
+### Scoped approval for exact AGENTS.md changes
+
+`security.protected_instruction_exact_transforms` is an opt-in list in the
+operator-owned profile `config.yaml`. It preapproves a complete, reviewed
+AGENTS.md before/after pair for one canonical Git checkout and relative path.
+The default is `[]`. `write_file`, replacement patches, and V4A update patches
+use the same policy; an unmatched proposal still requires human approval and
+fails closed in headless sessions. Other write guards remain in effect.
+
+```yaml
+security:
+  protected_instruction_exact_transforms:
+    - id: reviewed-recovery-rule
+      repo: /absolute/canonical/checkout
+      path: AGENTS.md
+      before_sha256: '<SHA-256 of complete current UTF-8 file>'
+      after_sha256: '<SHA-256 of complete reviewed replacement>'
+      enabled: true
+      expires_at: '2026-12-31T00:00:00Z'
+```
+
+Review both complete files and their diff, then compute their hashes with
+`sha256sum` (or `shasum -a 256`). Use `hermes config edit` to install the precise
+rule yourself. The agent cannot write its own profile configuration through
+file tools. Do not configure a broad protected-file disable to install a rule.
+
+Required fields are `repo`, `path`, `before_sha256`, and `after_sha256`.
+`id` (up to 128 characters), `enabled` (default `true`), and `expires_at`
+(timezone-aware ISO 8601) are optional. Unknown fields, invalid values, expired
+rules, and malformed configuration grant no scoped approval. At most 64 rules
+are accepted. Paths and hashes are exact values, with no regex or glob support.
+A linked worktree needs its own canonical `repo`; nested repositories and
+symlink targets cannot inherit a different checkout's grant.
+
+Only local-backend, isolated single-file updates to an existing AGENTS.md can match. Creates,
+deletes, moves, and multi-file transactions require normal human approval.
+Changes requiring BOM or newline normalization fail closed. A digest precondition
+is checked by the backend immediately before its atomic rename; a changed
+preimage is refused. Per-path locks serialize cooperating file-tool writers.
+An unrelated external writer is not synchronized by these locks; filesystem
+rename does not provide a compare-and-swap primitive against such writers.
+
+Remove the entry, set `enabled: false`, or set the list to `[]` to revoke it.
+The next operation reloads changed configuration; previously completed writes
+remain on disk. Scope matches emit a structured log record containing the rule
+ID (or list index), canonical repo/path, and complete before/after digests, never
+file contents. Terminal and `execute_code` protections receive no exception.
