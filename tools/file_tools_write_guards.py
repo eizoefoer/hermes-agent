@@ -352,7 +352,8 @@ def _try_scoped_agents_approval(paths: list[str], reasons: list[str], task_id: s
         return False
 
 
-def _request_protected_instruction_approval(reasons: list[str], task_id: str = "default") -> str | None:
+def _request_protected_instruction_approval(reasons: list[str], task_id: str = "default",
+                                            decision_out: dict[str, bool] | None = None) -> str | None:
     """Ask the human to approve a write to protected instruction file(s); ``None`` when approved.
 
     Deliberately NOT routed through ``_run_approval_gate`` (honors --yolo and
@@ -434,28 +435,36 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
         timed = choice == "timeout"
     # Any tapped scope is a one-operation grant; nothing is persisted.
     if not timed and choice in {"once", "session", "always"}:
+        if decision_out is not None:
+            decision_out["scoped"] = False
         return None
     return timed_out if timed else denied
 
 
 def _check_protected_instruction_write(paths: list[str], task_id: str = "default",
                                        after_by_path: dict[str, str] | None = None,
-                                       before_by_path: dict[str, str] | None = None) -> str | None:
+                                       before_by_path: dict[str, str] | None = None,
+                                       decision_out: dict[str, bool] | None = None) -> str | None:
     """Gate a write/patch touching protected instruction files. ONE protected file gates
     the ENTIRE multi-file patch (one prompt, all-or-nothing)."""
     enabled, extra, rules = _protected_instruction_policy()
     if not enabled:
         return None
+    if decision_out is not None:
+        decision_out["scoped"] = False
     reasons = [r for r in (_protected_instruction_reason(p, task_id, enabled=enabled, extra_patterns=extra)
                            for p in paths) if r]
     if not reasons:
         return None
     approved_after = after_by_path.get(paths[0]) if after_by_path is not None and len(paths) == 1 else None
     approved_before = before_by_path.get(paths[0]) if before_by_path is not None and len(paths) == 1 else None
-    if approved_after is not None and approved_before is not None and _try_scoped_agents_approval(
-            paths, reasons, task_id, rules, approved_after, approved_before):
-        return None
-    return _request_protected_instruction_approval(reasons, task_id)
+    if approved_after is not None and approved_before is not None:
+        scoped = _try_scoped_agents_approval(paths, reasons, task_id, rules, approved_after, approved_before)
+        if scoped:
+            if decision_out is not None:
+                decision_out["scoped"] = True
+            return None
+    return _request_protected_instruction_approval(reasons, task_id, decision_out)
 
 
 def _check_approval_required_write(paths: list[str], task_id: str = "default") -> str | None:

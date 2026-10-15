@@ -891,6 +891,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                 # subagents; different paths stay fully parallel.
                 _lock.enter_context(file_state.lock_path(_resolved))
             _protected_preimage = None
+            scoped_grant = False
             protected = _protected_instruction_reason(path, task_id)
             if protected:
                 from tools.file_tools_scoped import _read_complete_current_file
@@ -900,9 +901,12 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                     if not probe.not_found:
                         return tool_error("Unable to establish exact before-state for protected instruction write.")
                 # The grant and backend precondition share this locked preimage.
-                err = _check_protected_instruction_write([path], task_id, {path: content}, {path: _protected_preimage})
+                approval_decision = {}
+                err = _check_protected_instruction_write([path], task_id, {path: content},
+                                                          {path: _protected_preimage}, approval_decision)
                 if err:
                     return tool_error(err)
+                scoped_grant = approval_decision.get("scoped", False)
             # A whole-file overwrite of content this task never saw, or that
             # changed since, is refused HERE — before the write — instead of
             # warning after the clobber (#65604). Nothing below runs.
@@ -913,7 +917,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             rewrite_hint = _whole_file_rewrite_hint(task_id, _resolved, content)
             if protected:
                 result = _get_file_ops(task_id).write_file(
-                    _resolved or path, content, expected_content=_protected_preimage)
+                    _resolved or path, content,
+                    expected_content=_protected_preimage if scoped_grant else ...)
             else:
                 result = _get_file_ops(task_id).write_file(_resolved or path, content)
             result_dict = result.to_dict()

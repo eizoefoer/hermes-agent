@@ -1656,11 +1656,12 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         if file_ending:
             new_content = _normalize_line_endings(new_content, file_ending)
         if approve_write is not None:
-            error = approve_write(raw_content, new_content)
+            decision = approve_write(raw_content, new_content)
+            error, scoped_grant = decision if isinstance(decision, tuple) else (decision, True)
             if error:
                 return PatchResult(error=error)
             write_result = self.write_file(path, new_content, pre_content=raw_content,
-                                           expected_content=raw_content)
+                                           expected_content=raw_content if scoped_grant else ...)
         else:
             write_result = self.write_file(path, new_content, pre_content=raw_content)
         if write_result.error:

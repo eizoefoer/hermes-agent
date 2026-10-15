@@ -27,8 +27,11 @@ def approved_replace(file_ops, target, path, old, new, replace_all, task_id):
     if not _protected_instruction_reason(path, task_id):
         return file_ops.patch_replace(target, old, new, replace_all)
 
+    grant = {}
     def approve(before, after):
-        return _check_protected_instruction_write([path], task_id, {path: after}, {path: before})
+        error = _check_protected_instruction_write(
+            [path], task_id, {path: after}, {path: before}, grant)
+        return error, grant.get("scoped", False)
 
     return file_ops.patch_replace(target, old, new, replace_all, approve_write=approve)
 
@@ -51,11 +54,12 @@ def approved_patch(file_ops, patch, rewritten, paths, resolved, task_id):
     preview = apply_v4a_operations(copy.deepcopy(operations), preview_ops)
     if preview.error or preview_ops.after_content is None:
         return PatchResult(error=f"Unable to validate exact protected instruction patch: {preview.error or 'no candidate'}")
+    grant = {}
     error = _check_protected_instruction_write(
-        [op.file_path], task_id, {op.file_path: preview_ops.after_content}, {op.file_path: before.content})
+        [op.file_path], task_id, {op.file_path: preview_ops.after_content}, {op.file_path: before.content}, grant)
     if error:
         return PatchResult(error=error)
-    return file_ops.patch_v4a(rewritten, expected_content=before.content)
+    return file_ops.patch_v4a(rewritten, expected_content=before.content if grant.get("scoped", False) else ...)
 
 def _read_complete_current_file(path: str, task_id: str) -> str | None:
     """Read untruncated backend content; inability to prove state grants no scope."""
