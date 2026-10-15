@@ -19,6 +19,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_recovery as kbr
 from hermes_cli import kanban_diagnostics as kd
 
 
@@ -372,7 +373,7 @@ def test_interrupted_review_runs_retry_in_review_phase(
                 "UPDATE task_runs SET started_at = ? WHERE id = ?",
                 (old, review.current_run_id),
             )
-        assert kbd.detect_stale_running(conn, stale_timeout_seconds=1) == [task_id]
+        assert kbr.detect_stale_running(conn, stale_timeout_seconds=1) == [task_id]
 
     retried = kb.get_task(conn, task_id)
     assert retried is not None
@@ -411,11 +412,11 @@ def test_dispatcher_sweeps_survive_iso_text_timestamps(conn, monkeypatch) -> Non
     garbled = running("garbled", start="not-a-timestamp", heartbeat="2020-01-01T00:00:00+00:00")
     assert kb.get_task(conn, garbled).last_heartbeat_at == 1577836800  # Task coerces it too
     assert kbd.enforce_max_runtime(conn) == []  # eligible (running, pid, cap) but unreadable: not killed
-    assert kbd.detect_stale_running(conn, stale_timeout_seconds=1) == []
+    assert kbr.detect_stale_running(conn, stale_timeout_seconds=1) == []
     fresh = running("fresh heartbeat", start=iso(7200), heartbeat=iso(5))
-    assert kbd.detect_stale_running(conn, stale_timeout_seconds=600) == []  # fresh ISO heartbeat spares it
+    assert kbr.detect_stale_running(conn, stale_timeout_seconds=600) == []  # fresh ISO heartbeat spares it
     stale = running("stale", start=iso(7200), heartbeat=iso(7200))
-    assert kbd.detect_stale_running(conn, stale_timeout_seconds=600) == [stale]
+    assert kbr.detect_stale_running(conn, stale_timeout_seconds=600) == [stale]
     assert kbd.enforce_max_runtime(conn) == [fresh]  # readable ISO start 2h ago > 60s cap
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)  # garbled start: past the launch grace
     assert kbd.detect_crashed_workers(conn) == [garbled]

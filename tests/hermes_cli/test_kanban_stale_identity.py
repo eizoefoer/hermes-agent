@@ -6,6 +6,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_recovery as kbr
 
 
 @pytest.fixture
@@ -31,11 +32,11 @@ def test_stale_boot_uuid_recycle_reclaims_once_without_signal(board, monkeypatch
     actual = kbd._process_fingerprint(os.getpid())
     tid = stale_worker(board, "other-boot:0|" + actual.split("|", 1)[1])
     signals = []
-    assert kbd.detect_stale_running(board, stale_timeout_seconds=100,
+    assert kbr.detect_stale_running(board, stale_timeout_seconds=100,
                                     signal_fn=lambda *args: signals.append(args)) == [tid]
     assert signals == []
     assert kb.get_task(board, tid).status == "ready"
-    assert kbd.detect_stale_running(board, stale_timeout_seconds=100) == []
+    assert kbr.detect_stale_running(board, stale_timeout_seconds=100) == []
 
 
 @pytest.mark.parametrize("fingerprint", [None, "unverified", "matching"])
@@ -47,7 +48,7 @@ def test_live_long_worker_is_held_with_one_cooperative_notice(board, monkeypatch
     before = kb.get_task(board, tid)
     signals = []
     for _ in range(2):
-        assert kbd.detect_stale_running(board, stale_timeout_seconds=100,
+        assert kbr.detect_stale_running(board, stale_timeout_seconds=100,
                                         signal_fn=lambda *args: signals.append(args)) == []
     after = kb.get_task(board, tid)
     assert (after.status, after.worker_pid, after.current_run_id) == (
@@ -65,7 +66,7 @@ def test_stale_snapshot_cannot_reclaim_changed_pid_under_same_lock(board, monkey
                           (pid + 1, "new-owner:0|2", tid))
         return False
     monkeypatch.setattr(kbd, "_worker_alive", changed_owner)
-    assert kbd.detect_stale_running(board, stale_timeout_seconds=100) == []
+    assert kbr.detect_stale_running(board, stale_timeout_seconds=100) == []
     assert kb.get_task(board, tid).status == "running"
 
 
@@ -74,5 +75,15 @@ def test_foreign_host_stale_claim_is_not_local_pid_evidence(board, monkeypatch):
     tid = stale_worker(board, "other-boot:0|1")
     with kb.write_txn(board):
         board.execute("UPDATE tasks SET claim_lock='foreign-host:worker' WHERE id=?", (tid,))
-    assert kbd.detect_stale_running(board, stale_timeout_seconds=100) == []
+    assert kbr.detect_stale_running(board, stale_timeout_seconds=100) == []
     assert kb.get_task(board, tid).status == "running"
+
+
+def test_unreadable_witness_preserves_possibly_live_owner(board, monkeypatch):
+    monkeypatch.setattr(kbd.time, 'time', lambda: 100_000)
+    fingerprint = kbd._process_fingerprint(os.getpid())
+    tid = stale_worker(board, fingerprint)
+    monkeypatch.setattr(kbd, '_process_fingerprint', lambda pid: None)
+    assert kbd._worker_alive(os.getpid(), fingerprint) is True
+    assert kbr.detect_stale_running(board, stale_timeout_seconds=100) == []
+    assert kb.get_task(board, tid).status == 'running'

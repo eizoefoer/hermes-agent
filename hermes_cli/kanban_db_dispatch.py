@@ -27,29 +27,6 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
-from hermes_cli.kanban_db import _row_get, _opt_int
-
-# Import gateway functions for PID recycling detection
-try:
-    from gateway.drain_control import current_instantiation_epoch
-    from gateway.status import get_process_start_time, _pid_alive
-except ImportError:
-    # Fallback for environments where gateway is not available
-    def current_instantiation_epoch():
-        return 0
-    
-    def get_process_start_time(pid):
-        return None
-    
-    def _pid_alive(pid):
-        # Simple fallback implementation
-        if not pid or pid <= 0:
-            return False
-        try:
-            os.kill(pid, 0)
-            return True
-        except (ProcessLookupError, OSError):
-            return False
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -131,6 +108,7 @@ class DispatchResult:
     """
 
     reclaimed: int = 0
+    recovery_observations: list[dict] = field(default_factory=list)
     promoted: int = 0
     reconciled_orphans: list[str] = field(default_factory=list)
     """``running`` cards requeued by :func:`reconcile_orphaned_running` (broken
@@ -417,6 +395,15 @@ def _worker_alive(pid: Optional[int], started_at) -> bool:
         return False
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         return True
+    if isinstance(started_at, str) and "|" in started_at:
+        if _process_fingerprint(int(pid)) is None:
+            # Unavailable evidence is not proof of death/recycling. Hold the
+            # claim; _pid_recycled still refuses all signal authority.
+            return True
+    elif started_at is not None:
+        from gateway.status import get_process_start_time
+        if get_process_start_time(int(pid)) is None:
+            return True
     return not _pid_recycled(pid, started_at)
 
 
@@ -819,120 +806,6 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 event_payload_extra={"pid": pid, "sigkill": killed, "retry_status": retry_status},
             )
     return timed_out
-
-
-# A running task with no heartbeat for this long is inactive regardless of
-# ``dispatch_stale_timeout_seconds`` (spec: ">4h started + no commits in 1h").
-_STALE_HEARTBEAT_GAP_SECONDS = 3600
-
-
-def detect_stale_running(
-    conn: sqlite3.Connection,
-    *,
-    stale_timeout_seconds: int = 0,
-    signal_fn=None,
-) -> list[str]:
-    """Reclaim ``running`` tasks with no heartbeat progress; returns their ids.
-
-    Stale = running longer than ``stale_timeout_seconds`` (active run's
-    ``started_at``, else ``tasks.started_at``) AND ``last_heartbeat_at`` NULL or
-    older than ``_STALE_HEARTBEAT_GAP_SECONDS``. 
-    EVIDENCE-BASED DEAD PID DETECTION: Only reclaim workers with verified 
-    PID recycling or process death, never based on elapsed time alone.
-    For live but stalled workers, use cooperative steering/checkpoints.
-    Task returns to its source phase, run closes ``outcome='stale'``.
-    ``0`` disables the check; ``signal_fn`` is a test hook. Deliberately NOT
-    counted via ``_record_task_failure``: an absent heartbeat is not a worker
-    failure, and counting it would let long-running tasks trip the breaker.
-    """
-    if stale_timeout_seconds <= 0:
-        return []
-
-    now = int(time.time())
-    reclaimed: list[str] = []
-
-    rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.worker_started_at, t.current_run_id, t.last_heartbeat_at, t.claim_lock, "
-        "       COALESCE(r.started_at, t.started_at) AS active_started_at "
-        "FROM tasks t "
-        "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running'"
-    ).fetchall()
-
-    for row in rows:
-        if row["active_started_at"] is None:
-            continue
-        elapsed = now - (_kb._to_epoch(row["active_started_at"]) or now)  # unreadable clock: never reclaim
-        if elapsed < stale_timeout_seconds:
-            continue
-
-        last_hb = _kb._to_epoch(row["last_heartbeat_at"])
-        hb_age = (now - last_hb) if last_hb is not None else None
-        if hb_age is not None and hb_age < _STALE_HEARTBEAT_GAP_SECONDS:
-            continue
-
-        pid = row["worker_pid"]
-        tid = row["id"]
-        lock = row["claim_lock"] or ""
-        
-        # A remote claim's PID is not evidence on this host. Use the same boot/start
-        # identity as every other native lifecycle path, never parse a boot UUID as int.
-        if not lock.startswith(_kb._host_prefix()):
-            continue
-        fingerprint = row["worker_started_at"]
-        if _worker_alive(pid, fingerprint):
-            _defer_reclaim_for_live_worker_with_cooperative_steering(
-                conn, tid, lock, now,
-                reason="heartbeat_stale_worker_alive_cooperative_steering",
-                elapsed_seconds=elapsed,
-                heartbeat_age_seconds=_kb._opt_int(hb_age),
-                timeout_seconds=stale_timeout_seconds,
-            )
-            continue
-
-        # Staleness grants no signal authority. The owner is already gone/foreign;
-        # snapshot CAS also binds PID, fingerprint and run, even if lock is reused.
-        termination = {"host_local": True, "termination_attempted": False,
-                       "terminated": True, "pid_recycled": bool(_kb._pid_alive(pid))}
-        if not _worker_alive(pid, fingerprint):
-            with _kb.write_txn(conn):
-                retry_status = _kb._retry_status_for_run(conn, tid)
-                cur = conn.execute(
-                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                    "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
-                    "last_heartbeat_at = NULL "
-                    "WHERE id = ? AND status = 'running' "
-                    "  AND claim_lock IS ? AND worker_pid IS ? "
-                    "  AND worker_started_at IS ? AND current_run_id IS ?",
-                    (retry_status, tid, row["claim_lock"], pid, fingerprint, row["current_run_id"]),
-                )
-                if cur.rowcount != 1:
-                    continue
-
-                payload = {
-                    "elapsed_seconds": int(elapsed),
-                    "last_heartbeat_at": _kb._opt_int(last_hb),
-                    "heartbeat_age_seconds": _kb._opt_int(hb_age),
-                    "timeout_seconds": stale_timeout_seconds,
-                    "pid": int(pid) if pid else None,
-                    "retry_status": retry_status,
-                }
-                payload.update(termination)
-
-                run_id = _kb._end_run(
-                    conn, tid,
-                    outcome="stale", status="stale",
-                    error=(
-                        f"no heartbeat for {int(hb_age)}s "
-                        if hb_age is not None
-                        else "no heartbeat ever"
-                    ) + f" after {int(elapsed)}s running",
-                    metadata=payload,
-                )
-                _kb._append_event(conn, tid, "stale", payload, run_id=run_id)
-                reclaimed.append(tid)
-
-    return reclaimed
 
 
 def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
@@ -2053,6 +1926,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    recovery_policy: Optional[dict] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -2063,7 +1937,7 @@ def dispatch_once(
     resolved DB path so unrelated boards tick in parallel.
     """
     def _locked_tick() -> DispatchResult:
-        return _dispatch_once_locked(
+        result = _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,
             ttl_seconds=ttl_seconds,
@@ -2076,7 +1950,12 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            recovery_policy=recovery_policy,
         )
+        if recovery_policy is not None:
+            from hermes_cli.kanban_db_recovery import observe_failures
+            result.recovery_observations = observe_failures(conn, recovery_policy)
+        return result
 
     try:
         db_path = _kb.kanban_db_path(board=board)
@@ -2104,11 +1983,13 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
     import inspect
     try:
         sig = inspect.signature(spawn_fn)
-        if "board" in sig.parameters:
-            return spawn_fn(task, workspace, board=board)
-        return spawn_fn(task, workspace)
     except (TypeError, ValueError):
         return spawn_fn(task, workspace)
+    # Invocation is outside the inspection handler: an admitted process whose
+    # receipt raises must never be spawned a second time inside the same claim.
+    if "board" in sig.parameters:
+        return spawn_fn(task, workspace, board=board)
+    return spawn_fn(task, workspace)
 
 
 def _dispatch_lane_task(
@@ -2125,6 +2006,7 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    recovery_policy: Optional[dict] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2159,6 +2041,11 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
+    from hermes_cli.kanban_db_recovery import admission_guard
+    recovery_guard = admission_guard(conn, task_id, recovery_policy)
+    if recovery_guard:
+        result.respawn_guarded.append((task_id, recovery_guard))
+        return False
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
@@ -2210,6 +2097,8 @@ def _dispatch_lane_task(
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     try:
+        from hermes_cli.kanban_db_recovery import capture_run_source
+        capture_run_source(conn,claimed.id,claimed.current_run_id,recovery_policy)
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
             _set_worker_pid(conn, claimed.id, int(pid))
@@ -2284,6 +2173,7 @@ def _run_reclaim_phase(
     result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
+    from hermes_cli.kanban_db_recovery import detect_stale_running
     result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
     result.crashed = detect_crashed_workers(conn, board=board)
     # Side-channel attributes (see detect_crashed_workers); rate-limited tasks
@@ -2428,6 +2318,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    recovery_policy: Optional[dict] = None,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
@@ -2439,6 +2330,9 @@ def _dispatch_once_locked(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
     )
+    if recovery_policy is not None:
+        from hermes_cli.kanban_db_recovery import observe_failures
+        observe_failures(conn, recovery_policy)
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )
@@ -2483,6 +2377,7 @@ def _dispatch_once_locked(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        recovery_policy=recovery_policy,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
