@@ -220,8 +220,8 @@ jobs:
         run: |
           scripts/run_tests.sh \
             tests/scripts/desktop_update/test_desktop_update_windows_commit_outcome.py \
-            tests/scripts/desktop_update/test_desktop_update_windows_handoff_lineage.py \
-            tests/scripts/desktop_update/test_desktop_update_windows_marker.py -- \
+            tests/scripts/desktop_update/test_desktop_update_windows_handoff_run.py \
+            tests/scripts/desktop_update/test_desktop_update_windows_marker_bodies.py -- \
             -m "platforms and not integration" \
             -k 'result_finished_at_is_stamped_after_the_r6_release_wait or marker_with_a_live_delegate_is_handed_to_it_at_finish or handoff_run_adopts_only_the_desktop_bridge_for_that_run or marker_bodies_are_parsed_positionally_like_every_other_reader' \
             -x -v --tb=long --durations=10
