@@ -37,6 +37,25 @@ this document does not manufacture such a receipt or bypass branch protection.
   Neither a compatibility-branch merge nor local test passes establish default-main
   completion. Preserve divergent fork main; do not overwrite it.
 
+## Manual CI replay — 2026-10-16
+
+PR12's PR-event run `38896999189` failed before jobs with a GitHub internal
+error; supported rerun returned HTTP 403 (`This workflow run cannot be retried`).
+Manual run `38897089154` checked exact head `843c227afce2`, but its attribution
+job `116960111862` had no PR event base and compared against divergent fork main.
+Those historical contributor failures are not evidence of newly unmapped PR12
+authors. The optional `comparison_base` input now binds manual replay attribution
+to an explicitly supplied base commit; PR-event base/head remain authoritative,
+and an omitted input preserves the existing `origin/main` comparison. All test
+lanes and the aggregate gate remain unchanged. Supply the current PR base SHA
+from GitHub, not a guessed branch or a same-head base that excludes new authors.
+
+Real Git-history fixture regression: baseline 1 failed / 2 passed, then 3 passed;
+canonical `tests/ci` suite: 37 files, 672 passed, 0 failed, 1 skipped. All 12
+`scripts/check --base HEAD` checks passed. Independent read-only diff review found
+no actionable findings. This is source qualification, not hosted-CI or deployment
+acceptance. Read back the new exact-head hosted run before advancing any gate.
+
 ## Remaining four gates
 
 1. Reviewed exact-head supported source CI, explicit review of any platform-scope
