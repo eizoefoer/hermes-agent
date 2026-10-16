@@ -969,10 +969,8 @@ CREATE TABLE IF NOT EXISTS task_attachments (
     created_at   INTEGER NOT NULL
 );
 
--- Subscription from a gateway source (platform + chat + thread) to a
--- task. The gateway's kanban-notifier watcher tails task_events and
--- pushes ``completed`` / ``blocked`` / ``spawn_auto_blocked`` events to
--- the original requester so human-in-the-loop workflows close the loop.
+-- A gateway source (platform + chat + thread) watches a task.
+-- Durable subscription routing, event cursor, ping checkpoint and claim lease.
 CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     task_id       TEXT NOT NULL,
     platform      TEXT NOT NULL,
@@ -987,6 +985,8 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
     last_ping_event_id INTEGER NOT NULL DEFAULT 0,
+    claim_old_cursor INTEGER,
+    claim_expires_at INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 

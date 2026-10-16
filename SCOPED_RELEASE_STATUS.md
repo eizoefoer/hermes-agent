@@ -56,6 +56,53 @@ canonical `tests/ci` suite: 37 files, 672 passed, 0 failed, 1 skipped. All 12
 no actionable findings. This is source qualification, not hosted-CI or deployment
 acceptance. Read back the new exact-head hosted run before advancing any gate.
 
+## Notification integration and real-component probe — 2026-10-16
+
+Integrated only the existing PR10 functional notification change
+`74336e508ff15be50be8572f4e5cb0e1a3c53828` and locale completion
+`2d0b8f2a12106398598d10a512f462700856633b`; no PR10 CI rewrites or new upstream
+revision were imported. This source checkpoint combines scoped writes, signed
+approval callbacks and notification claim leases. It is NOT release acceptance.
+
+Canonical Kanban-family validation: 107 files, 722 passed, 1 failed, 4 skipped.
+The failure is `test_resolve_hermes_argv_module_actually_runs`: real CLI
+`--version` exceeds its unchanged 30-second subprocess deadline. An isolated
+single-test replay also failed. A separate runpy diagnostic exited zero but its
+8-second stack dump was inside `source_releases._head_containing` through
+`source_check.check_for_updates`; this does not make the canonical failure green.
+Canonical scoped/encoding/signed-ingress/notification focused validation: 8 files,
+90 passed, 0 failed (overlaps the family run; do not add as unique tests).
+`scripts/check --staged`: all 12 checks passed, zero blocking/advisory findings.
+
+The real isolated systemd recovery canary against routing source
+`0096709ab866726d79b2adc33459522bfe550448` first refused missing
+`claim_metadata`; notification integration supplies that API. The next probe
+persisted the actual remaining refusal:
+`dispatch_once() got an unexpected keyword argument 'recovery_policy'`.
+Two fresh supervisor processes recorded retry/backoff, and the third respected
+the persisted cooldown. No recovery worker was spawned. These are useful failure
+receipts, NOT successful crash-recovery or exactly-once delivery evidence.
+Retained diagnostic state is under the scoped-feature worktree's
+`artifacts/scoped-approval-20261015/notification-integration-canary-state/`.
+Production gateway and supervisors were not restarted or repointed.
+
+Next integration must port the existing native recovery contracts from retained
+`fix/native-recovery-gaps-t_b6b87d0e` (`cdede5423a3`), including terminal-obligation
+retirement, onto the current refactored dispatcher. Do not replace that dispatcher
+with the old file, silently discard its newer admission gates, remove
+`recovery_policy` from the routing caller, or treat a failed canary as healthy.
+The native `Store` lives in the routing service, not the Hermes native package;
+a delegated claim that it was the missing native API was incorrect.
+
+Independent staged review also retains two release blockers: ownership may expire
+between a pre-send lease check and remote acceptance, and between the check and
+internal wake admission. Fenced settlement protects SQLite ownership but cannot
+undo an already-issued external effect. Do not claim exactly-once origin delivery
+or duplicate-free wake admission from these leases. A lease renewal alone cannot
+close the remote-acceptance/persistence crash window; deterministic admission
+idempotency and explicit transport semantics require independent proof. These
+findings remain unresolved, not waived, and prohibit release acceptance.
+
 ## Remaining four gates
 
 1. Reviewed exact-head supported source CI, explicit review of any platform-scope
