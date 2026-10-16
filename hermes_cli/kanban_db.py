@@ -2748,6 +2748,8 @@ def complete_task(
             _completed_event_payload(result, event_summary, verified_cards, metadata),
             run_id=run_id,
         )
+        from hermes_cli.kanban_db_recovery import retire_terminal_obligation
+        retire_terminal_obligation(conn, task_id)
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
     # Success wipes the breaker counter (history stays on the event log).
     _clear_failure_counter(conn, task_id)
@@ -3841,6 +3843,8 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
             summary="task archived with run still active",
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
+        from hermes_cli.kanban_db_recovery import retire_terminal_obligation
+        retire_terminal_obligation(conn, task_id)
     if was_running:
         termination = _terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started)
         with write_txn(conn):
@@ -3852,12 +3856,6 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
     return True
 
 
-def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
-    """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
-    conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
-    for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs"):
-        conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
-
 
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete an ARCHIVED task (+ related rows); anything else must be
@@ -3865,7 +3863,8 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
         if _task_status(conn, task_id) != "archived":
             return False
-        _delete_task_relations(conn, task_id)
+        from hermes_cli.kanban_db_relations import delete_task_relations
+        delete_task_relations(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
 
@@ -3876,7 +3875,8 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
-        _delete_task_relations(conn, task_id)
+        from hermes_cli.kanban_db_relations import delete_task_relations
+        delete_task_relations(conn, task_id)
     recompute_ready(conn)
     return True
 

@@ -105,6 +105,7 @@ class DispatchResult:
     """
 
     reclaimed: int = 0
+    recovery_observations: list[dict] = field(default_factory=list)
     promoted: int = 0
     reconciled_orphans: list[str] = field(default_factory=list)
     """``running`` cards requeued by :func:`reconcile_orphaned_running` (broken
@@ -798,6 +799,15 @@ def detect_stale_running(
         tid = row["id"]
         lock = row["claim_lock"] or ""
 
+        # Heartbeat age is an observation, not authority to stop a live owner.
+        # Keep the native owner-pause check above and the normal dead-owner path.
+        if _worker_alive(pid, _kb._row_get(row, "worker_started_at")):
+            _defer_reclaim_for_live_worker(
+                conn, tid, lock, now,
+                {"termination_attempted": False, "terminated": False},
+                reason="heartbeat_stale_worker_alive_cooperative_steering",
+            )
+            continue
         termination = _kb._terminate_reclaimed_worker(
             pid, lock, signal_fn=signal_fn, started_at=_kb._row_get(row, "worker_started_at"))
 
@@ -1987,6 +1997,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    recovery_policy: Optional[dict] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -1997,7 +2008,7 @@ def dispatch_once(
     resolved DB path so unrelated boards tick in parallel.
     """
     def _locked_tick() -> DispatchResult:
-        return _dispatch_once_locked(
+        result = _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,
             ttl_seconds=ttl_seconds,
@@ -2010,7 +2021,12 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            recovery_policy=recovery_policy,
         )
+        if recovery_policy is not None and not dry_run:
+            from hermes_cli.kanban_db_recovery import observe_failures
+            result.recovery_observations = observe_failures(conn, recovery_policy)
+        return result
 
     try:
         db_path = _kb.kanban_db_path(board=board)
@@ -2032,19 +2048,6 @@ def dispatch_once(
     return result
 
 
-def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -> Optional[int]:
-    """Back-compat: older spawn_fn signatures (and test stubs) accept only
-    ``(task, workspace)``; pass ``board`` only when the callable supports it."""
-    import inspect
-    try:
-        sig = inspect.signature(spawn_fn)
-        if "board" in sig.parameters:
-            return spawn_fn(task, workspace, board=board)
-        return spawn_fn(task, workspace)
-    except (TypeError, ValueError):
-        return spawn_fn(task, workspace)
-
-
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2059,6 +2062,7 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    recovery_policy: Optional[dict] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2093,6 +2097,11 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
+    from hermes_cli.kanban_db_recovery import admission_guard
+    recovery_guard = admission_guard(conn, task_id, recovery_policy)
+    if recovery_guard:
+        result.respawn_guarded.append((task_id, recovery_guard))
+        return False
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
@@ -2144,7 +2153,10 @@ def _dispatch_lane_task(
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     try:
-        pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
+        from hermes_cli.kanban_db_recovery import capture_run_source
+        from hermes_cli.kanban_db_dispatch_spawn import call_spawn_fn
+        capture_run_source(conn, claimed.id, claimed.current_run_id, recovery_policy)
+        pid = call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
             _set_worker_pid(conn, claimed.id, int(pid), run_id=claimed.current_run_id, claim_lock=claimed.claim_lock)
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
@@ -2156,19 +2168,8 @@ def _dispatch_lane_task(
         _count_spawn(claimed.assignee)
         return True
     except Exception as exc:
-        from tools.process_registry import RestartSafeScopeUnavailable
-
-        # The host refused the spawn (no restart-safe scope): nothing about the
-        # card ran, so it must not spend the card's retry budget (#114720).
-        infrastructure = isinstance(exc, RestartSafeScopeUnavailable)
-        if infrastructure:
-            _kb._log.warning("kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s", claimed.id, exc)
-        if _record_task_failure(
-            conn, claimed.id, str(exc),
-            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
-            infrastructure=infrastructure,
-        ):
-            result.auto_blocked.append(claimed.id)
+        from hermes_cli.kanban_db_dispatch_spawn import record_spawn_failure
+        record_spawn_failure(conn, claimed, exc, result, failure_limit, recovery_policy)
         return False
 
 
@@ -2211,6 +2212,7 @@ def _run_reclaim_phase(
     failure_limit: int,
     reconcile_orphans: bool,
     board: Optional[str] = None,
+    recovery_policy: Optional[dict] = None,
 ) -> None:
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
     reap_worker_zombies()
@@ -2226,6 +2228,9 @@ def _run_reclaim_phase(
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
+    if recovery_policy is not None:
+        from hermes_cli.kanban_db_recovery import observe_failures
+        result.recovery_observations = observe_failures(conn, recovery_policy)
 
 
 def _tick_spawn_budget(
@@ -2330,20 +2335,6 @@ def _any_spawnable_review(
     return False
 
 
-def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
-    """``kanban.default_assignee`` when it names a real profile this home may
-    claim (``kanban.dispatch_profiles`` gated, same predicate as the spawn
-    gate). Otherwise ``None`` so an unassigned shared-board card is never
-    written to. When the profiles module isn't importable trust the
-    operator's config: the downstream check still buckets a missing profile
-    as nonspawnable."""
-    name = (default_assignee or "").strip() or None
-    if name:
-        profile_exists = _profile_exists_fn()
-        if profile_exists is not None and not profile_exists(name):
-            return None
-    return name
-
 
 # The dispatch lock has been released here. Fire the tick observer strictly OUTSIDE the single-writer
 # critical section (#56066 sweeper finding / #64231 disposition): a slow subscriber must never extend the
@@ -2362,6 +2353,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    recovery_policy: Optional[dict] = None,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
@@ -2372,6 +2364,7 @@ def _dispatch_once_locked(
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
+        recovery_policy=None if dry_run else recovery_policy,
     )
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
@@ -2417,8 +2410,10 @@ def _dispatch_once_locked(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        recovery_policy=recovery_policy,
     )
-    default_assignee = _resolve_default_assignee(default_assignee)
+    from hermes_cli.kanban_db_dispatch_spawn import resolve_default_assignee
+    default_assignee = resolve_default_assignee(default_assignee)
     spawned = 0
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:

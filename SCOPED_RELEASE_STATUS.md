@@ -103,6 +103,67 @@ close the remote-acceptance/persistence crash window; deterministic admission
 idempotency and explicit transport semantics require independent proof. These
 findings remain unresolved, not waived, and prohibit release acceptance.
 
+## Native recovery composition qualification — 2026-10-16 14:48 UTC
+
+Recovered the prior interrupted run's uncommitted native recovery port in this
+same worktree; no duplicate worker/task graph was created. Added the retained
+`dispatch_once(recovery_policy=...)` API, source-bound retry receipts and terminal
+obligation retirement without replacing the modern dispatcher or its admission
+gates. Fixed the reproduced integration defects:
+
+- Dry-run reclaim no longer creates recovery tables/events. Existing native
+  dry-run/reclaim behavior otherwise remains unchanged.
+- PID plus start-identity live workers are preserved despite stale heartbeats.
+- Callback signature inspection cannot invoke an admitted callback twice when
+  that callback raises `TypeError`/`ValueError`.
+- Recovery obligation retirement is in the same transaction as completion or
+  archival. Injected interruption after deletion reproduced both rollback gaps
+  RED (2 failed), then both passed after moving deletion into the transaction.
+- Moved spawn helpers and hard-delete relations into topical siblings to meet
+  existing file/complexity caps; no ratchet waivers added. The real CLI `--version`
+  test moved to its own discovered file and uses an isolated config with update
+  checks disabled. Its 30-second deadline and real subprocess assertion remain;
+  no production startup/update behavior was changed.
+
+Canonical validation of the final integration: **133 Kanban-related files,
+949 passed, 0 failed, 4 skipped**, 279.4 seconds. This includes 81 native-family
+files, 540 passed, 4 skipped (overlapping, not additive). After the final redundant
+import cleanup, launcher/native DB tests passed again. All 12 staged source checks
+passed, zero blocking/advisory findings. Independent final staged review found no
+new actionable regressions and reported 12 focused passes. Initial review's
+same-tick-backoff concern was not reproduced: observation occurs during reclaim,
+before candidate admission. Source-capture failures intentionally remain bounded
+fail-closed native failures; a changed source head does not lift native blocks.
+
+A fresh real user-systemd canary against this native source plus routing candidate
+`0096709ab866726d79b2adc33459522bfe550448` passed: **4 component restarts,
+1 execution, 1 accepted local HTTP delivery**. Durable runs record crashed then
+completed. Production gateway PID 3430553 and supervisor PID 3325081 retained
+identical PID/start fingerprints before/after; worker and supervisor were in
+separate cgroups. All three exact canary units were read back inactive,
+MainPID=0, Result=success. Evidence:
+`artifacts/scoped-approval-20261015/controller-native-canary-1436/` in the scoped
+feature worktree, including its `receipt.json`, DBs and component restart log.
+This is isolated real-component qualification, **NOT Telegram exactly-once,
+production deployment or the full independent acceptance gate**.
+
+Hosted CI for the preceding exact source `9629da76e27` completed: both Linux
+Python shards, both macOS lanes, JS, Rust, attribution, Docker and Nix succeeded;
+the all-platform aggregate failed because Windows x64/ARM64 failed. Exact logs
+are retained. The x64 failure is the Windows desktop updater handoff-log
+PermissionError; no unrelated Windows repair is included in this slice. Fresh
+CI is required for the next pushed source; previous-head passes are not transferable.
+Fresh PR12 comments/reviews/inline threads were all empty before this checkpoint.
+
+All eight canonical task IDs were read from the actual always-on-harness board;
+none has a live worker/claim. Statuses remain blocked/todo, not accepted. Native
+turn-lease inspection found this cron controller as sole active owner. No live
+board mutation, gateway restart, runtime activation or eBay/trading resumption
+was performed. No worktrees were created/deleted; evidence, runtime, backups and
+nonterminal work remain retained. Exactly-once remote send/wake crash-window
+findings above remain release blockers. Follow the existing external safe-boundary
+promotion mechanism only after reviewed source/CI and transport/admission proofs.
+
 ## Remaining four gates
 
 1. Reviewed exact-head supported source CI, explicit review of any platform-scope
