@@ -47,6 +47,37 @@ The new explicit shared lane includes that file; hosted failures remain blockers
 The old run also reported an LSP process-cleanup flake. No existing tests were
 changed to hide these results.
 
+## Current scoped failure diagnosis (2026-10-16)
+
+Run `38939833522` tested full candidate `799016be6960ee9ec4145c4fac763a08436b2f14`
+on standard `ubuntu-latest` and `macos-latest` runners; macOS shared passed,
+Linux shared failed the failed-redial recovery test, and macOS native failed
+`test_cancelled_exec_command_kills_shell_and_child`. Neither aggregate is accepted.
+Linux slices were still executing when the targeted recovery fix was prepared.
+
+The Linux failure is now reproduced deterministically: a failed dial publishes
+its error/readiness before its thread necessarily exits; an immediate next call
+sees that still-alive thread and rethrows the stale error instead of redialing.
+The repair waits within the existing caller deadline for that already-failed
+thread before deciding to redial. It does not reconnect healthy work or replay
+admitted requests. A held-thread-exit regression failed before the repair;
+canonical reconnect/backoff/recovery suites then passed 35 tests with no file
+retries. Independent review `deleg_e22d4836` approved the focused diff. These are
+local source proofs, not hosted or live acceptance. Evidence retained outside
+source: `/home/ubuntu/.hermes/plans/scoped-reconnect-red-20261016.log` and
+`scoped-reconnect-green-20261016.log`.
+
+macOS cancellation cleanup remains a supported-platform blocker, not a Windows
+exclusion. Exact job `117104389795` passed the timeout-tree test but timed out
+waiting for both shell and child after cancellation. Read-only review
+`deleg_82b6482d` suggested suspend/kill ordering as a hypothesis; this is not a
+verified root cause or an authorized reason to weaken process identity fencing.
+The relevant production and test files are unchanged from the frozen compatibility
+baseline. Next investigation must distinguish a cleanup defect from native-host
+PID observation/race behavior with real macOS process-state evidence, retaining
+both assertions. Logs: `/home/ubuntu/.hermes/plans/scoped-799016-macos-native.log`
+and `scoped-799016-linux-shared.log`. No new broad workflow dispatch was requested.
+
 ## Still outstanding
 
 Hosted exact-source receipts and independent review of results; reviewed source
