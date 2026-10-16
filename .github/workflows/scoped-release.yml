@@ -96,6 +96,8 @@ jobs:
               root = Path('evidence') / f'scoped-{lane}-{sha}'
               receipt = json.loads((root / 'receipt.json').read_text())
               assert receipt['source_sha'] == receipt['expected_sha'] == sha
+              expected_lane = 'shared' if lane.endswith('-shared') else lane
+              assert receipt['lane'] == expected_lane, 'receipt belongs to another lane'
               assert receipt['status'] == 'passed' and receipt['returncode'] == 0
               assert receipt['summary']['passed'] > 0 and receipt['summary']['files'] > 0
               assert receipt['summary']['failed'] == 0

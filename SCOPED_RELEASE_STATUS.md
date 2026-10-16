@@ -195,6 +195,35 @@ No production service change, gateway restart, business mutation or worktree
 deletion occurred. Exact hosted receipts, source merge, deployment and independent
 live acceptance remain required; the remote-send/wake crash windows remain open.
 
+## Scoped hosted repair — 2026-10-16 17:00 UTC
+
+At candidate `aecc914b44ba80f845fb80546a35033334f31c80`, scoped run
+`38932407158` passed Linux shared and macOS native lanes. macOS shared failed
+`test_infrastructure_spawn_refusal_never_charges_the_card`: this Linux/systemd
+contract assumes a missing user bus raises, whereas the native macOS child helper
+correctly returns an in-process command before Linux supervisor probing. Independent
+read-only review confirmed the host mismatch. Marked ONLY that test native Linux;
+it remains mandatory and executes on Linux, with no fake OS or production change.
+The canonical Linux DB/helper replay passed 65 tests across two files, zero failures,
+one unrelated Windows skip. macOS must be re-executed on the new exact head;
+these local passes are not hosted acceptance. Full Linux slices of the prior run
+were still executing at readback, not accepted or cancelled.
+
+The same review identified missing receipt-lane validation; the aggregate now rejects
+a receipt from another lane as well as enforcing the existing source/tree/hash/result
+checks. The macOS shared selection is explicitly the release manifest's contracts,
+not a claim of full macOS discovery; full canonical default discovery remains Linux.
+Reviewed integration into the maintained compatibility ref and exact deployment
+provenance remain separate mandatory gates, never implied by a candidate receipt.
+PR11/12 comments, reviews and inline comments were empty at fresh remote readback.
+
+Native board comment again refused: `delegate_task child contexts cannot mutate
+Kanban tasks via the CLI`. This is an owner-context blocker; no direct database
+write or context/guard bypass attempted. Existing task states were read, not changed.
+No workers reclaimed/spawned, broad workflow dispatched, gateway restarted, business
+mutation performed, or worktree deleted. All evidence/runtime/dirty/nonterminal
+work remains retained. Remote-send/wake crash-window findings remain blocking.
+
 ## Remaining four gates
 
 1. Reviewed exact-head supported source CI, explicit review of any platform-scope
