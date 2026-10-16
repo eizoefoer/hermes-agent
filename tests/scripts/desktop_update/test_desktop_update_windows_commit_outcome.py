@@ -75,7 +75,7 @@ if __name__ == '__main__':
 """
 
 
-def _handoff(tmp_path: Path, *args: str, verify: str = 'pass\n', timeout: int = 150, prepare=None, **env: str):
+def _handoff(tmp_path: Path, *args: str, verify: str = 'pass\n', timeout: int = 150, prepare=None, after_spawn=None, **env: str):
     install = tmp_path / 'checkout'
     publish_fixture_launcher(install, CLI)
     (install / 'hermes_cli/desktop_update_verify.py').write_text(verify, encoding='utf-8')
@@ -90,12 +90,33 @@ def _handoff(tmp_path: Path, *args: str, verify: str = 'pass\n', timeout: int = 
         env={**os.environ, 'HERMES_HOME': str(home), 'HERMES_RUNTIME_DIR': str(tmp_path / 'empty-store'),
              'HANDOFF_CALLS': str(calls), 'PYTHONIOENCODING': 'utf-8', **env},
     )
+    deadline = time.monotonic() + timeout
     try:
-        out, _ = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        subprocess.run(['taskkill', '/T', '/F', '/PID', str(proc.pid)], capture_output=True, check=False)
-        out, _ = proc.communicate()
-        pytest.fail(f'hand-off did not finish within {timeout}s: {out}')
+        if after_spawn is not None:
+            after_spawn(proc)
+        out, _ = proc.communicate(timeout=max(0, deadline - time.monotonic()))
+    except BaseException as exc:
+        cleanup_error = ''
+        if proc.poll() is None:
+            try:
+                subprocess.run(['taskkill', '/T', '/F', '/PID', str(proc.pid)],
+                               capture_output=True, check=False, timeout=10)
+            except (OSError, subprocess.SubprocessError) as cleanup_exc:
+                cleanup_error = f'; tree cleanup failed: {cleanup_exc}'
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+        try:
+            out, _ = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired as cleanup_exc:
+            cleanup_error += f'; output cleanup failed: {cleanup_exc}'
+            proc.stdout.close()
+            out = ''
+        if isinstance(exc, subprocess.TimeoutExpired):
+            pytest.fail(f'hand-off did not finish within {timeout}s: {out}{cleanup_error}')
+        if cleanup_error:
+            exc.add_note(cleanup_error)
+        raise
     argv = [json.loads(line) for line in calls.read_text(encoding='utf-8-sig').splitlines()] if calls.exists() else []
     result_path = home / '.hermes-update-result.json'
     result = json.loads(result_path.read_text(encoding='utf-8-sig')) if result_path.is_file() else None
@@ -154,40 +175,49 @@ def test_nonzero_exit_after_the_commit_point_is_installed_with_a_followup(tmp_pa
 
 
 _CHECKOUT_HOLDER = """
-import msvcrt, os, sys, threading, time
+import msvcrt, os, sys, time
 from pathlib import Path
 fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT | os.O_BINARY, 0o644)
 os.lseek(fd, 1 << 20, os.SEEK_SET)
 msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)   # hermes_cli/update_lock.py::_try_lock's byte
-ready, log, released = map(Path, sys.argv[2:])
+ready, released = map(Path, sys.argv[2:])
 ready.touch()
-deadline = time.monotonic() + 120
-while time.monotonic() < deadline:
-    if log.exists() and 'keeping the update marker' in log.read_text(encoding='utf-8-sig'):
-        released.write_text(str(time.time()), encoding='utf-8')
-        os.close(fd)
-        sys.exit(0)
-    threading.Event().wait(0.05)
-raise SystemExit('hand-off never reached the R6 release wait')
+if sys.stdin.readline() != 'release\\n':
+    raise SystemExit('missing explicit release command')
+os.close(fd)
+released.write_text(str(time.time()), encoding='utf-8')
 """
+
+
+def _release_checkout_after_ack(log_path: Path, holder: subprocess.Popen) -> None:
+    wait_until(lambda: log_path.exists() and 'keeping the update marker' in
+               log_path.read_text(encoding='utf-8-sig'), timeout=120,
+               what='hand-off acknowledged the R6 release wait')
+    assert holder.stdin is not None
+    holder.stdin.write('release\n')
+    holder.stdin.flush()
 
 
 @pytest.mark.platforms('windows')
 def test_result_finished_at_is_stamped_after_the_r6_release_wait(tmp_path: Path) -> None:
-    # A fixed 25 s holder could finish before a cold/loaded hand-off reached R6,
-    # testing no release wait at all. Keep the real lock until R6 acknowledges it.
+    # Keep the real checkout lock until the production R6 acknowledgement, then
+    # release it explicitly; log observation stays in the parent, not the lock-holder.
     holders = []
     ready, released = tmp_path / 'holder.ready', tmp_path / 'holder.released'
 
     def hold_checkout(home: Path, install: Path) -> None:
         holders.append(subprocess.Popen([
             sys.executable, '-c', _CHECKOUT_HOLDER, str(install / '.hermes-update.lock'),
-            str(ready), str(home / 'logs/desktop-update-handoff.log'), str(released),
-        ]))
+            str(ready), str(released),
+        ], stdin=subprocess.PIPE, text=True))
         wait_until(ready.exists, timeout=30, what='checkout holder acquired the real lock')
 
+    def release_after_ack(_handoff_proc: subprocess.Popen) -> None:
+        _release_checkout_after_ack(tmp_path / 'home/logs/desktop-update-handoff.log', holders[0])
+
     try:
-        code, out, _, result, home = _handoff(tmp_path, '-NoGateway', prepare=hold_checkout)
+        code, out, _, result, home = _handoff(
+            tmp_path, '-NoGateway', prepare=hold_checkout, after_spawn=release_after_ack)
     finally:
         for proc in holders:
             if proc.poll() is None:
