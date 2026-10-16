@@ -90,7 +90,9 @@ finally:
             if text in output:
                 return output
             time.sleep(.1)
-        raise AssertionError((text, output, log_path.read_text()))
+        raise AssertionError((text, output, log_path.read_text(),
+                              {"model_requests": model_peer.requests,
+                               "client_owners": witness.read_text() if witness.exists() else None}))
 
     def launch(*args):
         command = shlex.join([sys.executable, str(wrapper), *args])
@@ -123,7 +125,9 @@ finally:
                 tmux("send-keys", "-t", "chat", "Enter")
 
             launch("--cli", "chat")
-            first = until("Welcome to Hermes Agent")
+            # The welcome banner precedes prompt_toolkit startup; input sent there can
+            # be echoed by the PTY before an Enter handler exists. Wait for the composer.
+            first = until("\n❯ ")
             type_line("WS_SHARED")
             fresh = until("LOCAL_ACK_WS_SHARED")
             type_line("/title")
