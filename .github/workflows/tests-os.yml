@@ -125,6 +125,7 @@ jobs:
           prune-python-cache: true
 
       - name: Run ${{ matrix.marker }} tests
+        id: os_suite
         # scripts/run_tests.sh — the canonical runner, same as every other
         # lane: per-file subprocess isolation (run_tests_parallel.py). It
         # natively tolerates per-file empty collections (a platform-gated
@@ -200,6 +201,30 @@ jobs:
           HERMES_TEST_SLICE: ${{ matrix.slice || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
+          OPENROUTER_API_KEY: ''
+          OPENAI_API_KEY: ''
+          NOUS_API_KEY: ''
+
+      - name: Diagnose Windows hand-off failures in isolation
+        # Keep the full suite's failure authoritative. Its 300 s file deadline
+        # can kill pytest before the final traceback is printed. Re-run only
+        # the observed failing seams, one file at a time and stop at its first
+        # failure, to expose the cause rather than raise/disable the deadline.
+        if: ${{ failure() && steps.os_suite.outcome == 'failure' && runner.os == 'Windows' && inputs.desktop_updater }}
+        timeout-minutes: 16
+        shell: bash
+        run: |
+          scripts/run_tests.sh \
+            tests/scripts/desktop_update/test_desktop_update_windows_commit_outcome.py \
+            tests/scripts/desktop_update/test_desktop_update_windows_handoff_lineage.py \
+            tests/scripts/desktop_update/test_desktop_update_windows_marker.py -- \
+            -m "platforms and not integration" \
+            -k 'result_finished_at_is_stamped_after_the_r6_release_wait or marker_with_a_live_delegate_is_handed_to_it_at_finish or handoff_run_adopts_only_the_desktop_bridge_for_that_run or marker_bodies_are_parsed_positionally_like_every_other_reader' \
+            -x -v --tb=long --durations=10
+        env:
+          HERMES_TEST_WORKERS: '1'
+          HERMES_TEST_FILE_TIMEOUT: '300'
+          HERMES_TEST_FILE_RETRIES: '0'
           OPENROUTER_API_KEY: ''
           OPENAI_API_KEY: ''
           NOUS_API_KEY: ''
