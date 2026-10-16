@@ -265,6 +265,32 @@ nonterminal work remains retained. The temporary baseline comparison checkout is
 eligible for removal only after exact inactivity, clean status and durable-ref
 checks; its failure output is retained independently in the session evidence.
 
+## Supported-platform failure follow-up — 2026-10-16 22:20 UTC
+
+Scoped run `38964228125` failed at exact source
+`9756865cc32898f5dc3c62341e61c31cbd2d3868`; its aggregate remains failed.
+Both shared lanes and native macOS passed. Linux1 failed on the session `/diff`
+RPC deadline and a fixture `copytree` racing `.git/objects/maintenance.lock`;
+Linux2 failed on the previously reproduced CommandCode catalog environment-key
+mismatch. None is waived, and the session timeout is not proved inherited.
+
+The Git fixture now runs each of its two commits with command-local
+`gc.autoDetach=false` and `maintenance.autoDetach=false`: commit maintenance
+finishes before the later snapshot, without disabling maintenance or persisting
+configuration. An initial persistent-config attempt correctly failed the existing
+stock-maintenance assertion and was replaced, not hidden. The final canonical
+Git-lock file passed **22 tests, zero failures, no retries**; all 12 source checks
+passed. Independent final review found no actionable issue in this narrow diff.
+All real holder/reclaim and stock-config assertions remain unchanged.
+
+The session read test passed locally twice, including alongside Git-lock tests;
+this does not explain or waive its hosted timeout. Read-only investigation traced
+working-diff collection but obtained no CI phase timing proving the slow point.
+Keep that failure unresolved; no RPC timeout increase, test exclusion, unrelated
+provider repair, upstream update, merge or live activation is authorized by these
+local results. Exact revised-source hosted acceptance is still required before
+Gate1, followed by the existing deployment and independent live gates.
+
 ## Remaining four gates
 
 1. Reviewed exact-head supported source CI, explicit review of any platform-scope
