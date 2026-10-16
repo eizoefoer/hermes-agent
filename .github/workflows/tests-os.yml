@@ -92,15 +92,19 @@ jobs:
             runner: macos-latest
             marker: macos
             slice: 2/2
+          # The hand-off fixtures spawn nested PowerShell/process-discovery
+          # trees. Four simultaneous files hit the unchanged 300 s file bound
+          # on standard runners; the same 13 failing seams pass sequentially.
+          # Serialize files, not each test's own concurrent-process assertions.
           - name: Windows-only tests
             runner: windows-latest
             marker: windows
-            workers: 4
+            workers: 1
             timeout: 120
           - name: Windows-only tests (arm64)
             runner: windows-11-arm
             marker: windows
-            workers: 4
+            workers: 1
             timeout: 120
     steps:
       - name: Checkout code
