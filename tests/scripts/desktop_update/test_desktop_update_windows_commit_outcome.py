@@ -18,6 +18,7 @@ import time
 import pytest
 
 from tests.installation_launcher_fixture import publish_fixture_launcher
+from tests.waiting import wait_until
 
 ROOT = Path(__file__).resolve().parent.parent.parent.parent
 SCRIPT = ROOT / 'scripts/desktop-update/windows.ps1'
@@ -152,33 +153,53 @@ def test_nonzero_exit_after_the_commit_point_is_installed_with_a_followup(tmp_pa
         assert (result['ok'], result['exit_code']) == (False, 130), result
 
 
-_TIMED_CHECKOUT_HOLDER = """
-import msvcrt, os, sys, time
+_CHECKOUT_HOLDER = """
+import msvcrt, os, sys, threading, time
+from pathlib import Path
 fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT | os.O_BINARY, 0o644)
 os.lseek(fd, 1 << 20, os.SEEK_SET)
 msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)   # hermes_cli/update_lock.py::_try_lock's byte
-time.sleep(float(sys.argv[2]))
+ready, log, released = map(Path, sys.argv[2:])
+ready.touch()
+deadline = time.monotonic() + 120
+while time.monotonic() < deadline:
+    if log.exists() and 'keeping the update marker' in log.read_text(encoding='utf-8-sig'):
+        released.write_text(str(time.time()), encoding='utf-8')
+        os.close(fd)
+        sys.exit(0)
+    threading.Event().wait(0.05)
+raise SystemExit('hand-off never reached the R6 release wait')
 """
 
 
 @pytest.mark.platforms('windows')
 def test_result_finished_at_is_stamped_after_the_r6_release_wait(tmp_path: Path) -> None:
-    # The relaunched Desktop drops a non-manual result whose finished_at is 30 minutes old; the
-    # R6 wait lasts up to 2 h. The result must carry the time the hand-off actually finished.
+    # A fixed 25 s holder could finish before a cold/loaded hand-off reached R6,
+    # testing no release wait at all. Keep the real lock until R6 acknowledges it.
     holders = []
+    ready, released = tmp_path / 'holder.ready', tmp_path / 'holder.released'
 
-    def hold_checkout(_home: Path, install: Path) -> None:
-        holders.append((subprocess.Popen([sys.executable, '-c', _TIMED_CHECKOUT_HOLDER,
-                                          str(install / '.hermes-update.lock'), '25']), time.time() + 25))
+    def hold_checkout(home: Path, install: Path) -> None:
+        holders.append(subprocess.Popen([
+            sys.executable, '-c', _CHECKOUT_HOLDER, str(install / '.hermes-update.lock'),
+            str(ready), str(home / 'logs/desktop-update-handoff.log'), str(released),
+        ]))
+        wait_until(ready.exists, timeout=30, what='checkout holder acquired the real lock')
+
     try:
         code, out, _, result, home = _handoff(tmp_path, '-NoGateway', prepare=hold_checkout)
     finally:
-        for proc, _ in holders:
-            proc.kill(); proc.wait()
+        for proc in holders:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=10)
     assert code == 0, out
     log = (home / 'logs/desktop-update-handoff.log').read_text(encoding='utf-8-sig')
     assert 'keeping the update marker' in log, log
-    assert result['ok'] is True and result['finished_at'] >= int(holders[0][1]) - 1, result
+    assert released.exists(), log
+    assert holders[0].returncode == 0
+    assert result is not None, out
+    assert result['ok'] is True and result['finished_at'] >= int(released.read_text(encoding='utf-8')), result
 
 
 @pytest.mark.platforms('windows')
