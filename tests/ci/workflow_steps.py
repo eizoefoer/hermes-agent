@@ -135,6 +135,10 @@ def selected_files(step: dict, ctx: dict, repo: Path) -> set[str]:
             elif arg == "-m":
                 i += 1  # native marker evaluation belongs to the native runner
                 assert args[i] in ("platforms and integration", "platforms and not integration"), args
+            elif arg == "-o":
+                i += 1
+                # Diagnostics cannot change selection; arbitrary pytest config can.
+                assert i < len(args) and args[i] == "faulthandler_timeout=90", args
             elif arg.startswith("--ignore-glob="):
                 ignores.append(arg.split("=", 1)[1])
             elif arg in ("--", "--include-integration", "-v", "--tb=short", "-rA"):
