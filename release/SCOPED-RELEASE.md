@@ -78,6 +78,44 @@ PID observation/race behavior with real macOS process-state evidence, retaining
 both assertions. Logs: `/home/ubuntu/.hermes/plans/scoped-799016-macos-native.log`
 and `scoped-799016-linux-shared.log`. No new broad workflow dispatch was requested.
 
+## Exact-source follow-up: Python 3.14 callback completion (2026-10-16)
+
+Run `38943203945` at `9113b721d5f99a262a1bb820580e4ab0c0ff2f1c`
+completed **failure**. Linux shared and both macOS lanes passed, including the
+previously failing macOS cancellation test; this does not erase its earlier
+failure or establish a product repair. Linux-1 failed session-read diff RPC,
+worktree self-heal fixture Git commit exit128, and Telegram admission cancellation.
+Linux-2 failed the inherited models.dev credential-alias expectation. None are
+waived, excluded, or retried into acceptance; all five lanes remain mandatory.
+Artifacts and exact-source receipts are retained under
+`/home/ubuntu/.hermes/cache/four-gate-38943203945/`.
+
+The Telegram failure reproduced with the frozen PM-built Python 3.14.7 and PTB
+22.8: one selected test failed at the unchanged no-inflight-claims assertion.
+PTB removes finished tasks from its tracked set in its own done callback; its
+`stop()` may return before admission's subsequently queued cleanup callback runs.
+The test now observes an event registered after that cleanup callback before
+asserting settlement. It still requires no effects, no inflight or seen claim,
+a closed callback coroutine, and successful single delivery on retry, and now
+also requires the scheduled task to be cancelled. No sleep, product-code change,
+forced claim clearing, or timeout relaxation was used. A missing cleanup still
+fails the original state assertions after the event.
+
+Canonical no-retry execution of the full admission file on that environment:
+94 passed, zero failed. Independent read-only review `deleg_b1f59418` approved
+this synchronization correction and independently replayed the 94 tests. The two
+other Linux-1 files replayed on the same interpreter: nine passed, zero failed.
+Their hosted failures remain unresolved: Git stderr was not exposed, and the
+RPC deadline failure has no proven cause. These targeted local results do not
+constitute full-tree hosted acceptance or clear Linux-2's catalog mismatch.
+
+The existing board graph remains blocked/todo, with no running worker on the
+selected board. A controller progress-comment command hit a pending security
+approval on its combined readback pipeline and was not retried through another
+path. No board mutation is claimed. The controller remains enabled, and source
+integration, deployment, notification crash-window proof, and business resumption
+are still gated. No upstream refresh, runtime activation, or cleanup deletion.
+
 ## Still outstanding
 
 Hosted exact-source receipts and independent review of results; reviewed source
