@@ -38,3 +38,18 @@ def test_locator_rejects_unusable_path_git_core(tmp_path, monkeypatch):
     monkeypatch.setattr(update_cmd_git, "_portable_git_candidates", list)
     monkeypatch.setattr(update_cmd_git, "_probe_fork_bomb", lambda argv: None)
     assert update_cmd_git._locate_real_git() is None
+
+
+@pytest.mark.platforms("posix")
+def test_locator_preserves_install_root_when_launcher_symlinks_to_core(tmp_path, monkeypatch):
+    root = tmp_path / "Git"
+    launcher = root / "cmd" / "git.exe"
+    core = root / "mingw64" / "libexec" / "git-core" / "git.exe"
+    core.parent.mkdir(parents=True)
+    core.touch()
+    launcher.parent.mkdir()
+    launcher.symlink_to(core)
+    monkeypatch.setattr("shutil.which", lambda name: str(launcher))
+    monkeypatch.setattr(update_cmd_git, "_portable_git_candidates", list)
+    monkeypatch.setattr(update_cmd_git, "_probe_fork_bomb", lambda argv: False)
+    assert update_cmd_git._locate_real_git() == core

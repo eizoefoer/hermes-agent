@@ -595,9 +595,10 @@ def _locate_real_git() -> Optional[Path]:
     import shutil
 
     if path_git := shutil.which("git"):
-        root = Path(path_git).resolve().parent.parent
+        launcher = Path(path_git)
+        roots = dict.fromkeys((launcher.absolute().parent.parent, launcher.resolve().parent.parent))
         candidates += [root / arch / "libexec" / "git-core" / "git.exe"
-                       for arch in ("clangarm64", "mingw64", "mingw32")]
+                       for root in roots for arch in ("clangarm64", "mingw64", "mingw32")]
     return next((c for c in candidates if c.exists() and _probe_fork_bomb([str(c)]) is False), None)
 
 

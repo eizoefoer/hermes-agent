@@ -45,6 +45,11 @@ def _real_git_diagnostics():
         for base in (r"C:\Program Files", r"C:\Program Files (x86)")
         for arch in ("clangarm64", "mingw64", "mingw32")
     ] + _portable_git_candidates()
+    if path_git := shutil.which("git"):
+        launcher = Path(path_git)
+        roots = dict.fromkeys((launcher.absolute().parent.parent, launcher.resolve().parent.parent))
+        candidates += [root / arch / "libexec" / "git-core" / "git.exe"
+                       for root in roots for arch in ("clangarm64", "mingw64", "mingw32")]
     inventory = {"path_git": shutil.which("git"), "candidates": []}
     for candidate in candidates:
         row = {"path": str(candidate), "exists": candidate.exists()}
