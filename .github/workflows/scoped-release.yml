@@ -78,6 +78,10 @@ jobs:
         env:
           ACCEPTANCE_RESULT: ${{ needs.acceptance.result }}
         run: test "$ACCEPTANCE_RESULT" = success
+      - name: Checkout independent exact-source verifier
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          ref: ${{ github.sha }}
       - name: Download exact-source evidence
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -90,12 +94,21 @@ jobs:
           python3 - <<'PY'
           import hashlib, json, os
           from pathlib import Path
+          from scripts.ci.scoped_release import git, parse_summary, verify_source_binding
           sha = os.environ['EXPECTED_SHA']
+          assert git('rev-parse', 'HEAD') == sha
+          tree = git('rev-parse', 'HEAD^{tree}')
+          manifest = Path('release/scoped-acceptance.json').read_bytes()
           trees = set()
           for lane in ['linux-1', 'linux-2', 'linux-shared', 'macos-shared', 'macos-native']:
               root = Path('evidence') / f'scoped-{lane}-{sha}'
               receipt = json.loads((root / 'receipt.json').read_text())
               assert receipt['source_sha'] == receipt['expected_sha'] == sha
+              verify_source_binding(receipt, sha, tree, os.environ['GITHUB_RUN_ID'], manifest)
+              assert (root / 'manifest.json').read_bytes() == manifest
+              expected_host = 'macOS' if lane.startswith('macos') else 'Linux'
+              assert receipt['platform'].startswith(expected_host)
+              assert parse_summary((root / 'tests.log').read_text()) == receipt['summary']
               expected_lane = 'shared' if lane.endswith('-shared') else lane
               assert receipt['lane'] == expected_lane, 'receipt belongs to another lane'
               assert receipt['status'] == 'passed' and receipt['returncode'] == 0

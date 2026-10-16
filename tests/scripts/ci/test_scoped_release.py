@@ -63,6 +63,21 @@ def test_provenance_rejects_wrong_source_and_dirty_tree(tmp_path, monkeypatch):
         module.prepare(manifest, sha)
 
 
+@pytest.mark.parametrize("field,value", [
+    ("tree_sha", "forged-tree"), ("run_id", "another-run"),
+    ("manifest_sha256", "forged-manifest"), ("source_sha", "another-sha"),
+])
+def test_receipt_binding_rejects_consistent_but_wrong_evidence(field, value):
+    import hashlib
+    manifest = b'{"source": "approved"}'
+    receipt = {"tree_sha": "tree", "run_id": "run", "source_sha": "sha",
+               "manifest_sha256": hashlib.sha256(manifest).hexdigest()}
+    module.verify_source_binding(receipt, "sha", "tree", "run", manifest)
+    receipt[field] = value
+    with pytest.raises(ValueError, match="binding"):
+        module.verify_source_binding(receipt, "sha", "tree", "run", manifest)
+
+
 def test_shared_selection_is_exact_explicit_list(tmp_path):
     manifest = {"required_paths": ["tests/a.py", "tests/b.py"]}
     output = tmp_path / "selection.txt"

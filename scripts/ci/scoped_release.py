@@ -28,6 +28,14 @@ def parse_summary(text):
             "skipped": int(skipped or 0)}
 
 
+def verify_source_binding(receipt, source_sha, tree_sha, run_id, manifest):
+    """Compare lane claims with an independent exact-source aggregate checkout."""
+    expected = {"source_sha": source_sha, "tree_sha": tree_sha, "run_id": run_id,
+                "manifest_sha256": hashlib.sha256(manifest).hexdigest()}
+    if any(receipt[key] != value for key, value in expected.items()):
+        raise ValueError("receipt source/tree/run/manifest binding mismatch")
+
+
 def git(*args):
     return subprocess.check_output(["git", *args], text=True, encoding="utf-8", timeout=30).strip()
 

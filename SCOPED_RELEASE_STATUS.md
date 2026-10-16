@@ -224,6 +224,47 @@ No workers reclaimed/spawned, broad workflow dispatched, gateway restarted, busi
 mutation performed, or worktree deleted. All evidence/runtime/dirty/nonterminal
 work remains retained. Remote-send/wake crash-window findings remain blocking.
 
+## Exact receipt review and inherited provider blocker — 2026-10-16 17:25 UTC
+
+Hosted run `38936098738` at `20e1fa5ccae5b95609c9647493441c8b0c9b9809`
+has verified downloaded artifacts: Linux shared `12061566329` (255 passed, 1
+skip), macOS shared `12061332626` (254 passed, 2 skips), macOS native
+`12060554238` (1182 passed, 370 skips). These overlap; do not add them as
+unique tests. SHA/tree/run/manifest binding, actual canonical summaries and log
+hashes were independently read back. Both complete Linux slices were still
+executing at readback; the five-lane aggregate is NOT accepted.
+
+Previous scoped run `38932407158` Linux-2 finished with 30978 passed, 1 failed,
+434 skipped. Exact failure: `test_commandcode_profile.py::TestCommandCodeFetchModelsPickerContract::test_resolve_provider_full` expects
+`COMMANDCODE_API_KEY`, while live models.dev returns only `CMD_API_KEY`.
+An isolated checkout of frozen baseline `db44c46208f1b421b4ecb7e56bf9d68b0423906f`
+reproduced the identical assertion (9 passed, 1 failed); the current candidate
+reproduced it too. Provider resolver, CommandCode plugin and this test have zero
+diff from baseline. This establishes inherited behavior under the current external
+catalog, not a new scoped-feature regression and not a waived product defect.
+No unrelated provider repair, test weakening, catalog spoof or upstream update was
+made. Keep the failed lane visible and diagnose only release-relevant causes;
+full accepted-source CI remains blocked until this contract is honestly resolved.
+Downloaded failed logs: `/home/ubuntu/.hermes/cache/four-gate-38932407158-linux2.log`.
+Downloaded successful evidence: `/home/ubuntu/.hermes/cache/four-gate-38936098738/`.
+
+Independent review identified a valid evidence weakness: identical self-reported
+trees across lanes were not compared to an independently checked-out tree. The
+aggregate now checks out exact `github.sha` and validates receipt tree, run ID and
+manifest against that checkout, plus host identity and parsed log summary. Four
+new binding regressions failed RED; canonical helper suite then passed 16/16.
+YAML and embedded verifier compile passed. Independent current-diff review found
+no actionable defect. Earlier review claims that macOS shared passed an invalid
+lane or required paths were absent were disproved by the actual matrix and all
+26 paths; corrected review explicitly confirmed both. Candidate acceptance does
+not replace later exact integration/ref/deployment review.
+
+No board ownership bypass, source activation, gateway restart, worker reclaim,
+new graph or business action occurred. All existing runtime/evidence/dirty and
+nonterminal work remains retained. The temporary baseline comparison checkout is
+eligible for removal only after exact inactivity, clean status and durable-ref
+checks; its failure output is retained independently in the session evidence.
+
 ## Remaining four gates
 
 1. Reviewed exact-head supported source CI, explicit review of any platform-scope
