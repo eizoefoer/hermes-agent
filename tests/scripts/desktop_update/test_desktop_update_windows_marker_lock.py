@@ -4,6 +4,7 @@ delegate before it runs a single instruction.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -95,18 +96,65 @@ def test_a7_concurrent_claimants_over_a_dead_marker_yield_one_owner(tmp_path: Pa
 
 # -- the update child is the delegate before it runs anything ------------------
 
-def _suspended_launcher(parent: int, launcher: Path):
+def _update_executable(launcher: Path) -> Path:
+    # windows.ps1 resolves this command and suspends its interpreter, not the
+    # published launcher that answered the query.
+    command = json.loads(subprocess.check_output(
+        [str(launcher), '--print-runtime-command', '--module', 'hermes_cli.main'],
+        text=True, timeout=60,
+    ))
+    assert isinstance(command, list) and len(command) >= 2, command
+    return Path(command[0])
+
+
+def test_update_executable_uses_the_launchers_runtime_command(tmp_path: Path) -> None:
+    launcher = publish_fixture_launcher(tmp_path / 'checkout', HOLD_CLI)
+    assert _update_executable(launcher).samefile(sys.executable)
+
+
+def _suspended_update(parent: int, executable: Path):
     """A suspended process has kernel identity but need not expose its PEB argv."""
     import psutil
 
-    for child in psutil.Process(parent).children():
+    try:
+        children = psutil.Process(parent).children()
+    except psutil.NoSuchProcess as exc:
+        raise AssertionError('hand-off exited before suspended update was observed') from exc
+    for child in children:
         try:
-            if (Path(child.exe()) == launcher
+            if (Path(child.exe()).samefile(executable)
                     and child.status() == psutil.STATUS_STOPPED):
                 return child
         except psutil.NoSuchProcess:
             continue
     return None
+
+
+@pytest.mark.platforms('posix')
+def test_suspended_update_observes_the_resolved_interpreter() -> None:
+    import os
+    import signal
+
+    from tests.waiting import wait_until
+
+    child = subprocess.Popen([sys.executable, '-c', 'import signal; signal.pause()'])
+    try:
+        child.send_signal(signal.SIGSTOP)
+        observed = wait_until(lambda: _suspended_update(os.getpid(), Path(sys.executable)),
+                              timeout=10, what='stopped interpreter identity')
+        assert observed is not None
+        assert observed.pid == child.pid
+        assert observed.create_time() > 0
+    finally:
+        child.kill()
+        child.wait(timeout=10)
+
+
+def test_suspended_update_reports_an_exited_handoff() -> None:
+    child = subprocess.Popen([sys.executable, '-c', 'pass'])
+    child.wait(timeout=10)
+    with pytest.raises(AssertionError, match='hand-off exited'):
+        _suspended_update(child.pid, Path(sys.executable))
 
 
 @pytest.mark.platforms('windows')
@@ -132,6 +180,7 @@ def test_script_killed_before_publishing_the_delegate_runs_no_update(tmp_path: P
     )
     assert barrier_cli != HOLD_CLI
     launcher = publish_fixture_launcher(install, barrier_cli)
+    executable = _update_executable(launcher)
     home = tmp_path / 'home'; home.mkdir()
     hold = tmp_path / 'release-update'
     ran = Path(str(hold) + '.pid')
@@ -147,8 +196,8 @@ def test_script_killed_before_publishing_the_delegate_runs_no_update(tmp_path: P
         lock = _HeldLock(home)
         help_gate.touch()
         try:
-            child = wait_until(lambda: _suspended_launcher(script.pid, launcher), timeout=60,
-                               what='suspended native update launcher')
+            child = wait_until(lambda: _suspended_update(script.pid, executable), timeout=60,
+                               what='suspended update interpreter')
         except AssertionError as exc:
             raise AssertionError(f'{exc}\n{_log(home)}') from exc
         # Publication is blocked, so the child must still be suspended, and no
