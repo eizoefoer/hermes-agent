@@ -40,6 +40,13 @@ def git(*args):
     return subprocess.check_output(["git", *args], text=True, encoding="utf-8", timeout=30).strip()
 
 
+def require_clean_tree():
+    """Reject source not represented by HEAD, including injected import/test files."""
+    subprocess.run(["git", "diff", "--exit-code", "HEAD", "--"], check=True, timeout=30)
+    if git("ls-files", "--others", "--exclude-standard"):
+        raise ValueError("untracked files outside the accepted source tree")
+
+
 def prepare(manifest, expected):
     """Bind the entire checkout to the approved source stack, never a PR-only diff."""
     source = git("rev-parse", "HEAD")
@@ -48,8 +55,7 @@ def prepare(manifest, expected):
     for sha in [manifest["compatibility_baseline"], manifest["source_feature_head"],
                 *[item["head"] for item in manifest["source_stack"]]]:
         subprocess.run(["git", "merge-base", "--is-ancestor", sha, source], check=True, timeout=30)
-    # A modified tracked file would mean the tests did not exercise the receipt's tree.
-    subprocess.run(["git", "diff", "--exit-code", "HEAD", "--"], check=True, timeout=30)
+    require_clean_tree()
     for path in manifest["required_paths"]:
         if not Path(path).is_file():
             raise ValueError(f"required acceptance path missing: {path}")
@@ -108,7 +114,7 @@ def main():
         if process.returncode:
             raise ValueError(f"canonical runner exited {process.returncode}")
         receipt["summary"] = parse_summary(text)
-        subprocess.run(["git", "diff", "--exit-code", "HEAD", "--"], check=True, timeout=30)
+        require_clean_tree()
         receipt["status"] = "passed"
         result = 0
     except (ValueError, OSError, subprocess.SubprocessError) as exc:

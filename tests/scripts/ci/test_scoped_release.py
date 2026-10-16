@@ -58,6 +58,11 @@ def test_provenance_rejects_wrong_source_and_dirty_tree(tmp_path, monkeypatch):
     assert receipt["tree_sha"] == module.git("rev-parse", "HEAD^{tree}")
     with pytest.raises(ValueError, match="expected SHA"):
         module.prepare(manifest, "0" * 40)
+    injected = tmp_path / "untracked_import.py"
+    injected.write_text("value = 'not in accepted tree'\n")
+    with pytest.raises(ValueError, match="untracked"):
+        module.prepare(manifest, sha)
+    injected.unlink()
     path.write_text("unapproved\n")
     with pytest.raises(subprocess.CalledProcessError):
         module.prepare(manifest, sha)

@@ -116,6 +116,34 @@ path. No board mutation is claimed. The controller remains enabled, and source
 integration, deployment, notification crash-window proof, and business resumption
 are still gated. No upstream refresh, runtime activation, or cleanup deletion.
 
+## Exact-source follow-up: untracked source rejection (2026-10-16)
+
+Independent selection review `deleg_18c5d95b` found that tracked `git diff`
+checks did not reject nonignored untracked Python/test files. A real temporary
+Git repository reproduced this: the new injection assertion failed (15 passed,
+1 failed) before the fix. Both pre-test and post-test checks now reject these
+files through the same `require_clean_tree` function; canonical no-retry replay
+passed all 16 helper tests. This closes that provenance gap only, not gate 1.
+Ignored generated/runtime files retain normal Git ignore treatment.
+
+The review's stack-chain suggestion remains a provenance review consideration:
+manifest entries name frozen historical feature heads, not mutable latest PR
+heads. Current PR11 `18110d2a17112ec11fb7ec1c07cc8ae54bc07fc1` and PR12
+`ad34a46a5794f703f43de53960994e0c21726a08` were read from GitHub; PR12 still
+bases on PR11, and neither is merged. No default-main acceptance is claimed.
+
+Hosted run `38975215420` at that PR12 head completed **failure** on available
+standard `ubuntu-latest` / `macos-latest` runners. Both shared-contract lanes
+passed. Linux-1 failed mailbox drain/retry projection (`settled` vs `claimed`)
+and session-read diff RPC timeout; Linux-2 retained the models.dev credential
+alias failure; native macOS failed live-writer checkout recovery. All failures
+remain blocking, without waiver or narrowed selection. Local canonical replay
+of mailbox, retry and session-read files passed 12 tests; that does not resolve
+the hosted timing failures. Evidence logs are retained under
+`/home/ubuntu/.hermes/cache/four-gate-evidence/`; GitHub artifact IDs are
+`12081023266`, `12080014318`, `12078727887`, `12078604005`, `12078053016`.
+No further full-tree run is requested merely to retry these failures.
+
 ## Still outstanding
 
 Hosted exact-source receipts and independent review of results; reviewed source
