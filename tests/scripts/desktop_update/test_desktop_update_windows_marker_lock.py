@@ -14,10 +14,8 @@ import pytest
 from tests.installation_launcher_fixture import publish_fixture_launcher
 from tests.scripts.desktop_update.windows_handoff_support import (
     MARKER,
-    POWERSHELL,
     HOLD_CLI,
     _creation_time,
-    _alive,
     _dead_pid,
     _script,
     _finish,
@@ -97,17 +95,18 @@ def test_a7_concurrent_claimants_over_a_dead_marker_yield_one_owner(tmp_path: Pa
 
 # -- the update child is the delegate before it runs anything ------------------
 
-FIND_UPDATE_CHILD = r"""
-param([int]$Parent, [int]$Seconds)
-$deadline = (Get-Date).AddSeconds($Seconds)
-while ((Get-Date) -lt $deadline) {
-    $row = Get-CimInstance Win32_Process -Filter "ParentProcessId=$Parent" |
-        Where-Object { $_.CommandLine -match '--yes' } | Select-Object -First 1
-    if ($row) { [Console]::Out.Write($row.ProcessId); exit 0 }
-    Start-Sleep -Milliseconds 100
-}
-exit 1
-"""
+def _suspended_launcher(parent: int, launcher: Path):
+    """A suspended process has kernel identity but need not expose its PEB argv."""
+    import psutil
+
+    for child in psutil.Process(parent).children():
+        try:
+            if (Path(child.exe()) == launcher
+                    and child.status() == psutil.STATUS_STOPPED):
+                return child
+        except psutil.NoSuchProcess:
+            continue
+    return None
 
 
 @pytest.mark.platforms('windows')
@@ -116,37 +115,55 @@ def test_script_killed_before_publishing_the_delegate_runs_no_update(tmp_path: P
     child but has not published it as the marker delegate (the marker lock is held elsewhere).
     Killed there, no update instruction may have run, and the custodian line 1 names releases
     the marker (nothing holds the checkout)."""
+    from tests.scripts.desktop_update.windows_handoff_support import _log
+    from tests.waiting import wait_until
+
     install = tmp_path / 'checkout'
-    publish_fixture_launcher(install, HOLD_CLI)
+    help_gate = tmp_path / 'release-help'
+    # Pause the fixture's --help probe AFTER claim and BEFORE update creation.
+    # Holding the lock before starting the script would prevent its claim too.
+    barrier_cli = HOLD_CLI.replace(
+        "        print('--keep-stash'); return 0",
+        "        gate = Path(os.environ['HANDOFF_HELP_GATE'])\n"
+        "        Path(str(gate) + '.ready').touch()\n"
+        "        from threading import Event\n"
+        "        while not gate.exists(): Event().wait(0.02)\n"
+        "        print('--keep-stash'); return 0",
+    )
+    assert barrier_cli != HOLD_CLI
+    launcher = publish_fixture_launcher(install, barrier_cli)
     home = tmp_path / 'home'; home.mkdir()
     hold = tmp_path / 'release-update'
     ran = Path(str(hold) + '.pid')
     marker = home / MARKER
-    finder = tmp_path / 'find_child.ps1'
-    finder.write_text(FIND_UPDATE_CHILD, encoding='utf-8')
-    script = _script(home, install=install, HANDOFF_HOLD=str(hold))
+    script = _script(home, install=install, HANDOFF_HOLD=str(hold),
+                     HANDOFF_HELP_GATE=str(help_gate))
     lock = None
     try:
-        deadline = time.monotonic() + 60
-        while not (marker.exists() and _custodian(home, script.pid)
-                   and marker.read_bytes().split(b'\n')[0] == _custodian(home, script.pid).encode()):
-            assert time.monotonic() < deadline and script.poll() is None, 'script never claimed'
-            time.sleep(0.02)
-        lock = _HeldLock(home)   # after the claim, before the delegate publication
-        child = subprocess.run([POWERSHELL, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(finder),
-                                '-Parent', str(script.pid), '-Seconds', '60'],
-                               capture_output=True, text=True, timeout=90, check=False)
-        assert child.returncode == 0, 'the update child never appeared'
-        child_pid = int(child.stdout)
+        wait_until(lambda: Path(str(help_gate) + '.ready').exists(), timeout=60,
+                   what='post-claim help probe barrier')
+        owner = _custodian(home, script.pid)
+        assert owner and marker.read_bytes().split(b'\n')[0] == owner.encode(), _log(home)
+        lock = _HeldLock(home)
+        help_gate.touch()
+        try:
+            child = wait_until(lambda: _suspended_launcher(script.pid, launcher), timeout=60,
+                               what='suspended native update launcher')
+        except AssertionError as exc:
+            raise AssertionError(f'{exc}\n{_log(home)}') from exc
+        # Publication is blocked, so the child must still be suspended, and no
+        # delegate or first-instruction sentinel can already exist.
+        assert not ran.exists(), _log(home)
+        assert b'delegate:' not in marker.read_bytes(), _log(home)
         subprocess.run(['taskkill', '/F', '/PID', str(script.pid)], capture_output=True, check=True)
         script.wait(timeout=30)
-        time.sleep(3)
+        wait_until(lambda: not child.is_running(), timeout=30, what='suspended child job teardown')
         assert not ran.exists(), 'the update child ran before it was published as the delegate'
-        assert not _alive(child_pid), 'the never-resumed update child outlived its script'
         lines = marker.read_bytes().decode().split('\n')
-        assert lines[0] == _custodian(home, script.pid), lines
+        assert lines[0] == owner, lines
         assert not any(line.startswith('delegate:') for line in lines), lines
     finally:
+        help_gate.touch()
         if lock:
             lock.release()
         hold.touch()
