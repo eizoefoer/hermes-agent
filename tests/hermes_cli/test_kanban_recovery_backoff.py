@@ -40,6 +40,32 @@ def test_spawn_failure_is_backed_off_after_native_component_reopen(board, tmp_pa
         assert observe_failures(reopened, policy) == receipts
 
 
+@pytest.mark.parametrize('terminal', ['done', 'archived'])
+def test_terminal_task_does_not_keep_an_exhausted_recovery_obligation(board, terminal):
+    from hermes_cli.kanban_db_recovery import observe_failures
+
+    tid = kb.create_task(board, title='resolved failure', assignee='coder', max_retries=1)
+    policy = {'revision': 'a' * 40, 'now': 1000, 'retry_limit': 1}
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError('isolated startup failure')
+
+    kbd.dispatch_once(board, spawn_fn=fail, recovery_policy=policy)
+    assert observe_failures(board, policy)[0]['state'] == 'exhausted'
+    run_count = board.execute('SELECT COUNT(*) FROM task_runs WHERE task_id=?', (tid,)).fetchone()[0]
+    if terminal == 'done':
+        assert kb.complete_task(board, tid, result='fixture failure resolved', fire_lifecycle_hook=False)
+    else:
+        assert kb.archive_task(board, tid)
+    events_before = len(kb.list_events(board, tid))
+    assert observe_failures(board, policy) == []
+    assert observe_failures(board, policy) == []
+    assert board.execute('SELECT COUNT(*) FROM task_recovery_attempts WHERE task_id=?', (tid,)).fetchone()[0] == 0
+    assert board.execute('SELECT COUNT(*) FROM task_runs WHERE task_id=?', (tid,)).fetchone()[0] >= run_count
+    assert len(kb.list_events(board, tid)) == events_before
+    assert kb.get_task(board, tid).status == terminal
+
+
 def test_revision_change_does_not_override_native_block_or_approval(board):
     from hermes_cli.kanban_db_recovery import observe_failures
     tid = kb.create_task(board, title='authority', assignee='coder')

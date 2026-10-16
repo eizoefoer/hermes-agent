@@ -62,6 +62,10 @@ def observe_failures(conn: sqlite3.Connection, policy: dict) -> list[dict]:
     with kb.write_txn(conn):
         conn.execute(TABLE)
         conn.execute(SOURCES)
+        # Completed/archived cards retain their run/event evidence, not an
+        # outstanding retry obligation that the external bridge would re-route.
+        conn.execute("DELETE FROM task_recovery_attempts WHERE task_id IN "
+                     "(SELECT id FROM tasks WHERE status IN ('done','archived'))")
         rows = conn.execute(
             "SELECT t.id AS task_id,t.status,t.max_retries,t.consecutive_failures,r.id,r.outcome,r.error,r.metadata "
             ",s.revision AS admitted_revision FROM tasks t JOIN task_runs r ON r.id=(SELECT MAX(id) FROM task_runs "
