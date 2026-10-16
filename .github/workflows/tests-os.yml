@@ -197,7 +197,7 @@ jobs:
           scripts/run_tests.sh --files "$FILES" -- \
             ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
             -m "platforms and not integration" \
-            -v --tb=short
+            -v --tb=short -o faulthandler_timeout=90
         env:
           # These files spawn nested PowerShell trees. CPU-count parallelism
           # starves cold child startup before the fixture's idle deadline.
@@ -223,7 +223,7 @@ jobs:
             tests/scripts/desktop_update/test_desktop_update_windows_handoff_run.py \
             tests/scripts/desktop_update/test_desktop_update_windows_marker_bodies.py -- \
             -m "platforms and not integration" \
-            -k 'result_finished_at_is_stamped_after_the_r6_release_wait or marker_with_a_live_delegate_is_handed_to_it_at_finish or handoff_run_adopts_only_the_desktop_bridge_for_that_run or marker_bodies_are_parsed_positionally_like_every_other_reader' \
+            -k 'result_finished_at_is_stamped_after_the_r6_release_wait or marker_with_a_live_delegate_is_handed_to_it_at_finish or handoff_run_adopts_only_the_desktop_bridge_for_that_run or marker_bodies_are_parsed_positionally_like_every_other_reader or owner_creation_time_is_read_for_system_processes' \
             -x -v --tb=long --durations=10
         env:
           HERMES_TEST_WORKERS: '1'
