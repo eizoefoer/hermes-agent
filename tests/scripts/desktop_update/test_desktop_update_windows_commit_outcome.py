@@ -190,8 +190,14 @@ released.write_text(str(time.time()), encoding='utf-8')
 
 
 def _release_checkout_after_ack(log_path: Path, holder: subprocess.Popen) -> None:
-    wait_until(lambda: log_path.exists() and 'keeping the update marker' in
-               log_path.read_text(encoding='utf-8-sig'), timeout=120,
+    def acknowledged() -> bool:
+        try:
+            return 'keeping the update marker' in log_path.read_text(encoding='utf-8-sig')
+        except (FileNotFoundError, PermissionError):
+            # PowerShell Add-Content may briefly deny concurrent readers.
+            return False
+
+    wait_until(acknowledged, timeout=120,
                what='hand-off acknowledged the R6 release wait')
     assert holder.stdin is not None
     holder.stdin.write('release\n')
