@@ -14,6 +14,7 @@ locator targets — so the swap path is exercised end to end.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -33,6 +34,30 @@ def _make_broken_trampoline(tmp_path: Path) -> Path:
     bat = tmp_path / "git.bat"
     bat.write_text(_FORK_BOMB_BAT, encoding="utf-8")
     return bat
+
+
+def _real_git_diagnostics():
+    """Expose missing candidates versus refused probes on the actual Windows host."""
+    from hermes_cli.update_cmd_git import _portable_git_candidates
+    from hermes_cli.update_custody import run_git
+
+    candidates = [
+        Path(base) / "Git" / arch / "libexec" / "git-core" / "git.exe"
+        for base in (r"C:\Program Files", r"C:\Program Files (x86)")
+        for arch in ("clangarm64", "mingw64", "mingw32")
+    ] + _portable_git_candidates()
+    inventory = {"path_git": shutil.which("git"), "candidates": []}
+    for candidate in candidates:
+        row = {"path": str(candidate), "exists": candidate.exists()}
+        if row["exists"]:
+            try:
+                result = run_git([str(candidate)], ["--version"], timeout=15,
+                                 capture_output=True, text=True)
+                row.update(returncode=result.returncode, stdout=result.stdout, stderr=result.stderr)
+            except Exception as exc:
+                row["probe_error"] = f"{type(exc).__name__}: {exc}"
+        inventory["candidates"].append(row)
+    return inventory
 
 
 class TestGitTrampolineLive:
@@ -60,7 +85,7 @@ class TestGitTrampolineLive:
         real = update_cmd._locate_real_git()
         # windows-latest ships Git for Windows under Program Files with the
         # canonical git-core layout the locator searches first.
-        assert real is not None, "expected git-core git.exe on windows-latest"
+        assert real is not None, _real_git_diagnostics()
         assert real.exists()
         assert real.name == "git.exe"
         probe = subprocess.run(
