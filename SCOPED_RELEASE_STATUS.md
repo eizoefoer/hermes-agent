@@ -164,6 +164,37 @@ nonterminal work remain retained. Exactly-once remote send/wake crash-window
 findings above remain release blockers. Follow the existing external safe-boundary
 promotion mechanism only after reviewed source/CI and transport/admission proofs.
 
+## Scoped hosted acceptance entry point — 2026-10-16
+
+`release/SCOPED-RELEASE.md` and `release/scoped-acceptance.json` now define the
+frozen Linux/macOS contract. `.github/workflows/scoped-release.yml` preserves the
+broad workflow and uses five free standard-runner lanes: two full canonical Linux
+default-discovery slices, explicit shared contracts on Linux/macOS, and the native
+macOS marked suite. Actual candidate/tree SHA, baseline ancestry, selected command,
+log hash and nonempty summary are retained and downloaded by a fail-closed aggregate.
+Slow E2E exclusions of the existing default runner are explicit, not full E2E proof.
+
+Initial independent review rejected self-referential SHA, wrong baseline,
+macOS Bash4 selection and malformed result parsing; those were corrected before
+commit. Final independent review approved the design except a claimed missing
+`prune-python-cache` action input. Readback of setup-pm/action.yml lines45-47
+proves that input exists, so that finding is inapplicable; no action-schema change.
+Canonical explicit shared suite: 26 files, 255 passed, 0 failed, 1 foreign-Windows
+skip. Helper behavior suite: 12 passed. These are local qualification only.
+
+Broad run38922912950 at preceding feature source34ad3512d9a has two failed
+transient-resume reconnect tests, plus an LSP cleanup flake; reconnect source and
+tests are unchanged from frozen baseline, but baseline-failure attribution has
+not been established. Local unchanged reconnect tests pass23/23. Both failures
+remain visible, and reconnect is explicitly in the new shared acceptance selection.
+
+An attempted progress comment on t_6ca511b2 was refused by the native CLI:
+`delegate_task child contexts cannot mutate Kanban tasks via the CLI`.
+The owner-context blocker is retained; no DB bypass, respawn or graph duplication.
+No production service change, gateway restart, business mutation or worktree
+deletion occurred. Exact hosted receipts, source merge, deployment and independent
+live acceptance remain required; the remote-send/wake crash windows remain open.
+
 ## Remaining four gates
 
 1. Reviewed exact-head supported source CI, explicit review of any platform-scope
