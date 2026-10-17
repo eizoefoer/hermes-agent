@@ -203,6 +203,34 @@ or inline feedback. The existing eight-card graph remains blocked/todo with no
 running worker on its board. Production gateway PID3430553 remains unchanged;
 no service activation, source integration, business resumption or deletion occurred.
 
+## Credential compatibility follow-up (2026-10-17)
+
+The exact Linux-2 failure in hosted run `38975215420` is now reproduced
+without network dependence. Catalog metadata lists `CMD_API_KEY`, while the
+registered CommandCode plugin supports `COMMANDCODE_API_KEY`; catalog-first
+resolution discarded the latter. Resolver, plugin and original assertion are
+unchanged from the frozen baseline, so this is inherited compatibility behavior
+exposed by catalog drift, not a regression introduced by this release.
+
+A minimal CommandCode overlay retains the supported credential and existing
+plugin endpoint, including when the catalog is unavailable. No catalog credential
+is removed, no transport changes, and no original assertion is weakened.
+The deterministic regression failed before the repair. Canonical Python 3.14.7
+no-retry execution then passed **30 tests in 5 files**, including provider catalog,
+parity, precedence, profile identity and both present/absent catalog cases.
+Independent review `deleg_11f42c8e` approved the production fix. Evidence:
+`/home/ubuntu/.hermes/cache/four-gate-evidence/provider-catalog-red-20261017.log`
+and `provider-catalog-focused-green-20261017.log`.
+
+The latest hosted aggregate remains **failed**, not accepted. Native macOS
+checkout recovery remains the outstanding hosted failure without an established
+cause: the second repair launch still reports a live Git index holder after the
+fixture holder is reaped. Native-host PID/open-file evidence at that boundary is
+required before changing recovery fencing. No broad retry dispatch, upstream
+update, production activation, board resumption or cleanup deletion occurred.
+PR11/12 were freshly read as open and stacked, with no comments/reviews or inline
+feedback. Existing candidate/evidence/runtime and dirty routing work are retained.
+
 ## Still outstanding
 
 Hosted exact-source receipts and independent review of results; reviewed source

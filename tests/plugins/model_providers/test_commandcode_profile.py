@@ -140,6 +140,30 @@ class TestCommandCodeFetchModelsPickerContract:
     """
 
 
+    def test_catalog_credentials_preserve_registered_profile_key(self, monkeypatch, commandcode_profile):
+        """Catalog metadata must not make the plugin's existing credential unusable."""
+        from types import SimpleNamespace
+        from hermes_cli import providers as cli_providers
+
+        catalog = SimpleNamespace(
+            name="CommandCode", env=("CMD_API_KEY",),
+            api=commandcode_profile.base_url, doc="",
+        )
+        monkeypatch.setattr(cli_providers, "_models_dev_info", lambda *args: catalog)
+        resolved = cli_providers.resolve_provider_full("commandcode", {}, [])
+        assert resolved.api_key_env_vars == ("CMD_API_KEY", "COMMANDCODE_API_KEY")
+        assert resolved.base_url == catalog.api
+        assert resolved.transport == "openai_chat"
+
+    def test_missing_catalog_preserves_registered_endpoint(self, monkeypatch, commandcode_profile):
+        from hermes_cli import providers as cli_providers
+
+        monkeypatch.setattr(cli_providers, "_models_dev_info", lambda *args: None)
+        resolved = cli_providers.resolve_provider_full("commandcode", {}, [])
+        assert resolved.base_url == commandcode_profile.base_url
+        assert resolved.api_key_env_vars == ("COMMANDCODE_API_KEY",)
+        assert resolved.transport == "openai_chat"
+
     def test_resolve_provider_full(self):
         """Both profiles must resolve through the model-switch path.
 
