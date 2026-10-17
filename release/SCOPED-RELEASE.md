@@ -144,6 +144,35 @@ the hosted timing failures. Evidence logs are retained under
 `12081023266`, `12080014318`, `12078727887`, `12078604005`, `12078053016`.
 No further full-tree run is requested merely to retry these failures.
 
+## Mailbox drain synchronization follow-up (2026-10-17)
+
+The hosted `settled` versus `claimed` failure reproduced locally on the fourth
+canonical no-retry invocation using the frozen PM-built Python 3.14.7. The first
+phase's one-time receipt-task snapshot can miss a refresh enqueued by a completion
+callback. Reopening admission while that first phase is still active lets that
+refresh admit the retry before the second phase's read-time drain is installed.
+The test now waits for the existing receipt/mailbox/session quiescence predicate
+before reopening, and explicitly requires exactly one original admission. Both
+claimed-state assertions and final recovered retry/settlement remain enforced.
+No production behavior, test selection, deadlines or host markers changed.
+
+Independent read-only review `deleg_d74fde0f` approved the focused correction,
+noting that the predicate is observed quiescence rather than a formal scheduler
+barrier. Sixteen subsequent canonical no-retry invocations passed. The full
+mailbox/retry/session-read files then passed 12 tests with no file retries.
+Red and repeated-green logs remain under
+`/home/ubuntu/.hermes/cache/four-gate-evidence/mailbox-stress-20261017.log` and
+`mailbox-quiescence-green-20261017.log`. These local results do not clear the
+failed hosted run or prove live behavior. The diff-RPC timeout, provider-key
+alias mismatch and native macOS checkout recovery remain unresolved; no further
+full-tree dispatch is authorized merely to retry those failures.
+
+Live ownership inspection found no process using the two candidate worktree
+paths; gateway PID 3430553/start-ticks 410927755 remains on its prior runtime.
+Native board list was refused with `delegate_task child contexts cannot mutate
+Kanban tasks or boards`; no alternate state access or mutation bypass was used.
+No gateway restart, business resumption, worktree removal or evidence deletion.
+
 ## Still outstanding
 
 Hosted exact-source receipts and independent review of results; reviewed source
