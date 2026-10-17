@@ -173,6 +173,36 @@ Native board list was refused with `delegate_task child contexts cannot mutate
 Kanban tasks or boards`; no alternate state access or mutation bypass was used.
 No gateway restart, business resumption, worktree removal or evidence deletion.
 
+## Session-read cold acquisition follow-up (2026-10-17)
+
+The exact candidate `13454b04aeea4668536198b539b91f0d604c93b6` now reproduces
+its `/diff` RPC timeout locally under canonical Python 3.14.7 with process-only
+`strace`: one test failed at the unchanged 20-second RPC bound. The trace shows
+cold PM tool/Python/runtime acquisition in the isolated profile before the actual
+working-diff Git invocation, not a slow working-tree Git subprocess. This refutes
+the earlier unproven sequential-Git-timeout diagnosis for this reproduction; it
+does not independently establish every hosted timeout's cause.
+
+The read-command fixture now uses the supported `security.allow_lazy_installs:
+false` setting so real host Git handles this command without cold acquisition.
+All command coverage, RPC deadlines, session-cwd marker and write-refusal assertions
+are unchanged. Additional assertions reject acquired tools or a built PM runtime.
+No production, dependency, selection, platform marker or timeout change was made.
+The same traced invocation passed; canonical no-retry replay of session reads,
+TUI reads, gateway diff and Git consumer environment passed **15 tests in 4 files**.
+Independent read-only review `deleg_8304306f` found no actionable regression.
+Evidence is retained under `/home/ubuntu/.hermes/cache/four-gate-evidence/` as
+`session-read-process-timing-20261017.log`, `session-read-isolated-timing-20261017.log`,
+`session-read-isolated-green-20261017.log` and `session-read-focused-green-20261017.log`.
+This is a local fixture correction, not exact-source hosted acceptance. Native
+macOS checkout-lock recovery and the inherited external catalog credential-alias
+failure remain unresolved; no full-tree redispatch merely to retry them.
+
+Fresh PR11/12 readback still shows both open and stacked, with no comments/reviews
+or inline feedback. The existing eight-card graph remains blocked/todo with no
+running worker on its board. Production gateway PID3430553 remains unchanged;
+no service activation, source integration, business resumption or deletion occurred.
+
 ## Still outstanding
 
 Hosted exact-source receipts and independent review of results; reviewed source

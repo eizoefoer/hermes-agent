@@ -30,7 +30,10 @@ def test_local_session_reads_report_this_session_and_refuse_their_write_forms(tm
     thread = threading.Thread(target=peer.serve_forever, daemon=True)
     thread.start()
     url = f'http://127.0.0.1:{peer.server_port}/v1'
+    # Read-command coverage uses the host's real Git, not cold package acquisition.
+    # A fresh profile otherwise bootstraps PM during /diff before its Git timeout starts.
     config = json.dumps({'gateway': {'multiplex_profiles': False},
+                         'security': {'allow_lazy_installs': False},
                          'model': {'provider': 'custom', 'default': 'reads-model', 'base_url': url},
                          'auxiliary': {'title_generation': {'enabled': False}}})
     (home / 'config.yaml').write_text(config)
@@ -98,4 +101,6 @@ def test_local_session_reads_report_this_session_and_refuse_their_write_forms(tm
                     'agents', 'sessions', 'platform'):
         assert out[command] == 'unsupported_command', (command, out[command])
     assert (home / 'config.yaml').read_text() == config
+    assert not list((home / 'tools').glob('*')), 'read commands acquired tools'
+    assert not list((home / 'installs').glob('*/pm-runtime/generations/*')), 'read commands built PM runtime'
     assert not os.path.exists(home / 'cron' / 'jobs.json') or 'catalog' not in (home / 'cron' / 'jobs.json').read_text()
