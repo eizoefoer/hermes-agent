@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import re
 from functools import partial
 from pathlib import Path
@@ -317,7 +318,8 @@ class _Collector:
         task = self.kb.get_task(conn, sub["task_id"])
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                      len(events), sub["task_id"], slug, old_cursor, cursor)
-        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
+        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task,
+                "board": slug, "board_path": conn.execute("PRAGMA database_list").fetchone()[2]}
 
     def collect_board(self, slug: str) -> None:
         """Claim events on one board, appending delivery dicts to ``deliveries``."""
@@ -527,6 +529,7 @@ class _KanbanNotification:
         self.adapter: Any = None
         self.is_push_adapter = True
         self.wake_kinds: set = set()
+        self.event_identity = None
 
     # -- cursor / subscription ops (blocking, run in a fresh-context thread) --
 
@@ -622,6 +625,33 @@ class _KanbanNotification:
         logger.info("kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
                     self.task_id, self.platform_str, self.sub["chat_id"], self.sub_profile or "default", self.wake_kinds)
 
+    def _native_event_wakes(self):
+        """Immutable per-event work: retry batch growth must not repeat admitted events.
+
+        Only the native FIFO has transactional request replay. Legacy push/HTTP
+        delivery keeps its existing at-least-once behavior, not a false keyed ACK.
+        """
+        if not self.is_push_adapter or getattr(self.adapter, "gateway_runner", None) is not self.runner:
+            return None
+        payloads = []
+        for ev in self.d["events"]:
+            if not self.wake_agent or ev.kind not in _WAKE_KINDS:
+                continue
+            identity = json.dumps([self.d["board_path"], *self.sub_key, self.sub_profile, ev.id],
+                                  separators=(',', ':'))
+            # Mutable task title/assignee/result and neighbouring events are not
+            # part of an immutable event. The agent can read current board context.
+            from hashlib import sha256
+            payload = ev.payload or {}
+            detail = {"task_id": self.task_id, "event_id": ev.id, "kind": ev.kind,
+                      "board": self.board_slug,
+                      "payload_digest": sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest(),
+                      "summary": _safe_review_reason(payload.get("summary"), 200),
+                      "reason": _safe_review_reason(payload.get("reason"), 160)}
+            text = "[kanban] " + json.dumps(detail, sort_keys=True, ensure_ascii=False) + "\n\n" + t("gateway.kanban.wake.guidance")
+            payloads.append((text, diagnostic_event(ev), {ev.kind}, identity))
+        return payloads
+
     def _served_wake_profile(self) -> Optional[str]:
         """The subscription's profile when THIS gateway is a multiplexer serving it, else ``None``.
 
@@ -686,7 +716,8 @@ class _KanbanNotification:
                 raise RuntimeError(f"Kanban wake profile {self.sub_profile!r} no longer exists")
         async with _async_profile_runtime_scope(self.runner._resolve_profile_home_for_source(_source)):
             await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key, source=_source,
-                               notification_category="diagnostic" if self.wake_diagnostic else "result")
+                               notification_category="diagnostic" if self.wake_diagnostic else "result",
+                               **({"event_identity": self.event_identity} if self.event_identity is not None else {}))
         self._log_woke()
 
     async def _send_event(self, ev: Any, msg: str) -> bool:
@@ -809,15 +840,18 @@ class _KanbanNotification:
                     self.format_event(ev)
                 self.build_wake_text()
                 if self.wake_kinds:
-                    wake_payloads.append((self.synth, self.wake_diagnostic, self.wake_kinds))
+                    wake_payloads.append((self.synth, self.wake_diagnostic, self.wake_kinds, None))
             self.d = {**self.d, "events": original_events}
+            native_payloads = self._native_event_wakes()
+            if native_payloads is not None:
+                wake_payloads = native_payloads
         is_push = self.is_push_adapter
         from gateway.wake import WakeNotAccepted
 
         # A requested wake is required even when its passive ping already landed.
         if wake_payloads:
             try:
-                for self.synth, self.wake_diagnostic, self.wake_kinds in wake_payloads:
+                for self.synth, self.wake_diagnostic, self.wake_kinds, self.event_identity in wake_payloads:
                     if not await self.claim_current():
                         return
                     await self.wake()

@@ -18,6 +18,7 @@
     "tests/gateway/test_telegram_signed_approval_ingress.py",
     "tests/gateway/test_kanban_progress_notifications.py",
     "tests/gateway/test_kanban_notifier_wake_only_ordering.py",
+    "tests/gateway/test_kanban_event_wake_idempotency.py",
     "tests/gateway/test_multiplex_transport_matrix.py",
     "tests/hermes_cli/test_kanban_cli_origin.py",
     "tests/hermes_cli/test_kanban_module_launch.py",
