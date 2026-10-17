@@ -1,4 +1,14 @@
-# Delivery checklist — 2026-10-17 20:25 UTC
+# Delivery checklist — 2026-10-17 23:06 UTC
+
+## Current corrective experiment — installer write/inhibition composition
+
+NOT DEPLOYED; no complete checklist item closed. Before edits, the tracked causal gap on routing experiment `experiment/gate2-installer-write-inhibition-20261017` linked intended replacement safety -> continuous inhibition during actual forward/rollback writes -> existing installer methods replace fragment masks -> bounded real-filesystem composition experiment. Commit `2d07acfca70e9f0d1e813b0585a2a963e60ce637` is pushed and remote-verified. Its actual `_write_privileged_unit`, `_install_paths`, `_restore_and_restart` calls replace `/dev/null` masks with candidate/prior regular bytes in temporary directories. This reproduces a necessary composition hazard, not safe deployment or healthy replacement proof. Production installer/source/refusal unchanged.
+
+Parent corrected the child runner invocation: absolute external test path through frozen accepted native `scripts/run_tests.sh`, `HERMES_PYTHON=/usr/local/lib/hermes-agent/venv/bin/python`, zero file retries, discovered one real file and ran three assertions successfully, exit0. This supersedes the relative-path discovery limitation in that experiment's original receipt; it is local negative characterization, NOT hosted acceptance or item(c) closure. Independent review `deleg_528b568a` confirms filesystem evidence only. Critical limit: system-tier fixture targets approval-worker, NOT the actual system supervisor; command runner and validation are mocked. No combined manager/drain/pending-approval transaction has executed. Do not re-label these passing hazard assertions as passing safety assertions.
+
+Narrow engineering decision `deleg_d6b0a26e`: off-path staging can leave masks intact while writing, but moving executable bytes onto the live fragment is an explicit activation handoff whose replacement safety remains unproven. Next action is a minimal reviewed inhibition-aware installer write/restore transaction at the actual supervisor seam, retaining both replacement-after-final-read blocking assertions, completed native drain and unchanged pending approvals. No more standalone mask/drain/refusal revalidation, broad audit, or maintenance-authority-as-a-fix. Missing deliverable is engineering qualification, not proof that composition is impossible.
+
+Frozen run39000952128 freshly read successful jobs on standard ubuntu-latest/macos-latest; PR11/12 merged provenance unchanged, not default-main. Native CLI board read refused exactly `delegate_task child contexts cannot mutate Kanban tasks or boards`; no guard bypass or board write. Production gateway3430553, user3325081, system3398181 remain active; no production control/config/approval operation, restart, upstream refresh, broad workflow dispatch, spend or business resumption. Relevant dirty/runtime/evidence/backups remain retained. Experiment cleanup is handled only after exact inactive/clean/durable-local-and-remote-ref checks; no deletion of evidence is authorized.
 
 ## Combined-boundary decision — no executable activation path
 
