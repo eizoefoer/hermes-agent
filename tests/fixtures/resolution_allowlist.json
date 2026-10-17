@@ -393,6 +393,12 @@
     "kind": "bare_which"
   },
   {
+    "path": "hermes_cli/update_cmd_git.py",
+    "symbol": "_locate_real_git",
+    "kind": "bare_which",
+    "reason": "discovers installation roots beside the PATH Git trampoline, including PM/custom installs; never executes or returns that shim and accepts only a sibling git-core binary passing the real probe; covered by test_update_real_git_path.py"
+  },
+  {
     "path": "hermes_cli/update_cmd_commit.py",
     "symbol": "_absolute_git",
     "kind": "bare_which",

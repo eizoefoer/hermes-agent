@@ -141,18 +141,27 @@ async def test_drain_defers_retry_without_publishing_interim_failure(bot, monkey
     bot.errors[:] = ['Error code: 429 - rate limit exceeded']
     key = 'e' * 32
     await deliver(bot.connection, dict(id=key, profile='default', message='retry after restart'))
-    tasks = list(getattr(bot.authority, '_bot_receipt_tasks', ()))
-    if tasks: await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 10)
+    # A receipt task can enqueue a refresh after a snapshot of the task set was taken.
+    # Finish the first drain before reopening admission for the second, read-time drain.
+    from tests.gateway.test_session_bot_retry import _settle_quietly, _admissions
+    await _settle_quietly(bot)
+    assert len(_admissions(bot)) == 1
     assert (await asyncio.to_thread(read_delivery_result, bot.home, key))['status'] == 'claimed'
     from gateway import session_bot
     read = session_bot.read_receipt
+    bot.authority.runner._draining = False
+    receipt_read = asyncio.Event()
     async def drain_during_read(home, key):
         result = await read(home, key)
-        bot.authority.runner._draining = True
+        if result[1] is not None:
+            bot.authority.runner._draining = True
+            receipt_read.set()
         return result
-    bot.authority.runner._draining = False
     monkeypatch.setattr(session_bot, 'read_receipt', drain_during_read)
     await deliver(bot.connection, dict(id=key, profile='default', message='retry after restart'))
+    await asyncio.wait_for(receipt_read.wait(), 5)
+    tasks = list(getattr(bot.authority, '_bot_receipt_tasks', ()))
+    if tasks: await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 10)
     assert (await asyncio.to_thread(read_delivery_result, bot.home, key))['status'] == 'claimed'
     monkeypatch.setattr(session_bot, 'read_receipt', read)
     monkeypatch.setattr(finite, 'execute_finite_admission', execute)

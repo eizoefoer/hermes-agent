@@ -1,0 +1,123 @@
+name: Scoped Linux and macOS acceptance
+
+on:
+  push:
+    branches: [fix/signed-contract-preservation-20261016]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scoped-release-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  acceptance:
+    name: Scoped ${{ matrix.id }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {id: linux-1, os: ubuntu-latest, lane: linux-1}
+          - {id: linux-2, os: ubuntu-latest, lane: linux-2}
+          - {id: linux-shared, os: ubuntu-latest, lane: shared}
+          - {id: macos-shared, os: macos-latest, lane: shared}
+          - {id: macos-native, os: macos-latest, lane: macos-native}
+    steps:
+      - name: Checkout exact candidate tree
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Set up locked Python and test environment
+        uses: ./.github/actions/setup-pm
+        with:
+          packages: ripgrep
+          extras: '["all", "telegram", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web"]'
+          test-environment: 'true'
+          prune-python-cache: true
+      - name: Execute source-bound canonical acceptance
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+          ACCEPTANCE_LANE: ${{ matrix.lane }}
+          HERMES_TEST_WORKERS: '4'
+          HERMES_TEST_FILE_TIMEOUT: '900'
+          HERMES_TEST_FILE_RETRIES: '0'
+          OPENAI_API_KEY: ''
+          OPENROUTER_API_KEY: ''
+          NOUS_API_KEY: ''
+        run: |
+          set -euo pipefail
+          "$HERMES_PYTHON" scripts/ci/scoped_release.py --expected-sha "$EXPECTED_SHA" --lane "$ACCEPTANCE_LANE" --output "$RUNNER_TEMP/scoped-evidence"
+      - name: Preserve contract alongside actual results
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/scoped-evidence"
+          cp release/scoped-acceptance.json "$RUNNER_TEMP/scoped-evidence/manifest.json"
+      - name: Upload exact-source result and log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: scoped-${{ matrix.id }}-${{ github.sha }}
+          path: ${{ runner.temp }}/scoped-evidence/
+          if-no-files-found: error
+          retention-days: 90
+
+  verified-receipts:
+    name: Verify all supported-platform receipts
+    needs: acceptance
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all native lanes green
+        env:
+          ACCEPTANCE_RESULT: ${{ needs.acceptance.result }}
+        run: test "$ACCEPTANCE_RESULT" = success
+      - name: Checkout independent exact-source verifier
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Download exact-source evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: scoped-*-${{ github.sha }}
+          path: evidence
+      - name: Verify exact SHA, source tree, complete nonempty results and log hashes
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          from scripts.ci.scoped_release import git, parse_summary, verify_source_binding
+          sha = os.environ['EXPECTED_SHA']
+          assert git('rev-parse', 'HEAD') == sha
+          tree = git('rev-parse', 'HEAD^{tree}')
+          manifest = Path('release/scoped-acceptance.json').read_bytes()
+          trees = set()
+          for lane in ['linux-1', 'linux-2', 'linux-shared', 'macos-shared', 'macos-native']:
+              root = Path('evidence') / f'scoped-{lane}-{sha}'
+              receipt = json.loads((root / 'receipt.json').read_text())
+              assert receipt['source_sha'] == receipt['expected_sha'] == sha
+              verify_source_binding(receipt, sha, tree, os.environ['GITHUB_RUN_ID'], manifest)
+              assert (root / 'manifest.json').read_bytes() == manifest
+              expected_host = 'macOS' if lane.startswith('macos') else 'Linux'
+              assert receipt['platform'].startswith(expected_host)
+              assert parse_summary((root / 'tests.log').read_text()) == receipt['summary']
+              expected_lane = 'shared' if lane.endswith('-shared') else lane
+              assert receipt['lane'] == expected_lane, 'receipt belongs to another lane'
+              assert receipt['status'] == 'passed' and receipt['returncode'] == 0
+              assert receipt['summary']['passed'] > 0 and receipt['summary']['files'] > 0
+              assert receipt['summary']['failed'] == 0
+              assert (root / 'selection.txt').stat().st_size > 0
+              assert hashlib.sha256((root / 'tests.log').read_bytes()).hexdigest() == receipt['log_sha256']
+              assert hashlib.sha256((root / 'manifest.json').read_bytes()).hexdigest() == receipt['manifest_sha256']
+              trees.add(receipt['tree_sha'])
+          assert len(trees) == 1, 'lanes tested different trees'
+          print(f'Accepted exact source {sha}, tree {trees.pop()}; five nonempty native lanes and artifacts verified')
+          PY

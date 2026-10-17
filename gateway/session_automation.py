@@ -288,7 +288,7 @@ async def move_route_wakes(runner, session_key, old_session_id):
             ordered=True, after=partial(authority._schedule_admitted, new))
 
 
-async def admit_route_wake(runner, adapter, source, text, producer, metadata=None):
+async def admit_route_wake(runner, adapter, source, text, producer, metadata=None, *, event_identity=None):
     """Commit a producer wake (Kanban push wake, /loop tick) for ``source``'s route into the
     authority FIFO, like heartbeats and process completions, instead of a classic turn that
     interrupts or races the admitted one. ``False`` when no authority serves the scope or the
@@ -301,7 +301,10 @@ async def admit_route_wake(runner, adapter, source, text, producer, metadata=Non
     if authority is None or entry is None:
         return False
     import uuid
-    identity = json.dumps([producer, key, uuid.uuid4().hex], separators=(',', ':'))
+    if event_identity is not None and (not isinstance(event_identity, str) or not event_identity):
+        raise RuntimeStoreError('invalid_params')
+    identity = json.dumps([producer, key, event_identity if event_identity is not None else uuid.uuid4().hex],
+                          separators=(',', ':'))
     if source.platform == Platform.LOCAL:
         # A local route has no messaging provenance to borrow: its wake rides local_automation_v1 on
         # the live session's own source object (``snapshot_local_automation`` checks identity).

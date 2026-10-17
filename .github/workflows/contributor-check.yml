@@ -7,6 +7,11 @@ on:
         description: Commit to test and build. Empty keeps the triggering commit.
         type: string
         default: ''
+      comparison_base:
+        description: Immutable base commit for contributor attribution on manual replays.
+        required: false
+        type: string
+        default: ''
     outputs:
       review_status:
         description: "JSON array of review status objects"
@@ -29,12 +34,19 @@ jobs:
 
       - name: Check for unmapped contributor emails
         id: check-emails
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          COMPARISON_BASE: ${{ inputs.comparison_base }}
         run: |
-          # Get the merge base between this PR and main
-          MERGE_BASE=$(git merge-base origin/main HEAD)
+          # Keep immutable PR event identity authoritative. Manual replays may
+          # bind the intended comparison instead of a divergent fork main.
+          BASE_REF="${PR_BASE_SHA:-${COMPARISON_BASE:-origin/main}}"
+          HEAD_REF="${PR_HEAD_SHA:-HEAD}"
+          MERGE_BASE=$(git merge-base "$BASE_REF" "$HEAD_REF")
 
-          # Find any new author emails in this PR's commits
-          NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
+          # Find only author emails introduced by the actual comparison.
+          NEW_EMAILS=$(git log "${MERGE_BASE}..${HEAD_REF}" --format='%ae' --no-merges | sort -u)
 
           if [ -z "$NEW_EMAILS" ]; then
             echo "No new commits to check."

@@ -130,6 +130,39 @@ def test_a_failed_redial_is_retried_on_the_next_call(gateway, conn):
     assert conn.call("status") == {"status": "ok", "life": 2}
 
 
+def test_failed_redial_can_retry_before_its_thread_has_exited(gateway, conn, monkeypatch):
+    """Publishing a dial error wakes the caller before the loop thread necessarily exits."""
+    gateway.hang_up(conn)
+    gateway.refusals = 1
+    finishing = threading.Event()
+    release = threading.Event()
+    run = conn._run
+
+    def finish_after_release():
+        run()
+        if conn._error is not None:
+            finishing.set()
+            assert release.wait(5)
+
+    monkeypatch.setattr(conn, "_run", finish_after_release)
+    try:
+        with pytest.raises(GatewayClientError, match="Gateway starting"):
+            conn.call("status")
+        assert finishing.wait(5)
+        failed_thread = conn._thread
+        join = failed_thread.join
+
+        def release_on_join(timeout=None):
+            release.set()
+            join(timeout)
+
+        monkeypatch.setattr(failed_thread, "join", release_on_join)
+        assert conn.call("status") == {"status": "ok", "life": 2}
+    finally:
+        release.set()
+        conn._thread.join(5)
+
+
 def test_a_first_connect_failure_is_still_final(gateway):
     gateway.refusals = 2
     connection = GatewayConnection(connect=gateway.dial)

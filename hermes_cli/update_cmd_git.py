@@ -590,6 +590,15 @@ def _locate_real_git() -> Optional[Path]:
         for base in (r"C:\Program Files", r"C:\Program Files (x86)")
         for arch in ("clangarm64", "mingw64", "mingw32")
     ] + _portable_git_candidates()
+    # PM and custom installs need not live under Program Files or the legacy
+    # Hermes root. Search beside the PATH launcher, never return that shim.
+    import shutil
+
+    if path_git := shutil.which("git"):
+        launcher = Path(path_git)
+        roots = dict.fromkeys((launcher.absolute().parent.parent, launcher.resolve().parent.parent))
+        candidates += [root / arch / "libexec" / "git-core" / "git.exe"
+                       for root in roots for arch in ("clangarm64", "mingw64", "mingw32")]
     return next((c for c in candidates if c.exists() and _probe_fork_bomb([str(c)]) is False), None)
 
 

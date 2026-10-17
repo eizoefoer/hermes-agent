@@ -12,7 +12,7 @@ name: OS-specific tests
 # is where those markers actually execute:
 #
 #   macos    → ``-m platforms``    on macos-latest
-#   windows  → ``-m platforms``    on windows-latest-32-core and windows-latest-32-arm-core
+#   windows  → ``-m platforms`` on windows-latest and windows-11-arm
 #
 # (tests/conftest.py's ``pytest_collection_modifyitems`` hook skips
 # foreign-OS ``platforms(...)`` markers on each host, so one shared ``-m
@@ -92,13 +92,20 @@ jobs:
             runner: macos-latest
             marker: macos
             slice: 2/2
+          # The hand-off fixtures spawn nested PowerShell/process-discovery
+          # trees. Four simultaneous files hit the unchanged 300 s file bound
+          # on standard runners; the same 13 failing seams pass sequentially.
+          # Serialize files, not each test's own concurrent-process assertions.
           - name: Windows-only tests
-            runner: windows-latest-32-core
+            runner: windows-latest
             marker: windows
+            workers: 1
+            timeout: 120
           - name: Windows-only tests (arm64)
-            runner: windows-latest-32-arm-core
+            runner: windows-11-arm
             marker: windows
-            timeout: 60
+            workers: 1
+            timeout: 120
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -122,6 +129,7 @@ jobs:
           prune-python-cache: true
 
       - name: Run ${{ matrix.marker }} tests
+        id: os_suite
         # scripts/run_tests.sh — the canonical runner, same as every other
         # lane: per-file subprocess isolation (run_tests_parallel.py). It
         # natively tolerates per-file empty collections (a platform-gated
@@ -189,14 +197,38 @@ jobs:
           scripts/run_tests.sh --files "$FILES" -- \
             ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
             -m "platforms and not integration" \
-            -v --tb=short
+            -v --tb=short -o faulthandler_timeout=90
         env:
           # These files spawn nested PowerShell trees. CPU-count parallelism
           # starves cold child startup before the fixture's idle deadline.
-          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && (runner.arch == 'ARM64' && '16' || '16') || '' }}
+          HERMES_TEST_WORKERS: ${{ matrix.workers || '' }}
           HERMES_TEST_SLICE: ${{ matrix.slice || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
+          OPENROUTER_API_KEY: ''
+          OPENAI_API_KEY: ''
+          NOUS_API_KEY: ''
+
+      - name: Diagnose Windows hand-off failures in isolation
+        # Keep the full suite's failure authoritative. Its 300 s file deadline
+        # can kill pytest before the final traceback is printed. Re-run only
+        # the observed failing seams, one file at a time and stop at its first
+        # failure, to expose the cause rather than raise/disable the deadline.
+        if: ${{ failure() && steps.os_suite.outcome == 'failure' && runner.os == 'Windows' && inputs.desktop_updater }}
+        timeout-minutes: 16
+        shell: bash
+        run: |
+          scripts/run_tests.sh \
+            tests/scripts/desktop_update/test_desktop_update_windows_commit_outcome.py \
+            tests/scripts/desktop_update/test_desktop_update_windows_handoff_run.py \
+            tests/scripts/desktop_update/test_desktop_update_windows_marker_bodies.py -- \
+            -m "platforms and not integration" \
+            -k 'result_finished_at_is_stamped_after_the_r6_release_wait or marker_with_a_live_delegate_is_handed_to_it_at_finish or handoff_run_adopts_only_the_desktop_bridge_for_that_run or marker_bodies_are_parsed_positionally_like_every_other_reader or owner_creation_time_is_read_for_system_processes' \
+            -x -v --tb=long --durations=10
+        env:
+          HERMES_TEST_WORKERS: '1'
+          HERMES_TEST_FILE_TIMEOUT: '300'
+          HERMES_TEST_FILE_RETRIES: '0'
           OPENROUTER_API_KEY: ''
           OPENAI_API_KEY: ''
           NOUS_API_KEY: ''

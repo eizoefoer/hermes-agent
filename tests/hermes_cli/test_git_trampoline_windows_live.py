@@ -7,13 +7,13 @@ helpers against the runner's genuine Git-for-Windows install plus a real
 broken-trampoline stand-in (a .bat that reproduces the launcher's
 "BUG (fork bomb)" guard output and refuses to run).
 
-windows-latest ships full Git for Windows at ``C:\\Program Files\\Git`` with
-the real ``mingw64\\libexec\\git-core\\git.exe`` — exactly the layout the
-locator targets — so the swap path is exercised end to end.
+The runner may use PM-managed PortableGit rather than a Program Files install.
+The locator must find the real git-core executable beside either launcher.
 """
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -33,6 +33,35 @@ def _make_broken_trampoline(tmp_path: Path) -> Path:
     bat = tmp_path / "git.bat"
     bat.write_text(_FORK_BOMB_BAT, encoding="utf-8")
     return bat
+
+
+def _real_git_diagnostics():
+    """Expose missing candidates versus refused probes on the actual Windows host."""
+    from hermes_cli.update_cmd_git import _portable_git_candidates
+    from hermes_cli.update_custody import run_git
+
+    candidates = [
+        Path(base) / "Git" / arch / "libexec" / "git-core" / "git.exe"
+        for base in (r"C:\Program Files", r"C:\Program Files (x86)")
+        for arch in ("clangarm64", "mingw64", "mingw32")
+    ] + _portable_git_candidates()
+    if path_git := shutil.which("git"):
+        launcher = Path(path_git)
+        roots = dict.fromkeys((launcher.absolute().parent.parent, launcher.resolve().parent.parent))
+        candidates += [root / arch / "libexec" / "git-core" / "git.exe"
+                       for root in roots for arch in ("clangarm64", "mingw64", "mingw32")]
+    inventory = {"path_git": shutil.which("git"), "candidates": []}
+    for candidate in candidates:
+        row = {"path": str(candidate), "exists": candidate.exists()}
+        if row["exists"]:
+            try:
+                result = run_git([str(candidate)], ["--version"], timeout=15,
+                                 capture_output=True, text=True)
+                row.update(returncode=result.returncode, stdout=result.stdout, stderr=result.stderr)
+            except Exception as exc:
+                row["probe_error"] = f"{type(exc).__name__}: {exc}"
+        inventory["candidates"].append(row)
+    return inventory
 
 
 class TestGitTrampolineLive:
@@ -60,7 +89,7 @@ class TestGitTrampolineLive:
         real = update_cmd._locate_real_git()
         # windows-latest ships Git for Windows under Program Files with the
         # canonical git-core layout the locator searches first.
-        assert real is not None, "expected git-core git.exe on windows-latest"
+        assert real is not None, _real_git_diagnostics()
         assert real.exists()
         assert real.name == "git.exe"
         probe = subprocess.run(

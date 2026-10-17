@@ -79,12 +79,10 @@ jobs:
     # Release runs force the lane: a stable candidate must build the flake
     # no matter what its diff touches.
     if: needs.detect.outputs.nix == 'true' || inputs.release == true
-    # The build compiles the package and its whole dependency closure, so this
-    # takes minutes and not seconds when the cache misses. `nix flake check`
-    # builds 21 checks, and --max-jobs defaults to the core count. It uses the
-    # wider runner with no more configuration.
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 60
+    # Standard public runners keep fork CI free and schedulable. Serialize
+    # derivations and bound their parallelism without dropping any flake checks.
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -97,6 +95,8 @@ jobs:
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
+            max-jobs = 1
+            cores = 2
             # A store path that does not substitute is a cache miss and not a
             # build failure. Build it here instead.
             fallback = true

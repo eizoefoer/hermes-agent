@@ -33,7 +33,8 @@ from tools.file_tools_paths import (
 from tools.file_tools_write_guards import (
     _READ_DEDUP_STATUS_MESSAGE, _check_approval_required_write, _check_binary_document_write,
     _check_cross_profile_path, _check_protected_instruction_write, _check_sensitive_path,
-    _is_internal_file_tool_content, _stale_overwrite_blocker, _stale_write_refusal)
+    _is_internal_file_tool_content, _stale_overwrite_blocker,
+    _protected_instruction_reason, _stale_write_refusal)
 from tools.file_tools_read_tracking import (
     _bump_consecutive, _cap_read_tracker_data, _carry_full_write_baselines, _check_file_staleness,
     _check_not_found_cache, _known_full_content_sha256,
@@ -784,8 +785,8 @@ def _write_precheck_error(paths: list[str], content_paths: list[str], task_id: s
         err = _check_binary_document_write(p, task_id)
         if err:
             return err
-    return (_check_protected_instruction_write(paths, task_id)
-            or _check_approval_required_write(paths, task_id))
+    # Protected-file approval needs the complete proposal, derived later under the path locks.
+    return _check_approval_required_write(paths, task_id)
 
 
 def _edit_warnings(paths: list[str], path_to_resolved: dict, task_id: str) -> list[str]:
@@ -871,7 +872,6 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     # write_file checks the binary-document guard before the mirror guard.
     err = (_check_sensitive_path(path, task_id)
            or _check_binary_document_write(path, task_id)
-           or _check_protected_instruction_write([path], task_id)
            or _check_approval_required_write([path], task_id)
            or (None if cross_profile else _check_cross_profile_path(path, task_id)))
     if not err and _is_internal_file_tool_content(content):
@@ -890,6 +890,23 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                 # Per-path lock serializes read→modify→write across concurrent
                 # subagents; different paths stay fully parallel.
                 _lock.enter_context(file_state.lock_path(_resolved))
+            _protected_preimage = None
+            scoped_grant = False
+            protected = _protected_instruction_reason(path, task_id)
+            if protected:
+                from tools.file_tools_scoped import _read_complete_current_file
+                _protected_preimage = _read_complete_current_file(_resolved or path, task_id)
+                if _protected_preimage is None:
+                    probe = _get_file_ops(task_id).read_file_raw(_resolved or path)
+                    if not probe.not_found:
+                        return tool_error("Unable to establish exact before-state for protected instruction write.")
+                # The grant and backend precondition share this locked preimage.
+                approval_decision = {}
+                err = _check_protected_instruction_write([path], task_id, {path: content},
+                                                          {path: _protected_preimage}, approval_decision)
+                if err:
+                    return tool_error(err)
+                scoped_grant = approval_decision.get("scoped", False)
             # A whole-file overwrite of content this task never saw, or that
             # changed since, is refused HERE — before the write — instead of
             # warning after the clobber (#65604). Nothing below runs.
@@ -898,7 +915,12 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                 return json.dumps(_stale_write_refusal(path, blocker, _resolved), ensure_ascii=False)
             warnings = _edit_warnings([path], path_to_resolved, task_id)
             rewrite_hint = _whole_file_rewrite_hint(task_id, _resolved, content)
-            result = _get_file_ops(task_id).write_file(_resolved or path, content)
+            if protected:
+                result = _get_file_ops(task_id).write_file(
+                    _resolved or path, content,
+                    expected_content=_protected_preimage if scoped_grant else ...)
+            else:
+                result = _get_file_ops(task_id).write_file(_resolved or path, content)
             result_dict = result.to_dict()
             if warnings:
                 result_dict["_warning"] = warnings[0]
@@ -1000,12 +1022,16 @@ def patch_tool(mode: str = "replace", path: str | None = None, old_string: str |
                 if old_string is None or new_string is None:
                     return tool_error("old_string and new_string required")
                 _replace_target = _path_to_resolved.get(path) or path
-                result = file_ops.patch_replace(_replace_target, old_string, new_string, replace_all)
+                from tools.file_tools_scoped import approved_replace
+                result = approved_replace(file_ops, _replace_target, path, old_string,
+                                          new_string, replace_all, task_id)
             elif mode == "patch":
                 if not patch:
                     return tool_error("patch content required")
-                result = file_ops.patch_v4a(
-                    _rewrite_v4a_patch_paths_for_host(patch, _path_to_resolved, _path_to_entry, file_ops))
+                from tools.file_tools_scoped import approved_patch
+                rewritten = _rewrite_v4a_patch_paths_for_host(patch, _path_to_resolved, _path_to_entry, file_ops)
+                result = approved_patch(file_ops, patch, rewritten, _paths_to_check,
+                                        _path_to_resolved, task_id)
             else:
                 return tool_error(f"Unknown mode: {mode}")
 

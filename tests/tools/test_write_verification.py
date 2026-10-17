@@ -62,13 +62,19 @@ class TestWriteVerification:
 
         real_exec = fo.ShellFileOperations._exec
 
+        verification_attempts = []
+
         def flaky_exec(self, cmd, **kw):
-            if "sha256sum" in cmd:
+            # Fail the standalone post-write probe, not an atomic write whose
+            # conditional precondition branch also mentions the hash binary.
+            if cmd.startswith("sha256sum "):
+                verification_attempts.append(cmd)
                 raise RuntimeError("no hash binary")
             return real_exec(self, cmd, **kw)
 
         with mock_patch.object(fo.ShellFileOperations, "_exec", flaky_exec):
             r = json.loads(write_file_tool(str(f), "content lands anyway\n", task_id="t-wv2"))
+        assert verification_attempts, "the optional verification failure was not exercised"
         assert "error" not in r
         assert f.read_text() == "content lands anyway\n"
         assert "verified" not in r or r.get("verified") is None
