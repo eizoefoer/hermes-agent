@@ -1,4 +1,14 @@
-# Delivery checklist — 2026-10-17 18:44 UTC
+# Delivery checklist — 2026-10-17 20:30 UTC
+
+## Combined-boundary decision — no executable activation path
+
+Checklist (b)/(c), bounded decision review `deleg_b9a568bd`: examined existing exact-tier inhibition/queued-start scripts, native completed-drain evidence, preserved real-filesystem installer injection seams and current installer. Parent verified the actual seam tests and current `promote_supervisor` refusal. The preserved tests inject replacement in a simulated systemd runner after the final successful snapshot; manager subprobes do not enter that runner or the actual forward/rollback transaction. They cannot be called combined acceptance simply by running alongside it. No current transaction couples effective inhibition of both managers, completed gateway drain, pending-approval preservation and both installer seams. This is an absent qualified integration capability, NOT proof that composition is impossible or an authority request that would make an unsafe installer safe.
+
+No combined fixture was executed and no delivery item closed. Do not repeat the already-qualified mask/drain/admission subprobes or widen source scope. Smallest necessary next implementation is a bounded disposable integration of the existing maintenance primitives at the real transaction seams, including unchanged pending-approval readback and truthful forward/rollback/refusal receipts, independently reviewed before any production action. No general controller, ledger or new service topology is warranted. Current source intentionally refuses activation; it must not be patched to bypass refusal merely to exercise historical unsafe success tests.
+
+Decision evidence is retained on routing branch `experiment/gate2-combined-boundary-20261017`, `experiment-causal-gap.md`, based on04e24316487f413e63710053a8a81a266d7d8a13; review transcript `/home/ubuntu/.hermes/cache/delegation/live/deleg_b9a568bd/task-0.log`. Frozen native scoped run39000952128 read back success at123fc8c6dc233ab316721d12ff1f1dc3de69ee44; PR11/12 merged as previously recorded. Live service readback remains gateway3430553, user supervisor3325081 and system supervisor3398181 active, approval worker MainPID0/failed. No production control operation, new worker, board/business write, source repair, workflow dispatch, approval change, upstream refresh, spend or deletion. NOT DEPLOYED; Gates2–4 remain open. Dirty/runtime/evidence/backups and this nonterminal decision worktree are retained; no cleanup eligibility is asserted for unrelated paths.
+
+---
 
 Single current delivery checklist; source/review evidence remains in Git history (previous checkpoint 04054e77b96) and linked records. Not a competing task/lease ledger. No source repair or production activation in this cycle.
 
