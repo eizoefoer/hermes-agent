@@ -1,0 +1,24 @@
+# Current acceptance checkpoint — 2026-10-17 14:21 UTC
+
+No product repair authorized by this checkpoint. Existing release source and workflow are retained.
+
+| Intended feature | Concrete outstanding assertion / probe | Causal dependency | Smallest action |
+| --- | --- | --- | --- |
+| Noninterrupting compatible deployment | Shared acknowledgement covering gateway, user supervisor and system supervisor absent; historical forward/rollback final-read interleavings stop replacements | Native drain is gateway-local; unit-name systemd jobs do not fence PID/start identity. Pending routing PR9 explicitly refuses unsupported promotion | Keep production activation held. Require reviewed cooperative manager/owner boundary involving all replacement actors, challenged at BOTH preserved seams. No additional snapshot or private-lock substitution |
+| Durable event admission | Physical child loss/reopen must preserve keyed admission and reject changed payload | Accepted native SQLite authority and route restoration | Replay existing disposable real-component physical probe, retaining unknown human execution/follower pause. Not a deployed-live canary |
+| Compatible recovery dependency | Pending refusal contract must execute without production stop/config/backup mutation; worker currently failed/exit-code | Routing PR9 92627a19c57faa0e71c63cc78525531b12936009; PR10 de0eaa76997a9f3a08013df6066cee7dd01043ea remains unaccepted | Exercise existing real-installer/filesystem refusal contract. Historical approval qualification run remains failed and must not be called green |
+| Live isolation/recovery and continuation | Exact deployed source, origin/profile/approval/healthy-worker/terminal receipts absent | Gate2 deployment unavailable | Gates3/4 remain gated; preserve existing eight-card graph and business authorization limits |
+
+Fresh discovery: native PR11/12 MERGED. Supported-source run39000952128 has five successful Linux/macOS lanes and successful verifier, only ubuntu-latest/macos-latest labels. Accepted candidate123fc8c6dc233ab316721d12ff1f1dc3de69ee44 integrated on maintained compatibility ref cba881b0c497f5bbaba7fa85309176cb476739e2, NOT default-main acceptance. Gate1 receipt remains unchanged.
+
+Runtime readback: gateway3430553 InvocationID8e20ecdc576e4ae58b15332c95affa75; user supervisor3325081 InvocationID16b9e7b9123e443ea310d5034794c4de; system supervisor3398181 InvocationIDf5004da475a841479ae88b0f8c1570eb. Approval worker MainPID0 failed/exit-code. Existing eight cards remain three blocked/five todo. No running board worker claimed; no ownership reclaimed. Dirty routing source and runtime/evidence are retained.
+
+## Executed probes and boundary hold
+
+Physical original-feature probe passed against accepted native123fc8c6dc233ab316721d12ff1f1dc3de69ee44/tree ba9af54f5f9d7323e78d8e34eeeb0992222696d6: crash child3172705 exited73 after committing admission c786cad8872f49198cf311119235ac73; fresh child3172863 reopened the SAME single queued admission and rejected changed text with admission_conflict. Human execution remained unknown and followers paused. Receipt/log: `/home/ubuntu/.hermes/cache/four-gate-evidence/process-wake-20261017/physical-native-gnbzpbtq/`. Stand-in human and transport; no production recovery, inference or once-only external transport proof.
+
+Canonical accepted-native runner exercised existing routing headde0eaa76997a9f3a08013df6066cee7dd01043ea refusal contract: one file, six passed, zero failed, 100% complete, exit0. This establishes explicit refusal without simulated installer mutations, not safe deployment. Hosted routing run39030218180 freshly reads completed FAILURE at that exact head; no successful qualification receipt is inferred. Native PR11/12 comments/reviews/inline-comments each remain empty.
+
+No gate moved: same established production boundary blocker; no newly demonstrated shared ownership primitive. Do not repeat old probes or manufacture a cooperative toy protocol as release progress. Next meaningful experiment must use existing installer/native admission machinery AND all real replacement actors in disposable scope, challenge both original final-read interleavings, and verify no conflicting owner stop or unit/config mutation; otherwise activation remains explicitly unavailable. Existing full promote is not a safe substitute. External transport remains at-least-once attempts with duplicate/unknown outcomes, not exactly-once or guaranteed eventual delivery.
+
+No upstream update, workflow recreation/redispatch, protected approval edit, production drain/stop/restart/repoint, board/business mutation or spend. No deletion: dirty routing, nonterminal remote-backed candidates, active runtime, backups and evidence retained. This separate evidence branch does not alter or requalify the accepted product tree. Controller remains enabled because Gates2–4 remain open.
