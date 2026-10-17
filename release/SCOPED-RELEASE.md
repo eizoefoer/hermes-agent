@@ -231,6 +231,30 @@ update, production activation, board resumption or cleanup deletion occurred.
 PR11/12 were freshly read as open and stacked, with no comments/reviews or inline
 feedback. Existing candidate/evidence/runtime and dirty routing work are retained.
 
+## Original-feature crash-window checkpoint (2026-10-17)
+
+Before further repairs, `release/ACCEPTANCE-GAPS.md` now records the feature →
+failing assertion/probe → causal source/dependency → smallest action mapping.
+The new real-component probe reproduces the highest-priority unresolved finding:
+HTTP receiver acceptance followed by notifier exit77 before the native ping
+checkpoint results in TWO accepted identical messages after process/lease recovery.
+This passing characterization proves the failure window, NOT once-only acceptance.
+Independent review `deleg_5f2835df` accepted the bounded probe and truthful
+at-least-once-attempt/possible-duplicate semantics, not production release.
+Full watcher/Telegram behavior and physical lease-duration waiting are not tested.
+
+The same review found fresh per-attempt UUIDs at
+`gateway/session_automation.py:303-304`; native admission deduplicates request IDs,
+not equivalent text, so lost-response wake retries remain a separate internal
+admission blocker. Next: real disposable SessionAuthority admission/retry probe,
+then a stable subscription/event-batch/category identity through existing machinery
+if reproduced. No unrelated provider, checkout or Windows repair is justified.
+Canonical no-retry probe plus existing wake-ordering/claim-recovery suites passed
+11 tests in 3 files; retained log:
+`/home/ubuntu/.hermes/cache/four-gate-evidence/notification-crash-window-20261017.log`.
+These are bounded source/component evidence only; all four gates remain open.
+No merge, hosted redispatch, activation, restart, business mutation or deletion.
+
 ## Still outstanding
 
 Hosted exact-source receipts and independent review of results; reviewed source
