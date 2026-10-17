@@ -27,6 +27,11 @@ on:
         required: false
         type: string
         default: ''
+      comparison_base:
+        description: Immutable base commit for contributor attribution on manual replays.
+        required: false
+        type: string
+        default: ''
   workflow_call:
     inputs:
       commit:
@@ -38,6 +43,11 @@ on:
         required: false
         type: boolean
         default: false
+      comparison_base:
+        description: Immutable base commit for contributor attribution on manual replays.
+        required: false
+        type: string
+        default: ''
   pull_request:
   push:
     branches: [main]
@@ -294,6 +304,7 @@ jobs:
     uses: ./.github/workflows/contributor-check.yml
     with:
       commit: ${{ inputs.commit }}
+      comparison_base: ${{ inputs.comparison_base || '' }}
 
   uv-lockfile:
     name: Check uv.lock

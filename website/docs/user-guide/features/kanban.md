@@ -1261,7 +1261,22 @@ hermes kanban notify-unsubscribe t_abcd \
     --platform telegram --chat-id 12345678 --thread-id 7
 ```
 
-A subscription removes itself automatically once the task reaches `done` or `archived`; no cleanup needed.
+Subscriptions survive `done` and retries; they remove themselves on `archived`. Stale settled subscriptions are governed by `kanban.done_sub_retention_days`.
+
+### Sparse running-task progress
+
+The periodic notifier checks subscribed running tasks even when no terminal event arrives.
+It emits a passive progress ping after 10 minutes of the current run, then after another
+20 minutes, then every 40 minutes. The schedule is checkpointed in run-scoped `progress`
+events in the native board DB, so rebuilding a notifier does not reset the schedule.
+Late ticks emit one current update; transport recovery coalesces older progress instead
+of sending a catch-up burst. Finished tasks and earlier runs never emit stale progress.
+Progress does not wake an agent and `wake`-only subscriptions remain silent until an outcome.
+
+CLI `create` also captures an explicitly inherited gateway/TUI origin using the same
+auto-subscribe policy as the model tool. A standalone CLI invocation with only a local
+session ID has no chat recipient; use `notify-subscribe` explicitly. Existing unknown-origin
+tasks are never assigned an invented destination.
 
 **Discord threads under `profile_routes`:** when the gateway multiplexes profiles and routes a *channel*
 to a profile, a subscription created from the CLI for a *thread* in that channel needs the thread's route
@@ -1286,7 +1301,16 @@ Subscriptions created from inside the chat (`/kanban create`, `kanban_create`) r
 | `notify+wake` | yes | yes | You also want the destination agent to take a real turn — read the board context and reply in its own voice. Chat-originated auto-subscribes use this. |
 | `wake` | no | yes | You only want the agent to act on the event, with no separate ping. |
 
-For `notify+wake`, delivery completes only once the wake is admitted to the adapter's turn queue as well as the passive ping being sent. Missing handlers, rejected routes, and full queues are retried on later notifier ticks without expiring the subscription. Sent pings are checkpointed separately in SQLite, so a rejected wake does not repeat an already checkpointed ping. `notify` remains passive and never starts a turn. Admission is not a guarantee of model execution or a successful reply; normal turn gates still apply. This is not exactly-once delivery: a process crash between a send and its checkpoint can repeat the ping, and the existing claim-before-delivery cursor is not a crash-recoverable queue.
+For `notify+wake`, delivery completes only once the wake is admitted to the adapter's turn queue as well as the passive ping being sent. Missing handlers, rejected routes, and full queues are retried on later notifier ticks without expiring the subscription. Sent pings are checkpointed separately in SQLite, so a rejected wake does not repeat an already checkpointed ping. `notify` remains passive and never starts a turn. Admission is not a guarantee of model execution or a successful reply; normal turn gates still apply.
+
+Claim-before-delivery cursors carry a five-minute lease. A lost process's claim is reclaimed
+after expiry; stale batches are fenced before sending/waking and cannot settle a newer
+claim. Twelve consecutive delivery errors switch to a durable five-minute retry backoff,
+not automatic unsubscription. Delivery remains at-least-once, not exactly-once: process loss
+between remote acceptance and its SQLite ping checkpoint can repeat a message, and an
+already in-flight remote send cannot be revoked by lease expiry. Adapter acceptance is not
+proof that a human read the message. Deployment acceptance requires a real transport canary
+and independently recorded recipient receipt, not just unit tests or queued events.
 
 A "wake" forges a synthetic inbound message to the destination gateway agent so it takes a normal turn (reads the comment + result, reasons, replies) instead of getting a one-line passive notification. It only fires when the notifier runs inside a live gateway process; otherwise a `notify+wake` subscription still delivers its passive message, while a `wake`-only subscription does nothing in that process.
 

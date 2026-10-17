@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "source_feature_head": "34ad3512d9a8fdc266b39a8e55c7f8288a733701",
+  "candidate_branch": "fix/signed-contract-preservation-20261016",
+  "canonical_release_ref": "compat/scoped-approval-db44c46208",
+  "source_stack": [
+    {"pull_request": 11, "head": "18110d2a17112ec11fb7ec1c07cc8ae54bc07fc1", "base_ref": "compat/scoped-approval-db44c46208"},
+    {"pull_request": 12, "head": "34ad3512d9a8fdc266b39a8e55c7f8288a733701", "base_ref": "feat/scoped-agents-approval-20261015"}
+  ],
+  "compatibility_baseline": "db44c46208f1b421b4ecb7e56bf9d68b0423906f",
+  "default_main_snapshot": "592ae879fc557729192e238e2ac385492ae2c470",
+  "default_main_divergence": "This maintained compatibility release ref is not default main. Preserve divergent main; no upstream currency merge or reset. Deployment must bind an accepted exact compatibility-tree SHA, never assume default-main acceptance.",
+  "supported_hosts": ["Linux", "macOS"],
+  "excluded_host_scope": ["Unrelated Windows desktop repair is not a release prerequisite; shared-code regressions remain blocking."],
+  "required_paths": [
+    "tests/gateway/test_signed_approval_callback.py",
+    "tests/gateway/test_signed_telegram_approval_compatibility.py",
+    "tests/gateway/test_telegram_signed_approval_ingress.py",
+    "tests/gateway/test_kanban_progress_notifications.py",
+    "tests/gateway/test_kanban_notifier_wake_only_ordering.py",
+    "tests/gateway/test_kanban_event_wake_idempotency.py",
+    "tests/gateway/test_multiplex_transport_matrix.py",
+    "tests/hermes_cli/test_kanban_cli_origin.py",
+    "tests/hermes_cli/test_kanban_module_launch.py",
+    "tests/hermes_cli/test_kanban_notify_claim_recovery.py",
+    "tests/hermes_cli/test_kanban_recovery_backoff.py",
+    "tests/hermes_cli/test_kanban_recovery_integration.py",
+    "tests/tools/test_scoped_agents_approval.py",
+    "tests/acp_adapter/test_edit_approval.py",
+    "tests/acp_adapter/test_approval_isolation.py",
+    "tests/tools/test_human_protected_encoding.py",
+    "tests/tools/test_line_ending_preservation.py",
+    "tests/tools/test_write_verification.py",
+    "tests/hermes_cli/test_kanban_db.py",
+    "tests/hermes_cli/test_kanban_worker_pid_fingerprint.py",
+    "tests/hermes_cli/test_kanban_resume_guard.py",
+    "tests/gateway/test_multiplex_routing_authz.py",
+    "tests/gateway/test_telegram_topic_profile_routing.py",
+    "tests/hermes_state/test_terminal_retirement.py",
+    "tests/hermes_state/test_target_advance_fence.py",
+    "tests/hermes_cli/test_gateway_connection_reconnect.py",
+    "tests/scripts/ci/test_scoped_release.py"
+  ],
+  "test_policy": {
+    "linux": "Complete canonical default discovery in two deterministic slices, no file retries. Canonical slow integration/E2E exclusions retained; not full E2E acceptance.",
+    "macos": "Explicit shared contracts plus native platform-marked selection from list_os_marked_tests.py; no foreign-OS simulation.",
+    "zero_tests_or_zero_passes": "failure",
+    "failure_masking_or_retries": "prohibited"
+  },
+  "artifact_binding": "Five exact github.sha lane artifacts; aggregate reads all receipts, source tree, nonempty summaries and log/manifest hashes."
+}

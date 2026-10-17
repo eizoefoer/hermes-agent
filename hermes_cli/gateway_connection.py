@@ -140,6 +140,10 @@ class GatewayConnection:
                         raise self._error
                     return
                 thread = self._thread
+                if thread is not None and self._error is not None and self._ready.is_set():
+                    # An error wakes its caller before the failed loop thread has exited.
+                    # Finish that dial before deciding whether the next call may redial.
+                    thread.join(max(deadline - time.monotonic(), 0))
                 if thread is None or not thread.is_alive():
                     from agent.memory_provider import spawn_context_thread
 
