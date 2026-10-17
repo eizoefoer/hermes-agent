@@ -1,4 +1,4 @@
-# Delivery checklist — 2026-10-17 20:30 UTC
+# Delivery checklist — 2026-10-17 20:25 UTC
 
 ## Combined-boundary decision — no executable activation path
 
