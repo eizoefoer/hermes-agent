@@ -291,6 +291,19 @@ provider repair, upstream update, merge or live activation is authorized by thes
 local results. Exact revised-source hosted acceptance is still required before
 Gate1, followed by the existing deployment and independent live gates.
 
+## Original-feature crash-window acceptance — 2026-10-17
+
+Current causal gaps, independently reviewed transport semantics and real-component
+probe receipts are tracked in `release/ACCEPTANCE-GAPS.md`. A real child-process
+crash after loopback HTTP acceptance produces two identical accepted sends on
+lease recovery. A separate native FIFO probe preserves the healthy held turn but
+creates two wake admissions for the same source event after notifier interruption;
+the desired-one regression is deliberately RED. Fresh UUID-per-attempt wake identity
+is causal. Mutable claimed-batch hashing alone is not a robust repair. These findings
+block release; no four-gate acceptance, production activation or CI success is claimed.
+Do not resume provider/checkout baseline maintenance before resolving this original
+feature defect. Preserve normal approval gates and the existing task graph.
+
 ## Remaining four gates
 
 1. Reviewed exact-head supported source CI, explicit review of any platform-scope
