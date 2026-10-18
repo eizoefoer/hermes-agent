@@ -1,4 +1,16 @@
-# Delivery checklist — 2026-10-17 23:06 UTC
+# Delivery checklist — 2026-10-18 00:22 UTC
+
+## Latest bounded corrective experiment — stable activation guard across fragment writes
+
+**NOT DEPLOYED. No complete checklist item closed; Gates2–4 remain open.** Checklist (b)/(c) now has a concrete corrective primitive rather than more snapshot/staging checks: a separate exact-name systemd drop-in `ConditionPathExists=!absolute-maintenance-marker` remained effective when the actual installer `_write_privileged_unit` replaced `/dev/null` masks with candidate AND rollback fragments. Real user/system UUID units skipped explicit start/restart while held (`ConditionResult=no`, MainPID0, no ExecStartPre marker), then executed expected candidate/rollback only after explicit guard release. Zero exit status means skipped, not denied. Independent design review deleg_044decff and executed-evidence review deleg_bd54b138 accept this bounded result only.
+
+Source/causal record pushed and remote read-back verified at routing experiment `9f947853123afa994553bec730d7fd14a4b03acc`, branch `experiment/gate2-dropin-write-boundary-20261018`; `experiment-dropin-write-boundary.md` and `scripts/dropin_write_boundary_probe.py`. Receipt `/home/ubuntu/.hermes/cache/four-gate-evidence/deployment-boundary-20261017/dropin-write-26e2fb9f38794cbd8937b150f2fe8ad2.json`, SHA256 `294a4b77a1272a65b9f8d1bec14db57db15cf587e9a2f43b350c94c8c3917d51`. This is real manager + actual writer evidence, not full `_install_paths`/`_restore_and_restart`, simultaneous both-manager fencing, prequeued/automatic-job qualification under the new guard, native drain, approval preservation or deployed live acceptance. Do not transfer earlier mask-only receipts into these missing assertions. Current product promotion still refuses; no bypass.
+
+**Exact remaining blocker / next action:** integrate the proven separate guard at the bounded disposable installer forward and failed-canary rollback transaction, including both replacement-after-final-read injections, completed native drain and unchanged pending approvals. Cooperative sole integration-writer/systemd race exclusion is the achievable support contract; arbitrary privileged removal of guards cannot be technically fenced and is outside it. Maintenance approval alone still does not qualify the missing integrated procedure. No further broad audit, baseline/Windows/provider repair or standalone staging polish is warranted.
+
+Fresh ownership and board readback: gateway3430553/410927755, user supervisor3325081/402731328, system supervisor3398181/402840505 unchanged before/after; eight existing cards three blocked/five todo, worker_pid/session_id null, SQLite mode=ro only. Native scoped run39000952128 remains successful at123fc8c6dc233ab316721d12ff1f1dc3de69ee44; PR11/12 merged exact compatibility provenance unchanged, not default-main. No production unit/config/approval/board/source change, gateway restart, business dispatch, upstream refresh or spend. Both exact UUID disposable units/drop-ins/held markers removed and read back not-found/inactive/MainPID0; execution evidence retained. No worktree deletion: unfinished experiment, dirty routing, runtime and backups retained; privileged /proc cwd limitations do not authorize cleanup.
+
+## Previous checkpoints (retained evidence)
 
 ## Current corrective experiment — installer write/inhibition composition
 
