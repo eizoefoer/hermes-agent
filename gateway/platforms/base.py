@@ -162,6 +162,13 @@ def _reply_anchor_for_event(event) -> str | None:
     source = getattr(event, "source", None)
     platform = _platform_name(getattr(source, "platform", None))
     thread_id = getattr(source, "thread_id", None)
+    if platform == "telegram" and getattr(event, "internal", False):
+        # Durable automation IDs (e.g. ["kanban-wake", route, event]) are ledger
+        # identities, not Telegram message IDs. Keep them on the event, but never
+        # pass them to Telegram's integer reply target conversion.
+        message_id = getattr(event, "message_id", None)
+        if message_id is not None and not (str(message_id).isascii() and str(message_id).isdigit()):
+            return None
     raw_message = getattr(event, "raw_message", None)
     if (platform == "slack" and isinstance(raw_message, dict)
             and raw_message.get("_hermes_no_thread_response")):

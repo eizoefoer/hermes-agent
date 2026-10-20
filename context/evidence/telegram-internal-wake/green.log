@@ -1,0 +1,26 @@
+▶ not activated — using HERMES_PYTHON: /usr/local/lib/hermes-agent/venv/bin/python3
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 5 test files (~53 tests) under ['tests/gateway/test_telegram_internal_wake_anchor.py', 'tests/gateway/test_telegram_thread_fallback.py', 'tests/gateway/test_kanban_event_wake_idempotency.py', 'tests/gateway/test_background_process_notifications.py', 'tests/gateway/test_busy_redirect_anchor.py']; running with -j 4
+[  5.7% |     3/~53 | ✓6 | ✗0] ✓ tests/gateway/test_telegram_internal_wake_anchor.py (6✓, 1.1s)
+[  9.4% |     5/~53 | ✓8 | ✗0] ✓ tests/gateway/test_kanban_event_wake_idempotency.py (2✓, 3.7s)
+[ 39.6% |    21/~53 | ✓28 | ✗ 0] ✓ tests/gateway/test_telegram_thread_fallback.py (20✓, 3.9s)
+[ 45.3% |    24/~53 | ✓36 | ✗ 0] ✓ tests/gateway/test_busy_redirect_anchor.py (8✓, 5.9s)
+[100.0% |    53/~53 | ✓66 | ✗ 0] ✓ tests/gateway/test_background_process_notifications.py (30✓, 11.1s)
+
+=== Summary: 5 files, 66 tests passed, 0 failed (100% complete) in 11.1s (4 workers) ===
+  Durations cached to test_durations.json (5 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   5
+  Total subprocess CPU-wall: 25.7s  (runner wall: 11.1s, parallelism: 4x)
+  P50: 3.87s  P90: 11.11s  P95: 11.11s  P99: 11.11s  Max: 11.11s
+  <1s: 0 files (0%)  <2s: 1 files (20%)
+  Top 10 slowest:
+     11.11s  tests/gateway/test_background_process_notifications.py
+      5.86s  tests/gateway/test_busy_redirect_anchor.py
+      3.87s  tests/gateway/test_telegram_thread_fallback.py
+      3.72s  tests/gateway/test_kanban_event_wake_idempotency.py
+      1.12s  tests/gateway/test_telegram_internal_wake_anchor.py

@@ -1,0 +1,105 @@
+▶ not activated — using HERMES_PYTHON: /usr/local/lib/hermes-agent/venv/bin/python3
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 1 test files (~3 tests) under ['tests/gateway/test_telegram_internal_wake_anchor.py']; running with -j 4
+[100.0% |     3/~3 | ✓4 | ✗2] ✗ tests/gateway/test_telegram_internal_wake_anchor.py (4✓ 2✗, 1.2s)
+
+  ╔╍ Failed: tests/gateway/test_telegram_internal_wake_anchor.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║     @pytest.mark.parametrize('thread_id,chat_type', [(None, 'dm'), ('71', 'dm'), ('71', 'group')])
+  ║     def test_internal_wake_identity_is_not_a_telegram_reply(thread_id, chat_type):
+  ║         identity = json.dumps(['kanban-wake', 'route', '6233'])
+  ║         source = SessionSource(platform=Platform.TELEGRAM, chat_id='42', chat_type=chat_type,
+  ║                                thread_id=thread_id)
+  ║         event = MessageEvent(text='completed', source=source, internal=True, message_id=identity)
+  ║ >       assert _reply_anchor_for_event(event) is None
+  ║ E       assert '["kanban-wake", "route", "6233"]' is None
+  ║ E        +  where '["kanban-wake", "route", "6233"]' = _reply_anchor_for_event(MessageEvent(text='completed', message_type=<MessageType.TEXT: 'text'>, user_id=None, user_name=None, source=SessionSo...ata={}, timestamp=datetime.datetime(2026, 10, 20, 14, 20, 27, 681708), allow_gateway_control=True, reply_expected=None))
+  ║ 
+  ║ tests/gateway/test_telegram_internal_wake_anchor.py:18: AssertionError
+  ║ __________ test_internal_wake_identity_is_not_a_telegram_reply[71-dm] __________
+  ║ 
+  ║ thread_id = '71', chat_type = 'dm'
+  ║ 
+  ║     @pytest.mark.parametrize('thread_id,chat_type', [(None, 'dm'), ('71', 'dm'), ('71', 'group')])
+  ║     def test_internal_wake_identity_is_not_a_telegram_reply(thread_id, chat_type):
+  ║         identity = json.dumps(['kanban-wake', 'route', '6233'])
+  ║         source = SessionSource(platform=Platform.TELEGRAM, chat_id='42', chat_type=chat_type,
+  ║                                thread_id=thread_id)
+  ║         event = MessageEvent(text='completed', source=source, internal=True, message_id=identity)
+  ║ >       assert _reply_anchor_for_event(event) is None
+  ║ E       assert '["kanban-wake", "route", "6233"]' is None
+  ║ E        +  where '["kanban-wake", "route", "6233"]' = _reply_anchor_for_event(MessageEvent(text='completed', message_type=<MessageType.TEXT: 'text'>, user_id=None, user_name=None, source=SessionSo...ata={}, timestamp=datetime.datetime(2026, 10, 20, 14, 20, 27, 781847), allow_gateway_control=True, reply_expected=None))
+  ║ 
+  ║ tests/gateway/test_telegram_internal_wake_anchor.py:18: AssertionError
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/gateway/test_telegram_internal_wake_anchor.py::test_internal_wake_identity_is_not_a_telegram_reply[None-dm]
+  ║ FAILED tests/gateway/test_telegram_internal_wake_anchor.py::test_internal_wake_identity_is_not_a_telegram_reply[71-dm]
+  ║ ========================= 2 failed, 4 passed in 0.64s ==========================
+  ║
+  ║  Repro: python -m pytest tests/gateway/test_telegram_internal_wake_anchor.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+
+=== Summary: 1 files, 4 tests passed, 2 failed (100% complete) in 1.2s (4 workers) ===
+
+=== Per-file subprocess time distribution ===
+  Files:   1
+  Total subprocess CPU-wall: 1.2s  (runner wall: 1.2s, parallelism: 4x)
+  P50: 1.17s  P90: 1.17s  P95: 1.17s  P99: 1.17s  Max: 1.17s
+  <1s: 0 files (0%)  <2s: 1 files (100%)
+  Top 10 slowest:
+      1.17s  tests/gateway/test_telegram_internal_wake_anchor.py
+
+=== Failure output ===
+
+--- tests/gateway/test_telegram_internal_wake_anchor.py ---
+============================= test session starts ==============================
+platform linux -- Python 3.11.15, pytest-9.1.1, pluggy-1.6.0
+rootdir: /home/ubuntu/worktrees/telegram-internal-wake-anchor-20261020
+configfile: pyproject.toml
+plugins: timeout-2.4.0, asyncio-1.4.0, anyio-4.12.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 6 items
+
+tests/gateway/test_telegram_internal_wake_anchor.py FF....               [100%]
+
+=================================== FAILURES ===================================
+_________ test_internal_wake_identity_is_not_a_telegram_reply[None-dm] _________
+
+thread_id = None, chat_type = 'dm'
+
+    @pytest.mark.parametrize('thread_id,chat_type', [(None, 'dm'), ('71', 'dm'), ('71', 'group')])
+    def test_internal_wake_identity_is_not_a_telegram_reply(thread_id, chat_type):
+        identity = json.dumps(['kanban-wake', 'route', '6233'])
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id='42', chat_type=chat_type,
+                               thread_id=thread_id)
+        event = MessageEvent(text='completed', source=source, internal=True, message_id=identity)
+>       assert _reply_anchor_for_event(event) is None
+E       assert '["kanban-wake", "route", "6233"]' is None
+E        +  where '["kanban-wake", "route", "6233"]' = _reply_anchor_for_event(MessageEvent(text='completed', message_type=<MessageType.TEXT: 'text'>, user_id=None, user_name=None, source=SessionSo...ata={}, timestamp=datetime.datetime(2026, 10, 20, 14, 20, 27, 681708), allow_gateway_control=True, reply_expected=None))
+
+tests/gateway/test_telegram_internal_wake_anchor.py:18: AssertionError
+__________ test_internal_wake_identity_is_not_a_telegram_reply[71-dm] __________
+
+thread_id = '71', chat_type = 'dm'
+
+    @pytest.mark.parametrize('thread_id,chat_type', [(None, 'dm'), ('71', 'dm'), ('71', 'group')])
+    def test_internal_wake_identity_is_not_a_telegram_reply(thread_id, chat_type):
+        identity = json.dumps(['kanban-wake', 'route', '6233'])
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id='42', chat_type=chat_type,
+                               thread_id=thread_id)
+        event = MessageEvent(text='completed', source=source, internal=True, message_id=identity)
+>       assert _reply_anchor_for_event(event) is None
+E       assert '["kanban-wake", "route", "6233"]' is None
+E        +  where '["kanban-wake", "route", "6233"]' = _reply_anchor_for_event(MessageEvent(text='completed', message_type=<MessageType.TEXT: 'text'>, user_id=None, user_name=None, source=SessionSo...ata={}, timestamp=datetime.datetime(2026, 10, 20, 14, 20, 27, 781847), allow_gateway_control=True, reply_expected=None))
+
+tests/gateway/test_telegram_internal_wake_anchor.py:18: AssertionError
+=========================== short test summary info ============================
+FAILED tests/gateway/test_telegram_internal_wake_anchor.py::test_internal_wake_identity_is_not_a_telegram_reply[None-dm]
+FAILED tests/gateway/test_telegram_internal_wake_anchor.py::test_internal_wake_identity_is_not_a_telegram_reply[71-dm]
+========================= 2 failed, 4 passed in 0.64s ==========================
+
+=== 1 file with test failures (2 tests failed) ===
+  tests/gateway/test_telegram_internal_wake_anchor.py  (2 tests failed)
