@@ -168,6 +168,12 @@ def _reply_anchor_for_event(event) -> str | None:
         # Slack reaction handoff = new top-level message; a message_id anchor would make
         # _resolve_thread_ts() reply in a nonexistent thread.
         return None
+    if platform == "telegram" and getattr(event, "internal", False):
+        # Durable automation uses an admission ID, not a Telegram message ID.
+        # Keep that identity for dedupe, but route its reply by chat/topic only.
+        message_id = getattr(event, "message_id", None)
+        if message_id and not (message_id.isascii() and message_id.isdecimal()):
+            return None
     if platform == "telegram" and thread_id:
         # Forum topics route by topic metadata (no reply); DM-topic lanes reply to the triggering
         # message — replying to the topic seed/anchor can render outside the active lane.
