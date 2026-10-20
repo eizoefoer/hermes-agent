@@ -1,0 +1,131 @@
+▶ not activated — using HERMES_PYTHON: /usr/local/lib/hermes-agent/venv/bin/python3
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 1 test files (~5 tests) under ['tests/gateway/test_telegram_automation_reply_anchor.py']; running with -j 4
+[100.0% |     5/~5 | ✓7 | ✗1] ✗ tests/gateway/test_telegram_automation_reply_anchor.py (7✓ 1✗, 4.4s)
+
+  ╔╍ Failed: tests/gateway/test_telegram_automation_reply_anchor.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║             executed.append(event)
+  ║             captured = execution_result.get()
+  ║             reply = "reply to " + event.text
+  ║             if captured is not None:
+  ║                 captured["result"] = {"final_response": reply, "messages": []}
+  ║             return reply
+  ║     
+  ║         monkeypatch.setattr(runner, "_handle_message_with_agent", turn)
+  ║         await adapter.handle_message(MessageEvent(text="HUMAN", source=source, message_id="463"))
+  ║         await async_wait_until(lambda: bool(sent.await_count), timeout=15, what="human reply")
+  ║         sid = authority.logical_owner(runner.session_store.peek_session_id(key))
+  ║         await deliver_wake(adapter, source=source, text="TASK FINISHED", event_identity="immutable-event-6233")
+  ║     
+  ║         def rows():
+  ║             return [row for row in list_session_admissions(authority.db, session_id=sid, pending_only=False)
+  ║                     if row["request_id"].startswith('["kanban-wake",')]
+  ║     
+  ║         await async_wait_until(lambda: len(rows()) == 1 and rows()[0]["status"] == "terminal",
+  ║                                timeout=15, what="native wake and transport settlement")
+  ║         assert rows()[0]["outcome"] == "completed"
+  ║         assert len(executed) == 2 and executed[1].internal
+  ║         assert executed[1].message_id == rows()[0]["request_id"]
+  ║ >       assert sent.await_count == 2
+  ║ E       AssertionError: assert 1 == 2
+  ║ E        +  where 1 = <AsyncMock id='247260466840912'>.await_count
+  ║ 
+  ║ tests/gateway/test_telegram_automation_reply_anchor.py:114: AssertionError
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/gateway/test_telegram_automation_reply_anchor.py::test_native_wake_replay_sends_through_original_telegram_route
+  ║ ========================= 1 failed, 7 passed in 3.08s ==========================
+  ║
+  ║  Repro: python -m pytest tests/gateway/test_telegram_automation_reply_anchor.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+
+=== Summary: 1 files, 7 tests passed, 1 failed (100% complete) in 4.5s (4 workers) ===
+
+=== Per-file subprocess time distribution ===
+  Files:   1
+  Total subprocess CPU-wall: 4.4s  (runner wall: 4.5s, parallelism: 4x)
+  P50: 4.40s  P90: 4.40s  P95: 4.40s  P99: 4.40s  Max: 4.40s
+  <1s: 0 files (0%)  <2s: 0 files (0%)
+  Top 10 slowest:
+      4.40s  tests/gateway/test_telegram_automation_reply_anchor.py
+
+=== Failure output ===
+
+--- tests/gateway/test_telegram_automation_reply_anchor.py ---
+============================= test session starts ==============================
+platform linux -- Python 3.11.15, pytest-9.1.1, pluggy-1.6.0
+rootdir: /home/ubuntu/worktrees/telegram-wake-reply-anchor-20261020
+configfile: pyproject.toml
+plugins: timeout-2.4.0, asyncio-1.4.0, anyio-4.12.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 8 items
+
+tests/gateway/test_telegram_automation_reply_anchor.py .......F          [100%]
+
+=================================== FAILURES ===================================
+________ test_native_wake_replay_sends_through_original_telegram_route _________
+
+tmp_path = PosixPath('/var/tmp/hermes-pytest-1001/r-1xx69u7i/pytest-of-ubuntu/pytest-0/test_native_wake_replay_sends_0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe0e1d11b36d0>
+
+    @pytest.mark.asyncio
+    async def test_native_wake_replay_sends_through_original_telegram_route(tmp_path, monkeypatch):
+        """Real durable admission/replay and Telegram send; only inference/network are fake."""
+        from gateway.config import GatewayConfig
+        from gateway.run import GatewayRunner
+        from gateway.session_authority import initialize_session_authority
+        from gateway.session_results import execution_result
+        from gateway.wake import deliver_wake
+        from hermes_state_runtime import list_session_admissions
+        from tests.waiting import async_wait_until
+    
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "42")
+        runner = GatewayRunner(GatewayConfig())
+        adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fixture-token", typing_indicator=False))
+        sent = AsyncMock(return_value=SimpleNamespace(message_id=782))
+        adapter._bot = SimpleNamespace(send_message=sent)
+        adapter.gateway_runner = runner
+        runner.adapters = {Platform.TELEGRAM: adapter}
+        authority = await initialize_session_authority(runner, profile_id="default", instance_id="test-owner")
+        runner._wire_adapter_handlers(adapter)
+        source = adapter.build_source(chat_id="12345", chat_type="dm", user_id="42", thread_id="20197")
+        key = runner.session_store._generate_session_key(source)
+        executed = []
+    
+        async def turn(event, source, quick_key, run_generation):
+            executed.append(event)
+            captured = execution_result.get()
+            reply = "reply to " + event.text
+            if captured is not None:
+                captured["result"] = {"final_response": reply, "messages": []}
+            return reply
+    
+        monkeypatch.setattr(runner, "_handle_message_with_agent", turn)
+        await adapter.handle_message(MessageEvent(text="HUMAN", source=source, message_id="463"))
+        await async_wait_until(lambda: bool(sent.await_count), timeout=15, what="human reply")
+        sid = authority.logical_owner(runner.session_store.peek_session_id(key))
+        await deliver_wake(adapter, source=source, text="TASK FINISHED", event_identity="immutable-event-6233")
+    
+        def rows():
+            return [row for row in list_session_admissions(authority.db, session_id=sid, pending_only=False)
+                    if row["request_id"].startswith('["kanban-wake",')]
+    
+        await async_wait_until(lambda: len(rows()) == 1 and rows()[0]["status"] == "terminal",
+                               timeout=15, what="native wake and transport settlement")
+        assert rows()[0]["outcome"] == "completed"
+        assert len(executed) == 2 and executed[1].internal
+        assert executed[1].message_id == rows()[0]["request_id"]
+>       assert sent.await_count == 2
+E       AssertionError: assert 1 == 2
+E        +  where 1 = <AsyncMock id='247260466840912'>.await_count
+
+tests/gateway/test_telegram_automation_reply_anchor.py:114: AssertionError
+=========================== short test summary info ============================
+FAILED tests/gateway/test_telegram_automation_reply_anchor.py::test_native_wake_replay_sends_through_original_telegram_route
+========================= 1 failed, 7 passed in 3.08s ==========================
+
+=== 1 file with test failures (1 test failed) ===
+  tests/gateway/test_telegram_automation_reply_anchor.py  (1 test failed)

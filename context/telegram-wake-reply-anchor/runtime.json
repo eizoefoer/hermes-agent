@@ -1,0 +1,8 @@
+{
+  "pid": 514483,
+  "start_ticks": 457093884,
+  "active": "/home/ubuntu/.hermes/control-plane/releases/rc-b79039d833a9",
+  "plugin": "/home/ubuntu/.hermes/control-plane/releases/rc-b79039d833a9/services/always-on-harness/gateway-plugin",
+  "source": "e2f8c31053bb4af520604ca8b2ff5837e73f865a",
+  "test_exit": 0
+}

@@ -1,0 +1,30 @@
+▶ not activated — using HERMES_PYTHON: /usr/local/lib/hermes-agent/venv/bin/python3
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 7 test files (~62 tests) under ['tests/gateway/test_telegram_automation_reply_anchor.py', 'tests/gateway/test_telegram_thread_fallback.py', 'tests/gateway/test_busy_redirect_anchor.py', 'tests/gateway/test_kanban_event_wake_idempotency.py', 'tests/gateway/test_kanban_wake_scope.py', 'tests/gateway/test_kanban_wake_retry_admission.py', 'tests/gateway/test_background_process_notifications.py']; running with -j 4
+[  1.6% |     1/~62 | ✓1 | ✗0] ✓ tests/gateway/test_kanban_wake_retry_admission.py (1✓, 3.3s)
+[  4.8% |     3/~62 | ✓3 | ✗0] ✓ tests/gateway/test_kanban_event_wake_idempotency.py (2✓, 3.4s)
+[ 11.3% |     7/~62 | ✓10 | ✗ 0] ✓ tests/gateway/test_telegram_automation_reply_anchor.py (7✓, 1.3s)
+[ 16.1% |    10/~62 | ✓18 | ✗ 0] ✓ tests/gateway/test_busy_redirect_anchor.py (8✓, 5.0s)
+[ 41.9% |    26/~62 | ✓38 | ✗ 0] ✓ tests/gateway/test_telegram_thread_fallback.py (20✓, 3.5s)
+[ 53.2% |    33/~62 | ✓45 | ✗ 0] ✓ tests/gateway/test_kanban_wake_scope.py (7✓, 5.1s)
+[100.0% |    62/~62 | ✓75 | ✗ 0] ✓ tests/gateway/test_background_process_notifications.py (30✓, 10.4s)
+
+=== Summary: 7 files, 75 tests passed, 0 failed (100% complete) in 10.4s (4 workers) ===
+  Durations cached to test_durations.json (7 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   7
+  Total subprocess CPU-wall: 32.0s  (runner wall: 10.4s, parallelism: 4x)
+  P50: 3.47s  P90: 10.39s  P95: 10.39s  P99: 10.39s  Max: 10.39s
+  <1s: 0 files (0%)  <2s: 1 files (14%)
+  Top 10 slowest:
+     10.39s  tests/gateway/test_background_process_notifications.py
+      5.15s  tests/gateway/test_kanban_wake_scope.py
+      5.01s  tests/gateway/test_busy_redirect_anchor.py
+      3.47s  tests/gateway/test_telegram_thread_fallback.py
+      3.42s  tests/gateway/test_kanban_event_wake_idempotency.py
+      3.26s  tests/gateway/test_kanban_wake_retry_admission.py
+      1.29s  tests/gateway/test_telegram_automation_reply_anchor.py

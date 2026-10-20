@@ -1,0 +1,18 @@
+▶ not activated — using HERMES_PYTHON: /usr/local/lib/hermes-agent/venv/bin/python3
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 1 test files (~5 tests) under ['tests/gateway/test_telegram_automation_reply_anchor.py']; running with -j 4
+[100.0% |     5/~5 | ✓8 | ✗0] ✓ tests/gateway/test_telegram_automation_reply_anchor.py (8✓, 4.0s)
+
+=== Summary: 1 files, 8 tests passed, 0 failed (100% complete) in 4.1s (4 workers) ===
+  Durations cached to test_durations.json (1 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   1
+  Total subprocess CPU-wall: 4.0s  (runner wall: 4.1s, parallelism: 4x)
+  P50: 4.02s  P90: 4.02s  P95: 4.02s  P99: 4.02s  Max: 4.02s
+  <1s: 0 files (0%)  <2s: 0 files (0%)
+  Top 10 slowest:
+      4.02s  tests/gateway/test_telegram_automation_reply_anchor.py

@@ -1,0 +1,127 @@
+▶ not activated — using HERMES_PYTHON: /usr/local/lib/hermes-agent/venv/bin/python3
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 1 test files (~4 tests) under ['tests/gateway/test_telegram_automation_reply_anchor.py']; running with -j 4
+[100.0% |     4/~4 | ✓5 | ✗2] ✗ tests/gateway/test_telegram_automation_reply_anchor.py (5✓ 2✗, 1.4s)
+
+  ╔╍ Failed: tests/gateway/test_telegram_automation_reply_anchor.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║ _ test_synthetic_wake_keeps_destination_without_using_admission_id_as_reply[dm-20197] _
+  ║ 
+  ║ chat_type = 'dm', thread_id = '20197'
+  ║ 
+  ║     @pytest.mark.asyncio
+  ║     @pytest.mark.parametrize("chat_type,thread_id", [("dm", None), ("dm", "20197"), ("group", "20197")])
+  ║     async def test_synthetic_wake_keeps_destination_without_using_admission_id_as_reply(chat_type, thread_id):
+  ║         source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type=chat_type,
+  ║                                user_id="42", thread_id=thread_id)
+  ║         identity = json.dumps(["kanban-wake", "owning-route", "event:6233"], separators=(",", ":"))
+  ║         event = MessageEvent(text="completed event", source=source, internal=True, message_id=identity)
+  ║         adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fixture-token"))
+  ║         adapter._bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=782)))
+  ║         adapter._connected = True
+  ║         adapter._rich_available = False
+  ║         anchor = _reply_anchor_for_event(event)
+  ║         metadata = _thread_metadata_for_event(event)
+  ║         result = await adapter.send(source.chat_id, "continuation reply", reply_to=anchor, metadata=metadata)
+  ║ >       assert result.success, result.error
+  ║ E       AssertionError: invalid literal for int() with base 10: '["kanban-wake","owning-route","event:6233"]'
+  ║ E       assert False
+  ║ E        +  where False = SendResult(success=False, message_id=None, error='invalid literal for int() with base 10: \'["kanban-wake","owning-rou...vent:6233"]\'', raw_response=None, retryable=True, retry_after=None, continuation_message_ids=(), error_kind='unknown').success
+  ║ 
+  ║ tests/gateway/test_telegram_automation_reply_anchor.py:33: AssertionError
+  ║ ------------------------------ Captured log call -------------------------------
+  ║ ERROR    plugins.platforms.telegram.adapter:adapter.py:3692 [Telegram] Failed to send Telegram message: invalid literal for int() with base 10: '["kanban-wake","owning-route","event:6233"]'
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/gateway/test_telegram_automation_reply_anchor.py::test_synthetic_wake_keeps_destination_without_using_admission_id_as_reply[dm-None]
+  ║ FAILED tests/gateway/test_telegram_automation_reply_anchor.py::test_synthetic_wake_keeps_destination_without_using_admission_id_as_reply[dm-20197]
+  ║ ========================= 2 failed, 5 passed in 0.81s ==========================
+  ║
+  ║  Repro: python -m pytest tests/gateway/test_telegram_automation_reply_anchor.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+
+=== Summary: 1 files, 5 tests passed, 2 failed (100% complete) in 1.4s (4 workers) ===
+
+=== Per-file subprocess time distribution ===
+  Files:   1
+  Total subprocess CPU-wall: 1.4s  (runner wall: 1.4s, parallelism: 4x)
+  P50: 1.37s  P90: 1.37s  P95: 1.37s  P99: 1.37s  Max: 1.37s
+  <1s: 0 files (0%)  <2s: 1 files (100%)
+  Top 10 slowest:
+      1.37s  tests/gateway/test_telegram_automation_reply_anchor.py
+
+=== Failure output ===
+
+--- tests/gateway/test_telegram_automation_reply_anchor.py ---
+============================= test session starts ==============================
+platform linux -- Python 3.11.15, pytest-9.1.1, pluggy-1.6.0
+rootdir: /home/ubuntu/worktrees/telegram-wake-reply-anchor-20261020
+configfile: pyproject.toml
+plugins: timeout-2.4.0, asyncio-1.4.0, anyio-4.12.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 7 items
+
+tests/gateway/test_telegram_automation_reply_anchor.py FF.....           [100%]
+
+=================================== FAILURES ===================================
+_ test_synthetic_wake_keeps_destination_without_using_admission_id_as_reply[dm-None] _
+
+chat_type = 'dm', thread_id = None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("chat_type,thread_id", [("dm", None), ("dm", "20197"), ("group", "20197")])
+    async def test_synthetic_wake_keeps_destination_without_using_admission_id_as_reply(chat_type, thread_id):
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type=chat_type,
+                               user_id="42", thread_id=thread_id)
+        identity = json.dumps(["kanban-wake", "owning-route", "event:6233"], separators=(",", ":"))
+        event = MessageEvent(text="completed event", source=source, internal=True, message_id=identity)
+        adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fixture-token"))
+        adapter._bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=782)))
+        adapter._connected = True
+        adapter._rich_available = False
+        anchor = _reply_anchor_for_event(event)
+        metadata = _thread_metadata_for_event(event)
+        result = await adapter.send(source.chat_id, "continuation reply", reply_to=anchor, metadata=metadata)
+>       assert result.success, result.error
+E       AssertionError: invalid literal for int() with base 10: '["kanban-wake","owning-route","event:6233"]'
+E       assert False
+E        +  where False = SendResult(success=False, message_id=None, error='invalid literal for int() with base 10: \'["kanban-wake","owning-rou...vent:6233"]\'', raw_response=None, retryable=True, retry_after=None, continuation_message_ids=(), error_kind='unknown').success
+
+tests/gateway/test_telegram_automation_reply_anchor.py:33: AssertionError
+------------------------------ Captured log call -------------------------------
+ERROR    plugins.platforms.telegram.adapter:adapter.py:3692 [Telegram] Failed to send Telegram message: invalid literal for int() with base 10: '["kanban-wake","owning-route","event:6233"]'
+_ test_synthetic_wake_keeps_destination_without_using_admission_id_as_reply[dm-20197] _
+
+chat_type = 'dm', thread_id = '20197'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("chat_type,thread_id", [("dm", None), ("dm", "20197"), ("group", "20197")])
+    async def test_synthetic_wake_keeps_destination_without_using_admission_id_as_reply(chat_type, thread_id):
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type=chat_type,
+                               user_id="42", thread_id=thread_id)
+        identity = json.dumps(["kanban-wake", "owning-route", "event:6233"], separators=(",", ":"))
+        event = MessageEvent(text="completed event", source=source, internal=True, message_id=identity)
+        adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fixture-token"))
+        adapter._bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=782)))
+        adapter._connected = True
+        adapter._rich_available = False
+        anchor = _reply_anchor_for_event(event)
+        metadata = _thread_metadata_for_event(event)
+        result = await adapter.send(source.chat_id, "continuation reply", reply_to=anchor, metadata=metadata)
+>       assert result.success, result.error
+E       AssertionError: invalid literal for int() with base 10: '["kanban-wake","owning-route","event:6233"]'
+E       assert False
+E        +  where False = SendResult(success=False, message_id=None, error='invalid literal for int() with base 10: \'["kanban-wake","owning-rou...vent:6233"]\'', raw_response=None, retryable=True, retry_after=None, continuation_message_ids=(), error_kind='unknown').success
+
+tests/gateway/test_telegram_automation_reply_anchor.py:33: AssertionError
+------------------------------ Captured log call -------------------------------
+ERROR    plugins.platforms.telegram.adapter:adapter.py:3692 [Telegram] Failed to send Telegram message: invalid literal for int() with base 10: '["kanban-wake","owning-route","event:6233"]'
+=========================== short test summary info ============================
+FAILED tests/gateway/test_telegram_automation_reply_anchor.py::test_synthetic_wake_keeps_destination_without_using_admission_id_as_reply[dm-None]
+FAILED tests/gateway/test_telegram_automation_reply_anchor.py::test_synthetic_wake_keeps_destination_without_using_admission_id_as_reply[dm-20197]
+========================= 2 failed, 5 passed in 0.81s ==========================
+
+=== 1 file with test failures (2 tests failed) ===
+  tests/gateway/test_telegram_automation_reply_anchor.py  (2 tests failed)
