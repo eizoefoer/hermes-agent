@@ -1,0 +1,146 @@
+▶ not activated — using HERMES_PYTHON: /usr/local/lib/hermes-agent/venv/bin/python3
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 1 test files (~1 tests) under ['tests/gateway/test_compatible_plugin_rollback.py']; running with -j 4
+[100.0% |     1/~1 | ✓0 | ✗1] ✗ tests/gateway/test_compatible_plugin_rollback.py (1✗, 3.0s)
+
+  ╔╍ Failed: tests/gateway/test_compatible_plugin_rollback.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║            ^^^^^^^^^^^^^^^^^^^^^^^^^
+  ║ /usr/local/lib/hermes-agent/.hermes-runtime/python/generation-1784948407-307756-4a371912/cpython-3.11.15-linux-aarch64-gnu/lib/python3.11/shutil.py:752: in rmtree
+  ║     _rmtree_safe_fd(fd, path, onerror)
+  ║ /usr/local/lib/hermes-agent/.hermes-runtime/python/generation-1784948407-307756-4a371912/cpython-3.11.15-linux-aarch64-gnu/lib/python3.11/shutil.py:672: in _rmtree_safe_fd
+  ║     _rmtree_safe_fd(dirfd, fullname, onerror)
+  ║ /usr/local/lib/hermes-agent/.hermes-runtime/python/generation-1784948407-307756-4a371912/cpython-3.11.15-linux-aarch64-gnu/lib/python3.11/shutil.py:672: in _rmtree_safe_fd
+  ║     _rmtree_safe_fd(dirfd, fullname, onerror)
+  ║ /usr/local/lib/hermes-agent/.hermes-runtime/python/generation-1784948407-307756-4a371912/cpython-3.11.15-linux-aarch64-gnu/lib/python3.11/shutil.py:701: in _rmtree_safe_fd
+  ║     os.unlink(entry.name, dir_fd=topfd)
+  ║ tests/home_io_guard.py:167: in guarded
+  ║     self.check(value, dir_fd=kwargs.get(descriptor) if descriptor else None, metadata=metadata,
+  ║ tests/home_io_guard.py:118: in check
+  ║     self.refuse(value)
+  ║ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+  ║ 
+  ║ value = 'always-on-harness'
+  ║ 
+  ║     @staticmethod
+  ║     def refuse(value):
+  ║ >       raise AssertionError(
+  ║             f"TEST BUG: file I/O against the REAL hermes home: {value}\n"
+  ║             "Use the isolated HERMES_HOME or a temporary fixture instead."
+  ║         )
+  ║ E       AssertionError: TEST BUG: file I/O against the REAL hermes home: always-on-harness
+  ║ E       Use the isolated HERMES_HOME or a temporary fixture instead.
+  ║ 
+  ║ tests/home_io_guard.py:140: AssertionError
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/gateway/test_compatible_plugin_rollback.py::CompatibleRollbackTests::test_actual_reload_verb_compatible_rollback_and_adapter_count_limit
+  ║ ============================== 1 failed in 2.08s ===============================
+  ║
+  ║  Repro: python -m pytest tests/gateway/test_compatible_plugin_rollback.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+
+=== Summary: 1 files, 0 tests passed, 1 failed (100% complete) in 3.0s (4 workers) ===
+
+=== Per-file subprocess time distribution ===
+  Files:   1
+  Total subprocess CPU-wall: 3.0s  (runner wall: 3.0s, parallelism: 4x)
+  P50: 2.97s  P90: 2.97s  P95: 2.97s  P99: 2.97s  Max: 2.97s
+  <1s: 0 files (0%)  <2s: 0 files (0%)
+  Top 10 slowest:
+      2.97s  tests/gateway/test_compatible_plugin_rollback.py
+
+=== Failure output ===
+
+--- tests/gateway/test_compatible_plugin_rollback.py ---
+============================= test session starts ==============================
+platform linux -- Python 3.11.15, pytest-9.1.1, pluggy-1.6.0
+rootdir: /home/ubuntu/worktrees/native-same-key-rewire-20261020
+configfile: pyproject.toml
+plugins: timeout-2.4.0, asyncio-1.4.0, anyio-4.12.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 1 item
+
+tests/gateway/test_compatible_plugin_rollback.py F                       [100%]
+
+=================================== FAILURES ===================================
+_ CompatibleRollbackTests.test_actual_reload_verb_compatible_rollback_and_adapter_count_limit _
+
+self = <tests.gateway.test_compatible_plugin_rollback.CompatibleRollbackTests testMethod=test_actual_reload_verb_compatible_rollback_and_adapter_count_limit>
+
+    def test_actual_reload_verb_compatible_rollback_and_adapter_count_limit(self):
+        rollback = Path('/home/ubuntu/.hermes/control-plane/releases/rc-511d634ae694/services/always-on-harness/gateway-plugin')
+        with tempfile.TemporaryDirectory(prefix='compatible-plugin-rollback-') as root:
+            home = Path(root) / '.hermes'
+            (home / 'plugins').mkdir(parents=True)
+            (home / 'config.yaml').write_text('plugins:\n  enabled: [always-on-harness]\nsecurity:\n  allow_lazy_installs: false\n')
+            env = dict(os.environ, HOME=root, HERMES_HOME=str(home),
+                       HERMES_ALWAYS_ON_SERVICE=str(CANDIDATE.parent.resolve()))
+            result = subprocess.run([sys.executable, '-c', PROBE, str(home), str(NATIVE),
+                str(PRIOR), str(CANDIDATE.resolve()), str(rollback), str(CANDIDATE.parent.resolve())],
+                cwd=root, env=env, text=True, capture_output=True, timeout=90)
+>           self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+E           AssertionError: 1 != 0 : Failed to load plugin 'always-on-harness': COMMAND_REGISTRY_LOAD_FAILED
+E           Traceback (most recent call last):
+E             File "<string>", line 41, in <module>
+E             File "/home/ubuntu/worktrees/native-same-key-rewire-20261020/tests/gateway/plugin_reload_admission.py", line 42, in admit_reload_result
+E               _fail("target activation must be present exactly once", result)
+E             File "/home/ubuntu/worktrees/native-same-key-rewire-20261020/tests/gateway/plugin_reload_admission.py", line 19, in _fail
+E               raise ReloadAdmissionError(message, context)
+E           plugin_reload_admission.ReloadAdmissionError: target activation must be present exactly once
+
+tests/gateway/test_compatible_plugin_rollback.py:96: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+self = <tests.gateway.test_compatible_plugin_rollback.CompatibleRollbackTests testMethod=test_actual_reload_verb_compatible_rollback_and_adapter_count_limit>
+
+    def test_actual_reload_verb_compatible_rollback_and_adapter_count_limit(self):
+        rollback = Path('/home/ubuntu/.hermes/control-plane/releases/rc-511d634ae694/services/always-on-harness/gateway-plugin')
+>       with tempfile.TemporaryDirectory(prefix='compatible-plugin-rollback-') as root:
+
+tests/gateway/test_compatible_plugin_rollback.py:87: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/local/lib/hermes-agent/.hermes-runtime/python/generation-1784948407-307756-4a371912/cpython-3.11.15-linux-aarch64-gnu/lib/python3.11/tempfile.py:943: in __exit__
+    self.cleanup()
+/usr/local/lib/hermes-agent/.hermes-runtime/python/generation-1784948407-307756-4a371912/cpython-3.11.15-linux-aarch64-gnu/lib/python3.11/tempfile.py:947: in cleanup
+    self._rmtree(self.name, ignore_errors=self._ignore_cleanup_errors)
+/usr/local/lib/hermes-agent/.hermes-runtime/python/generation-1784948407-307756-4a371912/cpython-3.11.15-linux-aarch64-gnu/lib/python3.11/tempfile.py:929: in _rmtree
+    _shutil.rmtree(name, onerror=onerror)
+tests/home_io_guard.py:169: in guarded
+    return original(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/hermes-agent/.hermes-runtime/python/generation-1784948407-307756-4a371912/cpython-3.11.15-linux-aarch64-gnu/lib/python3.11/shutil.py:752: in rmtree
+    _rmtree_safe_fd(fd, path, onerror)
+/usr/local/lib/hermes-agent/.hermes-runtime/python/generation-1784948407-307756-4a371912/cpython-3.11.15-linux-aarch64-gnu/lib/python3.11/shutil.py:672: in _rmtree_safe_fd
+    _rmtree_safe_fd(dirfd, fullname, onerror)
+/usr/local/lib/hermes-agent/.hermes-runtime/python/generation-1784948407-307756-4a371912/cpython-3.11.15-linux-aarch64-gnu/lib/python3.11/shutil.py:672: in _rmtree_safe_fd
+    _rmtree_safe_fd(dirfd, fullname, onerror)
+/usr/local/lib/hermes-agent/.hermes-runtime/python/generation-1784948407-307756-4a371912/cpython-3.11.15-linux-aarch64-gnu/lib/python3.11/shutil.py:701: in _rmtree_safe_fd
+    os.unlink(entry.name, dir_fd=topfd)
+tests/home_io_guard.py:167: in guarded
+    self.check(value, dir_fd=kwargs.get(descriptor) if descriptor else None, metadata=metadata,
+tests/home_io_guard.py:118: in check
+    self.refuse(value)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+value = 'always-on-harness'
+
+    @staticmethod
+    def refuse(value):
+>       raise AssertionError(
+            f"TEST BUG: file I/O against the REAL hermes home: {value}\n"
+            "Use the isolated HERMES_HOME or a temporary fixture instead."
+        )
+E       AssertionError: TEST BUG: file I/O against the REAL hermes home: always-on-harness
+E       Use the isolated HERMES_HOME or a temporary fixture instead.
+
+tests/home_io_guard.py:140: AssertionError
+=========================== short test summary info ============================
+FAILED tests/gateway/test_compatible_plugin_rollback.py::CompatibleRollbackTests::test_actual_reload_verb_compatible_rollback_and_adapter_count_limit
+============================== 1 failed in 2.08s ===============================
+
+=== 1 file with test failures (1 test failed) ===
+  tests/gateway/test_compatible_plugin_rollback.py  (1 test failed)

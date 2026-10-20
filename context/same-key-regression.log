@@ -1,0 +1,26 @@
+▶ not activated — using HERMES_PYTHON: /usr/local/lib/hermes-agent/venv/bin/python3
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 5 test files (~24 tests) under ['tests/gateway/test_reload_plugin_rewire_receipt.py', 'tests/gateway/test_late_plugin_rewire.py', 'tests/gateway/test_platform_plugin_handlers.py', 'tests/plugins/test_multiplex_plugin_cache_scope.py', 'tests/tui_gateway/test_plugins_manage_late_activation.py']; running with -j 4
+[ 20.8% |     5/~24 | ✓5 | ✗0] ✓ tests/plugins/test_multiplex_plugin_cache_scope.py (5✓, 1.6s)
+[ 70.8% |    17/~24 | ✓17 | ✗ 0] ✓ tests/gateway/test_platform_plugin_handlers.py (12✓, 2.3s)
+[ 91.7% |    22/~24 | ✓22 | ✗ 0] ✓ tests/gateway/test_late_plugin_rewire.py (5✓, 3.4s)
+[ 95.8% |    23/~24 | ✓24 | ✗ 0] ✓ tests/gateway/test_reload_plugin_rewire_receipt.py (2✓, 3.6s)
+[100.0% |    24/~24 | ✓25 | ✗ 0] ✓ tests/tui_gateway/test_plugins_manage_late_activation.py (1✓, 3.2s)
+
+=== Summary: 5 files, 25 tests passed, 0 failed (100% complete) in 4.8s (4 workers) ===
+  Durations cached to test_durations.json (5 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   5
+  Total subprocess CPU-wall: 14.0s  (runner wall: 4.8s, parallelism: 4x)
+  P50: 3.19s  P90: 3.56s  P95: 3.56s  P99: 3.56s  Max: 3.56s
+  <1s: 0 files (0%)  <2s: 1 files (20%)
+  Top 10 slowest:
+      3.56s  tests/gateway/test_reload_plugin_rewire_receipt.py
+      3.35s  tests/gateway/test_late_plugin_rewire.py
+      3.19s  tests/tui_gateway/test_plugins_manage_late_activation.py
+      2.29s  tests/gateway/test_platform_plugin_handlers.py
+      1.56s  tests/plugins/test_multiplex_plugin_cache_scope.py

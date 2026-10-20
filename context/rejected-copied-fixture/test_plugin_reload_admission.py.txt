@@ -1,0 +1,86 @@
+import unittest
+
+from plugin_reload_admission import ReloadAdmissionError, admit_reload_result
+
+
+class ReloadAdmissionTests(unittest.TestCase):
+    def _native_success(self):
+        # Shape returned by gateway/run_plugin_rewire.py:reload_plugins_verb.
+        return {
+            "reloaded": True,
+            "home": "/profile",
+            "plugins": ["always-on-harness"],
+            "activations": [{
+                "name": "Always On Harness",
+                "key": "always-on-harness",
+                "activated_now": {
+                    "gateway_commands": ["aohdiagnostic", "policy", "repos", "risk"],
+                    "gateway_transforms": ["pre_gateway_dispatch"],
+                    "hooks": ["api_request_error", "post_api_request"],
+                },
+                "deferred": {},
+            }],
+            "adapters_rewired": 2,
+        }
+
+    def test_admits_matching_completed_native_reload(self):
+        result = self._native_success()
+        self.assertIs(admit_reload_result(result), result)
+
+    def test_rejects_outer_success_with_plugin_error_preserving_context(self):
+        result = self._native_success()
+        result["activations"] = [{"key": "always-on-harness", "activated_now": {},
+                                   "error": {"type": "RuntimeError", "message": "broken", "trace": "full"}}]
+        with self.assertRaises(ReloadAdmissionError) as caught:
+            admit_reload_result(result)
+        self.assertEqual(caught.exception.context["activations"], result["activations"])
+
+    def test_rejects_deferred_or_missing_activation(self):
+        for activations in ([], [{"key": "always-on-harness", "activated_now": {},
+                                  "deferred": {"tools": ["deferred_tool"]}}]):
+            result = self._native_success()
+            result["activations"] = activations
+            with self.subTest(activations=activations), self.assertRaises(ReloadAdmissionError):
+                admit_reload_result(result)
+
+    def test_rejects_missing_duplicate_and_malformed_targets(self):
+        cases = []
+        result = self._native_success(); result["plugins"] = []; cases.append(result)
+        result = self._native_success(); result["plugins"] = ["always-on-harness", "always-on-harness"]; cases.append(result)
+        result = self._native_success(); result["activations"] *= 2; cases.append(result)
+        result = self._native_success(); result["plugins"] = "always-on-harness"; cases.append(result)
+        for result in cases:
+            with self.subTest(result=result), self.assertRaises(ReloadAdmissionError):
+                admit_reload_result(result)
+
+    def test_requires_commands_transforms_hooks_and_positive_nonbool_adapters(self):
+        good = self._native_success()
+        for bad in ({"commands": []}, {"transforms": []}, {"hooks": []}, {"commands": ["x"], "transforms": ["x"]}):
+            result = self._native_success()
+            result["activations"] = [{"key": "always-on-harness", "activated_now": {"gateway_commands": ["/aohdiagnostic"]}, **bad}]
+            with self.subTest(bad=bad), self.assertRaises(ReloadAdmissionError):
+                admit_reload_result(result)
+        for count in (0, -1, True, 1.0, None):
+            result = self._native_success(); result["adapters_rewired"] = count
+            with self.subTest(count=count), self.assertRaises(ReloadAdmissionError):
+                admit_reload_result(result)
+
+    def test_rejects_wrong_nonempty_capabilities_and_missing_deferred(self):
+        for kind in ('gateway_commands', 'gateway_transforms', 'hooks'):
+            result = self._native_success()
+            result['activations'][0]['activated_now'][kind] = ['unrelated']
+            with self.subTest(kind=kind), self.assertRaises(ReloadAdmissionError):
+                admit_reload_result(result)
+        result = self._native_success()
+        del result['activations'][0]['deferred']
+        with self.assertRaises(ReloadAdmissionError):
+            admit_reload_result(result)
+
+    def test_rejects_non_success_outer_result(self):
+        result = self._native_success(); result["reloaded"] = False
+        with self.assertRaises(ReloadAdmissionError):
+            admit_reload_result(result)
+
+
+if __name__ == "__main__":
+    unittest.main()

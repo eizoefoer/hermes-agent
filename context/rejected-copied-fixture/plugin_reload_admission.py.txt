@@ -1,0 +1,69 @@
+"""Strict admission for the frozen Gateway reload-plugins response."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any
+
+
+class ReloadAdmissionError(ValueError):
+    """Malformed/unsuccessful response; context is retained in memory, not logged."""
+
+    def __init__(self, message: str, context: Mapping[str, Any]):
+        super().__init__(message)
+        self.context = dict(context)
+
+
+def _fail(message: str, result: Any) -> None:
+    context = dict(result) if isinstance(result, Mapping) else {"result": result}
+    raise ReloadAdmissionError(message, context)
+
+
+def admit_reload_result(result: Any, plugin_key: str = "always-on-harness") -> Any:
+    """Validate necessary response evidence, NOT adapter or live acceptance proof.
+
+    Frozen native adapters_rewired counts configured adapters even when their
+    rewire callback fails. A positive count cannot attest handler bindings.
+    """
+    if not isinstance(result, Mapping):
+        _fail("reload result must be an object", result)
+    if result.get("reloaded") is not True:
+        _fail("native reload did not succeed", result)
+    plugins = result.get("plugins")
+    if not isinstance(plugins, list) or any(not isinstance(x, str) for x in plugins):
+        _fail("plugins must be a list of names", result)
+    if plugins.count(plugin_key) != 1:
+        _fail("target plugin must be present exactly once", result)
+    activations = result.get("activations")
+    if not isinstance(activations, list):
+        _fail("activations must be a list", result)
+    matches = [a for a in activations if isinstance(a, Mapping) and a.get("key") == plugin_key]
+    if len(matches) != 1:
+        _fail("target activation must be present exactly once", result)
+    activation = matches[0]
+    # Frozen native summaries use key + activated_now/deferred. The summary intentionally
+    # omits an active boolean; a loaded summary can nevertheless describe deferred-only plugins.
+    if activation.get("key") != plugin_key or activation.get("error"):
+        _fail("target plugin activation failed or malformed", result)
+    if not isinstance(activation.get("deferred"), Mapping):
+        _fail("activation deferred field is absent or malformed", result)
+    activated_now = activation.get("activated_now")
+    if not isinstance(activated_now, Mapping):
+        _fail("activation activated_now is absent or malformed", result)
+    required = {
+        "gateway_commands": {"policy", "repos", "risk"},
+        "gateway_transforms": {"pre_gateway_dispatch"},
+        "hooks": {"api_request_error", "post_api_request"},
+    }
+    for key, names in required.items():
+        value = activated_now.get(key)
+        if (not isinstance(value, list) or
+                any(not isinstance(item, str) for item in value) or
+                not names.issubset(value)):
+            _fail(f"activation activated_now.{key} lacks required capabilities", result)
+    if activation.get("deferred"):
+        _fail("target activation contains deferred capabilities", result)
+    rewired = result.get("adapters_rewired")
+    if isinstance(rewired, bool) or not isinstance(rewired, int) or rewired <= 0:
+        _fail("adapters_rewired must be a positive integer", result)
+    return result

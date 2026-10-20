@@ -1,0 +1,257 @@
+▶ not activated — using HERMES_PYTHON: /usr/local/lib/hermes-agent/venv/bin/python3
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 1 test files (~1 tests) under ['tests/gateway/test_reload_plugin_rewire_receipt.py']; running with -j 4
+[100.0% |     1/~1 | ✓0 | ✗2] ✗ tests/gateway/test_reload_plugin_rewire_receipt.py (2✗, 3.6s)
+
+  ╔╍ Failed: tests/gateway/test_reload_plugin_rewire_receipt.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║     return future.result()
+  ║            ^^^^^^^^^^^^^^^
+  ║ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+  ║ 
+  ║     async def scenario():
+  ║         from gateway.run import _profile_runtime_scope
+  ║         runner = Runner()
+  ║         selected, other = Adapter(), Adapter()
+  ║         runner.adapters = {'primary': other if secondary else selected}
+  ║         runner._profile_adapters = {'secondary': {'adapter': selected}}
+  ║         runner._served_profile_homes = {'secondary': target}
+  ║         scope = _profile_runtime_scope(target, hydrate_secrets=False)
+  ║         with scope:
+  ║             discover_plugins(force=True)  # already loaded before control request
+  ║             runner._subscribe_plugin_rewire(get_plugin_manager(),
+  ║                 'secondary' if secondary else None, target if secondary else None)
+  ║         verb = reload_plugins_verb(runner, asyncio.get_running_loop())
+  ║         for _ in range(2):
+  ║             result = await asyncio.to_thread(verb, {'home': str(target)})
+  ║             assert result['reloaded'] is True
+  ║             assert result['adapters_rewired'] == 1
+  ║ >           assert selected.seen and selected.seen[-1] is not None
+  ║ E           assert ([])
+  ║ E            +  where [] = <tests.gateway.test_reload_plugin_rewire_receipt.test_same_key_reload_executes_rewire_and_reports_success.<locals>.Adapter object at 0xf1fd9e0482d0>.seen
+  ║ 
+  ║ tests/gateway/test_reload_plugin_rewire_receipt.py:50: AssertionError
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/gateway/test_reload_plugin_rewire_receipt.py::test_same_key_reload_executes_rewire_and_reports_success[False]
+  ║ FAILED tests/gateway/test_reload_plugin_rewire_receipt.py::test_same_key_reload_executes_rewire_and_reports_success[True]
+  ║ ============================== 2 failed in 2.23s ===============================
+  ║
+  ║  Repro: python -m pytest tests/gateway/test_reload_plugin_rewire_receipt.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+
+=== Summary: 1 files, 0 tests passed, 2 failed (100% complete) in 3.6s (4 workers) ===
+
+=== Per-file subprocess time distribution ===
+  Files:   1
+  Total subprocess CPU-wall: 3.6s  (runner wall: 3.6s, parallelism: 4x)
+  P50: 3.57s  P90: 3.57s  P95: 3.57s  P99: 3.57s  Max: 3.57s
+  <1s: 0 files (0%)  <2s: 0 files (0%)
+  Top 10 slowest:
+      3.57s  tests/gateway/test_reload_plugin_rewire_receipt.py
+
+=== Failure output ===
+
+--- tests/gateway/test_reload_plugin_rewire_receipt.py ---
+============================= test session starts ==============================
+platform linux -- Python 3.11.15, pytest-9.1.1, pluggy-1.6.0
+rootdir: /home/ubuntu/worktrees/native-same-key-rewire-20261020
+configfile: pyproject.toml
+plugins: timeout-2.4.0, asyncio-1.4.0, anyio-4.12.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 2 items
+
+tests/gateway/test_reload_plugin_rewire_receipt.py FF                    [100%]
+
+=================================== FAILURES ===================================
+_______ test_same_key_reload_executes_rewire_and_reports_success[False] ________
+
+secondary = False
+tmp_path = PosixPath('/var/tmp/hermes-pytest-1001/r-yfqfr8k0/pytest-of-ubuntu/pytest-0/test_same_key_reload_executes_0')
+
+    @pytest.mark.parametrize('secondary', [False, True])
+    def test_same_key_reload_executes_rewire_and_reports_success(secondary, tmp_path):
+        home = Path(os.environ['HERMES_HOME'])
+        target = tmp_path / 'secondary' if secondary else home
+        plugin = target / 'plugins' / 'receipt_probe'
+        plugin.mkdir(parents=True)
+        (plugin / 'plugin.yaml').write_text("name: receipt_probe\nversion: '0.1'\ndescription: test\n")
+        (plugin / '__init__.py').write_text(
+            'def register(ctx):\n    ctx.register_command("receiptprobe", lambda raw: "ok", description="test")\n')
+        (target / 'config.yaml').write_text('plugins:\n  enabled: [receipt_probe]\n')
+    
+        class Adapter:
+            fail = False
+            def __init__(self): self.seen = []
+            def rewire_plugin_handlers(self):
+                if self.fail:
+                    raise RuntimeError('test callback failure')
+                self.seen.append(get_plugin_command_handler('receiptprobe'))
+    
+        class Runner(GatewayPluginRewireMixin): pass
+    
+        async def scenario():
+            from gateway.run import _profile_runtime_scope
+            runner = Runner()
+            selected, other = Adapter(), Adapter()
+            runner.adapters = {'primary': other if secondary else selected}
+            runner._profile_adapters = {'secondary': {'adapter': selected}}
+            runner._served_profile_homes = {'secondary': target}
+            scope = _profile_runtime_scope(target, hydrate_secrets=False)
+            with scope:
+                discover_plugins(force=True)  # already loaded before control request
+                runner._subscribe_plugin_rewire(get_plugin_manager(),
+                    'secondary' if secondary else None, target if secondary else None)
+            verb = reload_plugins_verb(runner, asyncio.get_running_loop())
+            for _ in range(2):
+                result = await asyncio.to_thread(verb, {'home': str(target)})
+                assert result['reloaded'] is True
+                assert result['adapters_rewired'] == 1
+                assert selected.seen and selected.seen[-1] is not None
+            assert selected.seen[0] is not selected.seen[-1]  # fresh registration actually reached adapter
+            assert not other.seen
+            selected.fail = True
+            result = await asyncio.to_thread(verb, {'home': str(target)})
+            assert result['adapters_rewired'] == 0
+            before = len(selected.seen)
+            refused = await asyncio.to_thread(verb, {'home': str(tmp_path / 'unserved')})
+            assert refused['reloaded'] is False
+            assert len(selected.seen) == before
+    
+>       asyncio.run(scenario())
+
+tests/gateway/test_reload_plugin_rewire_receipt.py:61: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/local/lib/hermes-agent/.hermes-runtime/python/generation-1784948407-307756-4a371912/cpython-3.11.15-linux-aarch64-gnu/lib/python3.11/asyncio/runners.py:190: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/local/lib/hermes-agent/.hermes-runtime/python/generation-1784948407-307756-4a371912/cpython-3.11.15-linux-aarch64-gnu/lib/python3.11/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/hermes-agent/.hermes-runtime/python/generation-1784948407-307756-4a371912/cpython-3.11.15-linux-aarch64-gnu/lib/python3.11/asyncio/base_events.py:654: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    async def scenario():
+        from gateway.run import _profile_runtime_scope
+        runner = Runner()
+        selected, other = Adapter(), Adapter()
+        runner.adapters = {'primary': other if secondary else selected}
+        runner._profile_adapters = {'secondary': {'adapter': selected}}
+        runner._served_profile_homes = {'secondary': target}
+        scope = _profile_runtime_scope(target, hydrate_secrets=False)
+        with scope:
+            discover_plugins(force=True)  # already loaded before control request
+            runner._subscribe_plugin_rewire(get_plugin_manager(),
+                'secondary' if secondary else None, target if secondary else None)
+        verb = reload_plugins_verb(runner, asyncio.get_running_loop())
+        for _ in range(2):
+            result = await asyncio.to_thread(verb, {'home': str(target)})
+            assert result['reloaded'] is True
+            assert result['adapters_rewired'] == 1
+>           assert selected.seen and selected.seen[-1] is not None
+E           assert ([])
+E            +  where [] = <tests.gateway.test_reload_plugin_rewire_receipt.test_same_key_reload_executes_rewire_and_reports_success.<locals>.Adapter object at 0xf1fd9f191310>.seen
+
+tests/gateway/test_reload_plugin_rewire_receipt.py:50: AssertionError
+________ test_same_key_reload_executes_rewire_and_reports_success[True] ________
+
+secondary = True
+tmp_path = PosixPath('/var/tmp/hermes-pytest-1001/r-yfqfr8k0/pytest-of-ubuntu/pytest-0/test_same_key_reload_executes_1')
+
+    @pytest.mark.parametrize('secondary', [False, True])
+    def test_same_key_reload_executes_rewire_and_reports_success(secondary, tmp_path):
+        home = Path(os.environ['HERMES_HOME'])
+        target = tmp_path / 'secondary' if secondary else home
+        plugin = target / 'plugins' / 'receipt_probe'
+        plugin.mkdir(parents=True)
+        (plugin / 'plugin.yaml').write_text("name: receipt_probe\nversion: '0.1'\ndescription: test\n")
+        (plugin / '__init__.py').write_text(
+            'def register(ctx):\n    ctx.register_command("receiptprobe", lambda raw: "ok", description="test")\n')
+        (target / 'config.yaml').write_text('plugins:\n  enabled: [receipt_probe]\n')
+    
+        class Adapter:
+            fail = False
+            def __init__(self): self.seen = []
+            def rewire_plugin_handlers(self):
+                if self.fail:
+                    raise RuntimeError('test callback failure')
+                self.seen.append(get_plugin_command_handler('receiptprobe'))
+    
+        class Runner(GatewayPluginRewireMixin): pass
+    
+        async def scenario():
+            from gateway.run import _profile_runtime_scope
+            runner = Runner()
+            selected, other = Adapter(), Adapter()
+            runner.adapters = {'primary': other if secondary else selected}
+            runner._profile_adapters = {'secondary': {'adapter': selected}}
+            runner._served_profile_homes = {'secondary': target}
+            scope = _profile_runtime_scope(target, hydrate_secrets=False)
+            with scope:
+                discover_plugins(force=True)  # already loaded before control request
+                runner._subscribe_plugin_rewire(get_plugin_manager(),
+                    'secondary' if secondary else None, target if secondary else None)
+            verb = reload_plugins_verb(runner, asyncio.get_running_loop())
+            for _ in range(2):
+                result = await asyncio.to_thread(verb, {'home': str(target)})
+                assert result['reloaded'] is True
+                assert result['adapters_rewired'] == 1
+                assert selected.seen and selected.seen[-1] is not None
+            assert selected.seen[0] is not selected.seen[-1]  # fresh registration actually reached adapter
+            assert not other.seen
+            selected.fail = True
+            result = await asyncio.to_thread(verb, {'home': str(target)})
+            assert result['adapters_rewired'] == 0
+            before = len(selected.seen)
+            refused = await asyncio.to_thread(verb, {'home': str(tmp_path / 'unserved')})
+            assert refused['reloaded'] is False
+            assert len(selected.seen) == before
+    
+>       asyncio.run(scenario())
+
+tests/gateway/test_reload_plugin_rewire_receipt.py:61: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/local/lib/hermes-agent/.hermes-runtime/python/generation-1784948407-307756-4a371912/cpython-3.11.15-linux-aarch64-gnu/lib/python3.11/asyncio/runners.py:190: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/local/lib/hermes-agent/.hermes-runtime/python/generation-1784948407-307756-4a371912/cpython-3.11.15-linux-aarch64-gnu/lib/python3.11/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/hermes-agent/.hermes-runtime/python/generation-1784948407-307756-4a371912/cpython-3.11.15-linux-aarch64-gnu/lib/python3.11/asyncio/base_events.py:654: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    async def scenario():
+        from gateway.run import _profile_runtime_scope
+        runner = Runner()
+        selected, other = Adapter(), Adapter()
+        runner.adapters = {'primary': other if secondary else selected}
+        runner._profile_adapters = {'secondary': {'adapter': selected}}
+        runner._served_profile_homes = {'secondary': target}
+        scope = _profile_runtime_scope(target, hydrate_secrets=False)
+        with scope:
+            discover_plugins(force=True)  # already loaded before control request
+            runner._subscribe_plugin_rewire(get_plugin_manager(),
+                'secondary' if secondary else None, target if secondary else None)
+        verb = reload_plugins_verb(runner, asyncio.get_running_loop())
+        for _ in range(2):
+            result = await asyncio.to_thread(verb, {'home': str(target)})
+            assert result['reloaded'] is True
+            assert result['adapters_rewired'] == 1
+>           assert selected.seen and selected.seen[-1] is not None
+E           assert ([])
+E            +  where [] = <tests.gateway.test_reload_plugin_rewire_receipt.test_same_key_reload_executes_rewire_and_reports_success.<locals>.Adapter object at 0xf1fd9e0482d0>.seen
+
+tests/gateway/test_reload_plugin_rewire_receipt.py:50: AssertionError
+=========================== short test summary info ============================
+FAILED tests/gateway/test_reload_plugin_rewire_receipt.py::test_same_key_reload_executes_rewire_and_reports_success[False]
+FAILED tests/gateway/test_reload_plugin_rewire_receipt.py::test_same_key_reload_executes_rewire_and_reports_success[True]
+============================== 2 failed in 2.23s ===============================
+
+=== 1 file with test failures (2 tests failed) ===
+  tests/gateway/test_reload_plugin_rewire_receipt.py  (2 tests failed)

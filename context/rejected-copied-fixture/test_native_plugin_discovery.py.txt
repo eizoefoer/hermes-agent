@@ -1,0 +1,159 @@
+"""Exact frozen native loader qualification, NOT running-gateway evidence.
+
+Run in a fresh subprocess/home: the real plugin mutates process registries and
+writes compatibility snapshots. No provider calls or production socket use.
+"""
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+
+NATIVE = Path('/home/ubuntu/.hermes/control-plane/releases/rc-123fc8c6dc23')
+PRIOR = Path('/home/ubuntu/.hermes/control-plane/releases/rc-4faf458c56da/services/always-on-harness/gateway-plugin')
+CANDIDATE = Path(__file__).parent / 'gateway-plugin'
+
+PROBE = r'''
+import inspect, json, os, sys
+from pathlib import Path
+home, prior, candidate, native = map(Path, sys.argv[1:])
+assert Path.home() == home.parent
+assert Path(os.environ['HERMES_HOME']) == home
+sys.path.insert(0, str(native))
+from hermes_cli.plugins import discover_plugins, get_plugin_manager
+from hermes_cli.plugins_activation import activation_summaries
+from agent import chat_completion_helpers as helpers
+from gateway import signed_telegram_approval as approval
+native_fallback = helpers.try_activate_fallback
+link = home / 'plugins' / 'always-on-harness'
+receipts = []
+for phase, target in [('prior', prior), ('candidate', candidate),
+                      ('candidate_repeat', candidate), ('rollback_prior', prior),
+                      ('recover_candidate', candidate)]:
+    link.unlink(missing_ok=True)
+    link.symlink_to(target)
+    discover_plugins(force=True)
+    manager = get_plugin_manager()
+    plugin = manager._plugins.get('always-on-harness')
+    assert plugin is not None, activation_summaries(manager)
+    guard = helpers.try_activate_fallback
+    record = approval._RESUME_REGISTRY.get('always_on_dynamic_permission')
+    receipts.append({'phase': phase, 'target': str(link.resolve()),
+        'error': str(plugin.error or ''), 'deferred': bool(plugin.deferred),
+        'signature': str(inspect.signature(guard)),
+        'guard_identity': id(guard),
+        'resume_identity': id(record) if record else None,
+        'resume_transition': record.transition if record else None,
+        'activations': [x for x in activation_summaries(manager)
+                        if x['key'] == 'always-on-harness']})
+print('NATIVE_DISCOVERY_RECEIPT=' + json.dumps(receipts))
+'''
+
+
+class NativeDiscoveryQualificationTests(unittest.TestCase):
+    def test_real_loader_actual_legacy_migration_preserves_native_fallback(self):
+        legacy = Path('/home/ubuntu/.hermes/control-plane/releases/rc-c5cccd9ecdc5/services/always-on-harness/gateway-plugin')
+        # Exercise actual native discovery, real old plugin and real native
+        # fallback in ONE subprocess. Empty chains cannot resolve a provider.
+        probe = PROBE.replace(
+            "print('NATIVE_DISCOVERY_RECEIPT=' + json.dumps(receipts))",
+            """
+    from types import SimpleNamespace
+    agent = SimpleNamespace(_fallback_chain=[], _fallback_index=0,
+                            _unavailable_fallback_keys=set())
+    try:
+        value = guard(agent, reason=None, reset_at=123)
+        receipts[-1]['fallback'] = {'returned': value}
+    except TypeError as exc:
+        receipts[-1]['fallback'] = {'error': str(exc)}
+print('NATIVE_DISCOVERY_RECEIPT=' + json.dumps(receipts))
+""")
+        with tempfile.TemporaryDirectory(prefix='native-plugin-legacy-') as root:
+            home = Path(root) / '.hermes'
+            (home / 'plugins').mkdir(parents=True)
+            (home / 'config.yaml').write_text(
+                'plugins:\n  enabled: [always-on-harness]\n'
+                'security:\n  allow_lazy_installs: false\n')
+            env = dict(os.environ, HOME=root, HERMES_HOME=str(home),
+                       HERMES_ALWAYS_ON_SERVICE=str(CANDIDATE.parent.resolve()))
+            result = subprocess.run(
+                [sys.executable, '-c', probe, str(home), str(legacy),
+                 str(CANDIDATE.resolve()), str(NATIVE)],
+                env=env, cwd=root, text=True, capture_output=True, timeout=75)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            lines = [x for x in result.stdout.splitlines()
+                     if x.startswith('NATIVE_DISCOVERY_RECEIPT=')]
+            self.assertEqual(len(lines), 1, result.stdout + result.stderr)
+            receipts = json.loads(lines[0].split('=', 1)[1])
+            print(lines[0])
+        old, new, repeat, rollback, recovered = receipts
+        self.assertIn('reset_at', old['fallback']['error'])
+        for receipt in (new, repeat, recovered):
+            self.assertEqual(receipt['error'], '', receipt)
+            self.assertEqual(receipt['fallback'], {'returned': False})
+            self.assertEqual(receipt['resume_identity'], old['resume_identity'])
+            self.assertEqual(len(receipt['activations']), 1)
+        self.assertEqual(new['guard_identity'], repeat['guard_identity'])
+        self.assertEqual(new['guard_identity'], recovered['guard_identity'])
+        self.assertIn('already registered', rollback['error'])
+        self.assertEqual(rollback['activations'], [])
+        self.assertEqual(rollback['guard_identity'], new['guard_identity'])
+
+    def test_real_loader_candidate_repeat_and_rejected_prior_rollback(self):
+        self.assertTrue((NATIVE / 'hermes_cli/plugins.py').is_file())
+        self.assertTrue((PRIOR / '__init__.py').is_file())
+        # Keep both HOME and HERMES_HOME isolated: always_on uses Path.home(),
+        # while native plugins use get_hermes_home(). Neither may reach live DBs.
+        with tempfile.TemporaryDirectory(prefix='native-plugin-loader-') as root:
+            home = Path(root) / '.hermes'
+            (home / 'plugins').mkdir(parents=True)
+            (home / 'config.yaml').write_text(
+                'plugins:\n  enabled: [always-on-harness]\n'
+                'security:\n  allow_lazy_installs: false\n')
+            env = dict(os.environ, HOME=root, HERMES_HOME=str(home),
+                       HERMES_ALWAYS_ON_SERVICE=str(CANDIDATE.parent.resolve()))
+            result = subprocess.run(
+                [sys.executable, '-c', PROBE, str(home), str(PRIOR),
+                 str(CANDIDATE.resolve()), str(NATIVE)],
+                env=env, cwd=root, text=True, capture_output=True, timeout=75)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            lines = [x for x in result.stdout.splitlines()
+                     if x.startswith('NATIVE_DISCOVERY_RECEIPT=')]
+            self.assertEqual(len(lines), 1, result.stdout + result.stderr)
+            receipts = json.loads(lines[0].split('=', 1)[1])
+            print(lines[0])
+        old, new, repeat, rollback, recovered = receipts
+        for receipt in (old, new, repeat, recovered):
+            self.assertEqual(receipt['error'], '', receipt)
+            self.assertFalse(receipt['deferred'], receipt)
+        # Prior rc-4faf already has reset_at; it lacks reload-safe registration.
+        self.assertIn('reset_at', old['signature'])
+        self.assertIn('reset_at', new['signature'])
+        self.assertEqual(new['guard_identity'], repeat['guard_identity'])
+        self.assertEqual(old['resume_identity'], new['resume_identity'])
+        self.assertEqual(new['resume_identity'], repeat['resume_identity'])
+        self.assertEqual(new['resume_transition'],
+                         'approved_pending_resume -> always_on_owned_or_blocked')
+        # This is a negative eligibility test, not acceptance of rollback. The
+        # native loader returns normally while registration of the old plugin
+        # fails and the new guard stays resident. A pointer restore is NOT rollback.
+        self.assertIn('already registered', rollback['error'])
+        self.assertEqual(rollback['guard_identity'], new['guard_identity'])
+        self.assertEqual(rollback['resume_identity'], new['resume_identity'])
+        self.assertEqual(rollback['activations'], [])
+        self.assertEqual(recovered['guard_identity'], new['guard_identity'])
+        self.assertEqual(recovered['resume_identity'], new['resume_identity'])
+        for receipt in (new, repeat, recovered):
+            self.assertEqual(len(receipt['activations']), 1)
+            active = receipt['activations'][0]['activated_now']
+            self.assertEqual(active['gateway_commands'], ['aohdiagnostic', 'policy', 'repos', 'risk'])
+            self.assertEqual(active['gateway_transforms'], ['pre_gateway_dispatch'])
+            self.assertEqual(active['hooks'], ['api_request_error', 'post_api_request'])
+
+
+if __name__ == '__main__':
+    unittest.main()

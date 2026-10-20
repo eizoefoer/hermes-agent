@@ -1,0 +1,20 @@
+▶ not activated — using HERMES_PYTHON: /usr/local/lib/hermes-agent/venv/bin/python3
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 2 test files (~6 tests) under ['tests/gateway/test_reload_plugin_rewire_receipt.py', 'tests/gateway/test_late_plugin_rewire.py']; running with -j 4
+[ 16.7% |     1/~6 | ✓2 | ✗0] ✓ tests/gateway/test_reload_plugin_rewire_receipt.py (2✓, 3.0s)
+[100.0% |     6/~6 | ✓7 | ✗0] ✓ tests/gateway/test_late_plugin_rewire.py (5✓, 3.2s)
+
+=== Summary: 2 files, 7 tests passed, 0 failed (100% complete) in 3.2s (4 workers) ===
+  Durations cached to test_durations.json (2 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   2
+  Total subprocess CPU-wall: 6.2s  (runner wall: 3.2s, parallelism: 4x)
+  P50: 3.16s  P90: 3.16s  P95: 3.16s  P99: 3.16s  Max: 3.16s
+  <1s: 0 files (0%)  <2s: 0 files (0%)
+  Top 10 slowest:
+      3.16s  tests/gateway/test_late_plugin_rewire.py
+      3.05s  tests/gateway/test_reload_plugin_rewire_receipt.py

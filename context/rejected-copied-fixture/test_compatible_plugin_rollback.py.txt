@@ -1,0 +1,115 @@
+"""Actual frozen reload verb with disposable adapters, never a live gateway."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+
+import sys
+from pathlib import Path as _Path
+sys.path.insert(0, str(_Path(__file__).parent))
+from test_native_plugin_discovery import NATIVE, PRIOR, CANDIDATE
+
+PROBE = r'''
+import asyncio, json, sys, threading
+from pathlib import Path
+from types import SimpleNamespace
+home, native, prior, candidate, rollback, service = map(Path, sys.argv[1:])
+sys.path.insert(0, str(native))
+sys.path.insert(0, str(service))
+from gateway.run_plugin_rewire import GatewayPluginRewireMixin, reload_plugins_verb
+from hermes_cli.plugins import get_plugin_manager, get_plugin_command_handler
+from gateway import signed_telegram_approval as approval
+from agent import chat_completion_helpers as helpers
+from plugin_reload_admission import admit_reload_result, ReloadAdmissionError
+class Adapter:
+    fail = False
+    def __init__(self): self.observations = []
+    def rewire_plugin_handlers(self):
+        if self.fail: raise RuntimeError('disposable adapter refuses rewiring')
+        self.observations.append(bool(get_plugin_command_handler('aohdiagnostic')))
+class Runner(GatewayPluginRewireMixin): pass
+adapter = Adapter()
+runner = Runner()
+runner.adapters = {'disposable': adapter}
+loop = asyncio.new_event_loop()
+thread = threading.Thread(target=loop.run_forever)
+thread.start()
+async def subscribe(): runner._subscribe_plugin_rewire(get_plugin_manager())
+asyncio.run_coroutine_threadsafe(subscribe(), loop).result(timeout=10)
+verb = reload_plugins_verb(runner, loop)
+link = home / 'plugins' / 'always-on-harness'
+receipts = []
+try:
+    for phase, target in [('prior', prior), ('candidate', candidate),
+                          ('repeat', candidate), ('compatible_rollback', rollback),
+                          ('recover', candidate)]:
+        link.unlink(missing_ok=True)
+        link.symlink_to(target)
+        result = verb({'home': str(home)})
+        if result.get('reloaded') and not result.get('activations'):
+            receipts.append({'phase': phase, 'result': result, 'diagnostic': bool(get_plugin_command_handler('aohdiagnostic')), 'adapter_diagnostic': adapter.observations[-1] if adapter.observations else False})
+            continue
+        admit_reload_result(result)
+        guard = helpers.try_activate_fallback
+        record = approval._RESUME_REGISTRY['always_on_dynamic_permission']
+        value = guard(SimpleNamespace(_fallback_chain=[], _fallback_index=0,
+                       _unavailable_fallback_keys=set()), reason=None, reset_at=123)
+        receipts.append({'phase': phase, 'result': result, 'guard': id(guard),
+                         'record': id(record), 'fallback': value,
+                         'diagnostic': bool(get_plugin_command_handler('aohdiagnostic')),
+                         'adapter_diagnostic': adapter.observations[-1]})
+    # Freeze native semantics: this count does NOT prove successful rewiring.
+    adapter.fail = True
+    before = list(adapter.observations)
+    async def failed_rewire(): return runner._rewire_plugin_handlers()
+    assert asyncio.run_coroutine_threadsafe(failed_rewire(), loop).result(timeout=10) == 0
+    misleading = verb({'home': str(home)})
+    assert misleading['adapters_rewired'] == 1, misleading
+    assert adapter.observations == before
+    admit_reload_result(misleading)  # Necessary response check, not binding proof.
+    print('COMPATIBLE_ROLLBACK=' + json.dumps({'phases': receipts,
+          'failed_adapter_count': misleading['adapters_rewired'],
+          'failed_adapter_proved_bound': False}))
+finally:
+    loop.call_soon_threadsafe(loop.stop)
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    loop.close()
+'''
+
+
+class CompatibleRollbackTests(unittest.TestCase):
+    def test_actual_reload_verb_compatible_rollback_and_adapter_count_limit(self):
+        rollback = Path('/home/ubuntu/.hermes/control-plane/releases/rc-511d634ae694/services/always-on-harness/gateway-plugin')
+        with tempfile.TemporaryDirectory(prefix='compatible-plugin-rollback-') as root:
+            home = Path(root) / '.hermes'
+            (home / 'plugins').mkdir(parents=True)
+            (home / 'config.yaml').write_text('plugins:\n  enabled: [always-on-harness]\nsecurity:\n  allow_lazy_installs: false\n')
+            env = dict(os.environ, HOME=root, HERMES_HOME=str(home),
+                       HERMES_ALWAYS_ON_SERVICE=str(CANDIDATE.parent.resolve()))
+            result = subprocess.run([sys.executable, '-c', PROBE, str(home), str(NATIVE),
+                str(PRIOR), str(CANDIDATE.resolve()), str(rollback), str(CANDIDATE.parent.resolve())],
+                cwd=root, env=env, text=True, capture_output=True, timeout=90)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            lines = [x for x in result.stdout.splitlines() if x.startswith('COMPATIBLE_ROLLBACK=')]
+            self.assertEqual(len(lines), 1, result.stdout + result.stderr)
+            print(lines[0])
+            receipt = json.loads(lines[0].split('=', 1)[1])
+        prior, candidate, repeat, rollback, recovered = receipt['phases']
+        self.assertEqual([r['diagnostic'] for r in receipt['phases']], [False, True, True, False, True])
+        # Frozen loader only notifies listeners for NEW plugin keys. Same-key
+        # force reload changes the registry but leaves the adapter observation stale.
+        # This is an asserted NEGATIVE canary, never rollback/live acceptance.
+        self.assertEqual([r['adapter_diagnostic'] for r in receipt['phases']], [False] * 5)
+        self.assertEqual([r['result']['adapters_rewired'] for r in receipt['phases']], [1] * 5)
+        self.assertEqual({r['record'] for r in receipt['phases']}, {prior['record']})
+        self.assertEqual({r['guard'] for r in (candidate, repeat, rollback, recovered)}, {candidate['guard']})
+        self.assertTrue(all(r['fallback'] is False for r in receipt['phases']))
+        self.assertFalse(receipt['failed_adapter_proved_bound'])
+
+
+if __name__ == '__main__':
+    unittest.main()

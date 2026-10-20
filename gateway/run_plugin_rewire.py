@@ -80,11 +80,12 @@ class GatewayPluginRewireMixin:
 
 def reload_plugins_verb(runner: Any, loop: asyncio.AbstractEventLoop) -> Callable[..., dict]:
     """Control-socket ``reload-plugins``: force re-discovery under the requested home's scope so a plugin
-    installed/enabled by another process (CLI, Desktop, ``plugins.manage``) loads now; the loaded event
-    then re-wires that profile's adapters. Only the gateway home and served profile homes are accepted.
+    installed/enabled by another process (CLI, Desktop, ``plugins.manage``) loads now; then explicitly
+    re-wire that profile's adapters, including same-key replacements with no loaded event.
+    Only the gateway home and served profile homes are accepted.
     Answer: ``{"reloaded", "home", "plugins", "activations", "adapters_rewired"}``. Runs on the socket executor thread
-    (discovery is blocking); the count is read on the loop AFTER the re-wire callback (FIFO), so a
-    truthful "active now" reaches the caller."""
+    (discovery is blocking); the explicit re-wire pass runs on the loop and returns the number of
+    successful adapter callbacks. Plugin activation and individual handler acceptance remain separate."""
 
     def _handler(params: Optional[dict] = None) -> dict:
         from hermes_constants import get_hermes_home, hermes_home_key
@@ -110,7 +111,9 @@ def reload_plugins_verb(runner: Any, loop: asyncio.AbstractEventLoop) -> Callabl
             manager = get_plugin_manager()
             names, activations = sorted(manager._plugins), activation_summaries(manager)
         try:
-            rewired = asyncio.run_coroutine_threadsafe(_count_adapters(runner, profile_name), loop).result(timeout=5.0)
+            rewired = asyncio.run_coroutine_threadsafe(
+                _rewire_adapters(runner, profile_name, requested if profile_name else None),
+                loop).result(timeout=5.0)
         except Exception:
             rewired = None
         return {"reloaded": True, "home": str(requested), "plugins": names, "activations": activations,
@@ -119,8 +122,7 @@ def reload_plugins_verb(runner: Any, loop: asyncio.AbstractEventLoop) -> Callabl
     return _handler
 
 
-async def _count_adapters(runner: Any, profile_name: Optional[str]) -> int:
-    """Live adapters for the profile; scheduled after the loaded-event callback, so they are re-wired."""
-    if profile_name is None:
-        return len(getattr(runner, "adapters", None) or {})
-    return len((getattr(runner, "_profile_adapters", None) or {}).get(profile_name) or {})
+async def _rewire_adapters(runner: Any, profile_name: Optional[str],
+                           profile_home: Optional[Path]) -> int:
+    """Explicit forced reload pass, including already-loaded keys; return callback successes."""
+    return runner._rewire_plugin_handlers(profile_name, profile_home)
