@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from gateway.memory_status import _parse_iso
+from gateway.drain_ownership import drain_marker_ownership, marker_mutation
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
 
@@ -62,7 +63,8 @@ def drain_request_path(home: Optional[Path] = None) -> Path:
 
 
 def write_drain_request(
-    *, principal: str = "drain-control", suppress_notification: bool = False, home: Optional[Path] = None
+    *, principal: str = "drain-control", suppress_notification: bool = False, home: Optional[Path] = None,
+    ownership=None,
 ) -> dict[str, Any]:
     """Write the begin-drain marker atomically; returns the payload.
 
@@ -76,13 +78,22 @@ def write_drain_request(
         "action": "drain", "requested_at": datetime.now(UTC).isoformat(), "principal": principal,
         "epoch": current_instantiation_epoch(), "suppress_notification": bool(suppress_notification),
     }
-    atomic_json_write(drain_request_path(home), payload)
+    path = drain_request_path(home)
+    with marker_mutation(home=path.parent, ownership=ownership):
+        atomic_json_write(path, payload)
     return payload
 
 
-def clear_drain_request(*, home: Optional[Path] = None) -> bool:
+def clear_drain_request(*, home: Optional[Path] = None, ownership=None) -> bool:
     """Remove the drain marker (cancel-drain, idempotent). Returns True if one existed."""
     path = drain_request_path(home)
+    if ownership is None and not path.parent.exists():
+        return False
+    with marker_mutation(home=path.parent, ownership=ownership):
+        return _clear_drain_marker(path)
+
+
+def _clear_drain_marker(path: Path) -> bool:
     try:
         path.unlink()
         return True
