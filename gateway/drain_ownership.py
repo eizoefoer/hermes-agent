@@ -8,6 +8,29 @@ from contextlib import contextmanager
 import os
 from pathlib import Path
 import stat
+import threading
+
+
+# Serialize descriptor publication/closure with Python's fork boundary. CLOEXEC
+# alone leaves a fork-only child holding the parent's flock open description.
+_ownerships = set()
+_descriptor_lock = threading.Lock()
+
+
+def _after_fork_child():
+    try:
+        for ownership in _ownerships:
+            fd, ownership.fd = ownership.fd, None
+            os.close(fd)
+        _ownerships.clear()
+    finally:
+        _descriptor_lock.release()
+
+
+if hasattr(os, 'register_at_fork'):
+    os.register_at_fork(before=_descriptor_lock.acquire,
+                        after_in_parent=_descriptor_lock.release,
+                        after_in_child=_after_fork_child)
 
 try:
     import fcntl
@@ -45,8 +68,10 @@ def drain_marker_ownership(*, home):
     home = Path(home).resolve()
     home.mkdir(parents=True, exist_ok=True)
     path = home / '.drain_request.lock'
-    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
-    ownership = _Ownership(path, fd)
+    with _descriptor_lock:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+        ownership = _Ownership(path, fd)
+        _ownerships.add(ownership)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ValueError('drain ownership lock is not a regular file')
@@ -55,8 +80,11 @@ def drain_marker_ownership(*, home):
         yield ownership
     finally:
         # close releases flock; never unlink the shared lock inode or marker.
-        ownership.fd = None
-        os.close(fd)
+        with _descriptor_lock:
+            _ownerships.discard(ownership)
+            if ownership.fd is not None:
+                ownership.fd = None
+                os.close(fd)
 
 
 @contextmanager
