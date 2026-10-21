@@ -810,6 +810,42 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
     async def _inject_watch_notification(
         self, synth_text: str, evt: dict, *, raise_not_accepted: bool = False,
     ) -> Optional[bool]:
+        """Keep refused events retryable without hammering a broken admission every tick."""
+        from gateway.wake import WakeNotAccepted
+        identity = self._completion_delivery_identity(evt) or tuple(
+            str(evt.get(field) or '') for field in ('type', 'session_id', 'event_id'))
+        key = (str(evt.get('session_key') or ''), identity)
+        retries = getattr(self, '_notification_admission_retries', None)
+        if retries is None:
+            retries = self._notification_admission_retries = {}
+        failures, due = retries.get(key, (0, 0.0))
+        if time.monotonic() < due:
+            if raise_not_accepted:
+                raise WakeNotAccepted('notification admission retry deferred')
+            return False
+        refusal = 'transport unavailable'
+        try:
+            result = await self._inject_watch_notification_once(synth_text, evt, raise_not_accepted=True)
+        except WakeNotAccepted as exc:
+            refusal = str(exc)
+            result = False
+        if result is not False:
+            retries.pop(key, None)
+            return result
+        failures = min(failures + 1, 9)
+        delay = min(300, 2 ** failures)
+        # Only retry timing is evicted; the queue/durable ledger still owns every result.
+        if key not in retries and len(retries) >= 1024:
+            retries.pop(next(iter(retries)))
+        retries[key] = (failures, time.monotonic() + delay)
+        logger.warning('Background notification admission refused; retry in %ss: %s', delay, refusal)
+        if raise_not_accepted:
+            raise WakeNotAccepted(refusal)
+        return False
+
+    async def _inject_watch_notification_once(
+        self, synth_text: str, evt: dict, *, raise_not_accepted: bool = False,
+    ) -> Optional[bool]:
         """Inject a watch/completion notification as a synthetic message event.
 
         Routing comes from the queued event, never the active foreground message. Returns

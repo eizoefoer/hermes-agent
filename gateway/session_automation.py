@@ -131,11 +131,18 @@ def snapshot_automation(authority, adapter, event, identity):
     # Recheck only the source/provenance: a completed input's retained media is already released.
     restored = restore_native({'text': event.text, 'native_text_v1': {
         key: value for key, value in envelope.items() if key != 'media'}}, runner)
-    if (restored.source.to_dict() != event.source.to_dict()
+    committed_source = restored.source.to_dict()
+    producer_source = event.source.to_dict()
+    # Reply anchors identify individual messages, not the conversation's owner. The producer
+    # deliberately clears its stale anchor; retain every other source and connector check.
+    committed_source.pop('message_id', None)
+    producer_source.pop('message_id', None)
+    if (committed_source != producer_source
             or runner._adapter_for_source(restored.source) is not adapter):
         raise RuntimeStoreError('admission_conflict')
     provenance = deepcopy(envelope['provenance'])
     source = deepcopy(envelope['source'])
+    source.pop('message_id', None)
     # Producer timestamps and platform reply IDs change on retry. Neither belongs
     # in the identity/fingerprint of the same immutable completion.
     envelope = {'source': source, 'route': entry.session_key,
