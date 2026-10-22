@@ -190,6 +190,12 @@ def routing_context(runner, source):
     return home, bot, profile, config
 
 
+def is_project_status(event):
+    return (not event.internal and not event.get_command()
+            and re.fullmatch(r'(?:all |project |all projects )?status[?.!]*',
+                             _authored(event).strip(), re.IGNORECASE) is not None)
+
+
 async def route_inbound(runner, authority, event):
     if event.source.platform.value != 'telegram' or event.internal or event.get_command():
         return None
@@ -214,7 +220,7 @@ async def route_inbound(runner, authority, event):
         text, _ = await runner._transcribe_pending_audio_event_once(event)
         text = prepare_input(authority.db, rid, text if text is not None else event.text)
     event.text = text
-    if re.fullmatch(r'(?:all |project |all projects )?status[?.!]*', _authored(event).strip(), re.IGNORECASE):
+    if is_project_status(event):
         event.source._project_status = project_status(authority.db, event.source, home, bot, profile, config)
         from hermes_state_project_routing import settle_input
         settle_input(authority.db, rid)
@@ -381,6 +387,9 @@ async def prepare_adapter_event(adapter, event):
         raise RuntimeStoreError('project_routing_unavailable')
     from gateway.session_ingress_context import native_callback
     with owner_scope(authority), native_callback(runner, event, home, getattr(adapter, '_owner_profile', None)):
+        if is_project_status(event):
+            await route_inbound(runner, authority, event)
+            return False
         key = runner._session_key_for_source(event.source)
         reply = await runner._hm_pending_reply_intercepts(event, event.source, key)
         if reply is not None:
@@ -500,6 +509,13 @@ def project_write_guard(authority, payload, authorize=None):
 
 
 async def pending_project_reply(runner, event, internal, physical_key):
+    if not internal and is_project_status(event) and routing_enabled_source(runner, event.source):
+        from gateway.session_authorities import active_authority
+        authority = active_authority(runner)
+        if authority is not None:
+            if getattr(event.source, '_project_status', None) is None:
+                await route_inbound(runner, authority, event)
+            return event.source._project_status
     if not internal:
         reply = await runner._hm_pending_reply_intercepts(event, event.source, physical_key)
         if reply is not None:
@@ -508,7 +524,7 @@ async def pending_project_reply(runner, event, internal, physical_key):
 
 
 async def recover_project_inputs(authority):
-    """Only captured, never-admitted ingress is prepared again; committed work stays native."""
+    """Recover captured ingress and committed choices lacking a project admission."""
     from gateway.session_envelope import restore_native, _validate_native
     from gateway.session_ingress_context import native_callback, reauthorize_roles
     from gateway.session_authorities import owner_scope

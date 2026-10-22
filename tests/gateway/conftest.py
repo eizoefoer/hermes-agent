@@ -719,3 +719,24 @@ def hosted_owner(tmp_path, monkeypatch):
     thread.join()
     loop.close()
     store._db.close()
+
+
+@pytest.fixture
+def notification_clock(monkeypatch):
+    """Control notification backoff without freezing asyncio's own monotonic clock."""
+    from types import SimpleNamespace
+    import gateway.run_notifications as notifications
+
+    class Clock:
+        now = 1000.0
+
+        def monotonic(self):
+            return self.now
+
+        def advance(self, seconds):
+            self.now += seconds
+
+    clock = Clock()
+    monkeypatch.setattr(notifications, 'time', SimpleNamespace(
+        monotonic=clock.monotonic, time=notifications.time.time))
+    return clock

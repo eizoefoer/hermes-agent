@@ -227,11 +227,6 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # duplicate rather than recovering a loss.
         self._delivery_ambiguous = False
 
-    @property
-    def _delivery_adapter(self):
-        from gateway.project_delivery import project_delivery_adapter
-        return project_delivery_adapter(self.adapter, getattr(self, '_project_delivery_source', None))
-
     def _stream_is_message(self) -> bool:
         """Whether THIS chat's transport treats the stream as the message: per-chat probe
         first (a relay adapter's class attribute only reflects its primary identity), else

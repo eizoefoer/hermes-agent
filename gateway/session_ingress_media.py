@@ -328,8 +328,8 @@ def _held_media_paths(conn):
             references.extend(hosted_document_references(request_id, {'text': text}))
         held.update(reference['path'] for reference in references)
     if conn.execute("SELECT 1 FROM sqlite_master WHERE name='project_route_inputs'").fetchone():
-        for row in conn.execute("SELECT json_extract(payload_json,'$.native_text_v1.media') FROM project_route_inputs"):
-            held.update(ref['path'] for ref in json.loads(row[0] or '[]'))
+        from hermes_state_project_routing import held_input_media
+        held.update(held_input_media(conn))
     return held
 
 
@@ -401,6 +401,9 @@ def sweep_settled_media(db, *, now=None):
         rows = conn.execute("""SELECT json_extract(payload_json, '$.attachments_v1.media', '$.native_text_v1.media')
             FROM session_admissions WHERE status='terminal' AND (json_type(payload_json, '$.attachments_v1.media')
             IS NOT NULL OR json_type(payload_json, '$.native_text_v1.media') IS NOT NULL)""").fetchall()
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE name='project_route_inputs'").fetchone():
+            rows += conn.execute("""SELECT json_array(NULL, json_extract(payload_json, '$.native_text_v1.media'))
+                FROM project_route_inputs""").fetchall()
     cutoff = now - MEDIA_CACHE_MAX_AGE_HOURS * 3600
     stale = {}
     for (encoded,) in rows:

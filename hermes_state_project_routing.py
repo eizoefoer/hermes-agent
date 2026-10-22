@@ -214,12 +214,46 @@ def captured_inputs(db):
     with db._read_ctx() as conn:
         if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='project_route_inputs'").fetchone():
             return
+        choices = conn.execute("SELECT 1 FROM sqlite_master WHERE name='project_route_choices'").fetchone()
+    recoverable = "i.state='captured'"
+    if choices:
+        recoverable += """ OR (EXISTS (SELECT 1 FROM project_route_choices c
+            WHERE c.receipt_id=i.receipt_id AND c.state='chosen')
+            AND NOT EXISTS (SELECT 1 FROM project_route_receipts r
+                WHERE r.receipt_id=i.receipt_id AND r.session_id IS NOT NULL))"""
+        recoverable = f"""({recoverable}) AND NOT EXISTS (
+            SELECT 1 FROM project_route_choices c WHERE c.receipt_id=i.receipt_id
+                AND c.state='pending' AND c.expires<=?)"""
+        import time
+        params = (time.time(),)
+    else:
+        params = ()
     cursor = 0
     while True:
         with db._read_ctx() as conn:
-            rows = conn.execute("SELECT rowid,payload_json FROM project_route_inputs WHERE state='captured' AND rowid>? ORDER BY rowid LIMIT 32", (cursor,)).fetchall()
+            rows = conn.execute(f"""SELECT i.rowid,i.payload_json FROM project_route_inputs i
+                WHERE ({recoverable}) AND i.rowid>? ORDER BY i.rowid LIMIT 32""", (*params, cursor)).fetchall()
         if not rows:
             return
         for row in rows:
             cursor = row[0]
             yield json.loads(row[1])
+
+
+def held_input_media(conn):
+    """Native admissions own admitted media; unresolved ingress holds only until selection expires."""
+    import time
+    predicate = "i.state='captured'"
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='project_route_choices'").fetchone():
+        predicate = """(i.state='captured' AND NOT EXISTS (
+            SELECT 1 FROM project_route_choices c WHERE c.receipt_id=i.receipt_id
+                AND c.state='pending' AND c.expires<=?)) OR (i.state!='settled' AND EXISTS (SELECT 1 FROM project_route_choices c
+            WHERE c.receipt_id=i.receipt_id AND (c.state='chosen' OR c.expires>?))
+            AND NOT EXISTS (SELECT 1 FROM project_route_receipts r
+                WHERE r.receipt_id=i.receipt_id AND r.session_id IS NOT NULL))"""
+        params = (time.time(), time.time())
+    else:
+        params = ()
+    rows = conn.execute(f"""SELECT json_extract(i.payload_json,'$.native_text_v1.media')
+        FROM project_route_inputs i WHERE {predicate}""", params)
+    return {ref['path'] for row in rows for ref in json.loads(row[0] or '[]')}

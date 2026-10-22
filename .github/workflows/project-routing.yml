@@ -1,0 +1,110 @@
+name: Telegram project routing acceptance
+
+on:
+  pull_request:
+    paths:
+      - 'gateway/**'
+      - 'hermes_state_project_routing.py'
+      - 'hermes_cli/config_defaults.py'
+      - 'plugins/platforms/telegram/**'
+      - 'tests/gateway/**'
+      - 'release/scoped-acceptance.json'
+      - '.github/workflows/project-routing.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: project-routing-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-routing:
+    name: Native routing and regression contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout exact proposed head
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Set up isolated locked test environment
+        uses: ./.github/actions/setup-pm
+        with:
+          packages: ripgrep
+          extras: '["all", "telegram"]'
+          test-environment: 'true'
+          prune-python-cache: true
+      - name: Exercise all project modules and native regression contracts
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          HERMES_TEST_WORKERS: '2'
+          HERMES_TEST_FILE_TIMEOUT: '600'
+          HERMES_TEST_FILE_RETRIES: '0'
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          python3 - <<'PY'
+          import json, pathlib
+          paths = json.loads(pathlib.Path('release/scoped-acceptance.json').read_text())['required_paths']
+          project = sorted(pathlib.Path('tests/gateway').glob('test_project_*.py'))
+          required = {f'tests/gateway/{name}.py' for name in (
+              'test_project_routing', 'test_project_choices', 'test_project_routing_agent',
+              'test_project_routing_authorization', 'test_project_routing_contracts',
+              'test_project_routing_native',
+          )}
+          assert required <= {str(p) for p in project}, 'all six project modules must execute'
+          paths += [str(p) for p in project]
+          paths += [f'tests/gateway/{name}.py' for name in (
+              'test_native_ingress_trust', 'test_native_ingress_media',
+              'test_native_media_capture_lease', 'test_native_media_redelivery',
+              'test_native_reply_crash_recovery', 'test_native_startup_recovery',
+              'test_native_telegram_startup_recovery', 'test_session_authority',
+              'test_session_recovery', 'test_session_identity',
+              'test_session_row_cwd', 'test_session_group_controls',
+              'test_session_approval_commands', 'test_session_mutation_compress',
+              'test_telegram_final_delivery', 'test_telegram_automation_reply_anchor',
+              'test_automation_reply_identity', 'test_automation_retry',
+              'test_completion_admission', 'test_completion_delivery',
+              'test_post_stream_media_delivery', 'test_queued_followup_final_delivery',
+              'test_telegram_topic_profile_routing', 'test_base_topic_sessions',
+              'test_authority_automation', 'test_watch_automation_identity',
+              'test_automation_notification_category', 'test_new_moves_automation_wake',
+              'test_native_media_ownership', 'test_retired_media_ownership',
+              'test_stream_final_contract', 'test_notification_retry_backoff',
+          )]
+          paths += ['tests/gateway/relay/test_relay_egress_declines.py', 'tests/ci/test_docs_drift.py']
+          paths = sorted(set(paths))
+          assert all(pathlib.Path(p).is_file() for p in paths), 'missing regression module'
+          pathlib.Path('project-routing-selection.txt').write_text('\n'.join(paths) + '\n')
+          pathlib.Path('project-routing-core.txt').write_text('\n'.join(str(p) for p in project) + '\n')
+          print(f'Executing {len(paths)} modules including all six project modules')
+          PY
+          mapfile -t project < project-routing-core.txt
+          scripts/run_tests.sh "${project[@]}" | tee "$RUNNER_TEMP/project-routing-core.log"
+          mapfile -t paths < project-routing-selection.txt
+          scripts/run_tests.sh "${paths[@]}" | tee "$RUNNER_TEMP/project-routing-tests.log"
+          python3 - "$RUNNER_TEMP/project-routing-tests.log" "$RUNNER_TEMP/project-routing-core.log" <<'PY'
+          import pathlib, re, sys
+          for filename in sys.argv[1:]:
+              text = pathlib.Path(filename).read_text()
+              summary = re.search(r'^=== Summary: (.+)$', text, re.M)
+              assert summary, 'missing canonical test summary'
+              assert re.search(r'[1-9][0-9]* (tests )?passed', summary[1]), summary[1]
+              assert not re.search(r'[1-9][0-9]* (failed|errors?)', summary[1]), summary[1]
+              if filename.endswith('core.log'):
+                  assert not re.search(r'[1-9][0-9]* skipped', summary[1]), summary[1]
+          PY
+      - name: Upload source-bound integration log and selection
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: project-routing-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            ${{ runner.temp }}/project-routing-tests.log
+            ${{ runner.temp }}/project-routing-core.log
+            project-routing-selection.txt
+            project-routing-core.txt
+          if-no-files-found: error
+          retention-days: 30

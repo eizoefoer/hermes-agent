@@ -642,7 +642,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 self.session_store._ensure_loaded()
                 entry = self.session_store._entries.get(session_key)
                 if entry and getattr(entry, "origin", None):
-                    return self._restored_source(entry)
+                    from gateway.session_automation import process_action_source
+                    return process_action_source(self, entry, self._restored_source(entry), evt)
             except Exception as exc:
                 logger.debug("Synthetic process-event session-store lookup failed for %s: %s", session_key, exc)
             cached_source = self._get_cached_session_source(session_key)

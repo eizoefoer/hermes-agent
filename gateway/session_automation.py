@@ -106,6 +106,43 @@ def admission_display(payload):
     return card
 
 
+def _origin_envelope(prior, source):
+    """Project producers carry an immutable originating input, never the lane's latest input."""
+    from gateway.project_routing import route_of
+    from dataclasses import asdict
+    route = route_of(source)
+    return next((envelope for row in reversed(prior)
+                 if (envelope := row['payload'].get('native_text_v1')) is not None
+                 and (route is None or envelope.get('project_route') == asdict(route))), None)
+
+
+def process_action_source(runner, entry, source, event):
+    """Use the process's captured trigger ID to restore its committed project action."""
+    from gateway.project_routing import route_of, validate_route, routing_context
+    route = route_of(source)
+    trigger = str(event.get('message_id') or '').strip()
+    if route is None or not trigger:
+        return source
+    from gateway.session_authorities import authority_for_home
+    from gateway.session_envelope import restore_native_source
+    from hermes_state_runtime import list_session_admissions
+    home, bot, profile, config = routing_context(runner, source)
+    authority = authority_for_home(runner, home)
+    if authority is None:
+        return None
+    owner = authority.logical_owner(entry.session_id)
+    for row in list_session_admissions(authority.db, session_id=owner, pending_only=False):
+        payload = row['payload']
+        descriptor = payload.get('native_text_v1', {}).get('project_route', {})
+        if (descriptor.get('input_id') == trigger
+                and descriptor.get('execution_key') == entry.session_key):
+            restored = restore_native_source(payload, runner)
+            validate_route(authority.db, restored, descriptor, home=home, bot=bot,
+                           profile=profile, config=config, session_id=entry.session_id)
+            return restored
+    return None
+
+
 def snapshot_automation(authority, adapter, event, identity):
     runner = authority.runner
     if (not event.internal or event.message_type != MessageType.TEXT or event.is_command()
@@ -122,8 +159,7 @@ def snapshot_automation(authority, adapter, event, identity):
     # Admissions belong to the logical root; ``entry.session_id`` is only the transcript tip.
     owner = authority.logical_owner(entry.session_id)
     prior = list_session_admissions(authority.db, session_id=owner, pending_only=False)
-    envelope = next((r['payload']['native_text_v1'] for r in reversed(prior)
-                     if 'native_text_v1' in r['payload']), None)
+    envelope = _origin_envelope(prior, event.source)
     if envelope is None or 'provenance' not in envelope:
         raise RuntimeStoreError('not_found')
     # Persisted origins deliberately omit relay trust. Borrow only an exact
@@ -336,8 +372,7 @@ async def admit_route_wake(runner, adapter, source, text, producer, metadata=Non
     from hermes_state_runtime import list_session_admissions
     prior = list_session_admissions(authority.db, session_id=authority.logical_owner(entry.session_id),
                                     pending_only=False)
-    envelope = next((r['payload']['native_text_v1'] for r in reversed(prior)
-                     if 'native_text_v1' in r['payload']), None)
+    envelope = _origin_envelope(prior, source)
     if envelope is None or 'provenance' not in envelope:
         return False
     # The route's committed source, which ``snapshot_automation`` re-derives and compares.

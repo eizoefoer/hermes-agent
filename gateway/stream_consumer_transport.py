@@ -28,6 +28,11 @@ class StreamTransportMixin:
 
     _MIN_NEW_MSG_CHARS = 4
 
+    @property
+    def _delivery_adapter(self):
+        from gateway.project_delivery import project_delivery_adapter
+        return project_delivery_adapter(self.adapter, getattr(self, '_project_delivery_source', None))
+
     async def _edit_message(self, *, message_id: str, content: str, finalize: bool = False):
         """Edit via the adapter, passing routing metadata when supported."""
         # Contract: adapters must accept finalize= even when False (test-guarded).

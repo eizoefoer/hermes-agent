@@ -12,16 +12,14 @@ platforms:
     extra:
       project_routing:
         enabled: true
-        eligible_projects: [heisentick, property, applymate, auto-dropshiper]
+        eligible_projects: [alpha, beta]
         aliases:
-          heisentick: [Heisentick, trading]
-          property: [property, cashflow]
-          applymate: [ApplyMate, resume]
-          auto-dropshiper: [eBay, auto-dropshiper]
+          alpha: [first-project]
+          beta: [second-project]
         references: {} # slug -> exact authored repository, PR or task references
 ```
 
-The equivalent `telegram.project_routing` block is also supported. Paths come exclusively from the native project registry. A changed workspace requires a new isolated session; the gateway refuses to combine an old workspace association with a different folder.
+The equivalent `telegram.project_routing` block is also supported. Set `telegram.project_routing.enabled` to opt in, `telegram.project_routing.eligible_projects` to the allowed registry IDs or slugs, `telegram.project_routing.aliases` to a mapping of slugs to authored names, and `telegram.project_routing.references` to a mapping of slugs to exact authored repository, PR or task references. Paths come exclusively from the native project registry. A changed workspace requires a new isolated session; the gateway refuses to combine an old workspace association with a different folder.
 
 Direct authored names, aliases and configured references, and durable replies to bot messages, select a project. Conflicting evidence or an unknown request produces one expiring inline project choice. Selecting it submits the original input, including attachments, rather than creating a replacement request. Quoted and forwarded text is not routing authority. Voice is transcribed before selection. Routing keeps individual text and media inputs separate, including album items; each item needs authored project context or a durable reply anchor. This preserves input identity and prevents captions for different projects from being merged.
 

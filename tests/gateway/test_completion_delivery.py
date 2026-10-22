@@ -93,12 +93,14 @@ def _completion_event(*, started_at, session_id="proc_reused"):
     }
 
 
-def _stop_after_sleeps(monkeypatch, runner, count):
+def _stop_after_sleeps(monkeypatch, runner, count, clock=None):
     sleep_calls = 0
 
     async def _bounded_sleep(_delay):
         nonlocal sleep_calls
         sleep_calls += 1
+        if clock is not None:
+            clock.advance(2)
         if sleep_calls >= count:
             runner._running = False
 
@@ -167,7 +169,7 @@ def test_concurrent_claims_share_the_same_narrow_delivery_seam():
 
 
 def test_failed_async_injection_is_retried_and_only_success_is_acked(
-    monkeypatch, isolated_registry,
+    monkeypatch, isolated_registry, notification_clock,
 ):
     isolated = queue.Queue()
     monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
@@ -177,7 +179,7 @@ def test_failed_async_injection_is_retried_and_only_success_is_acked(
         handle_message=AdmittingHandler(side_effect=[RuntimeError("temporary"), None])
     )
     runner = _runner(adapter)
-    _stop_after_sleeps(monkeypatch, runner, count=3)
+    _stop_after_sleeps(monkeypatch, runner, count=3, clock=notification_clock)
 
     from tools import async_delegation
 
@@ -428,7 +430,7 @@ def test_completion_batches_do_not_cross_conversation_routes():
     assert adapter.handle_message.await_count == 2
 
 
-def test_failed_coalesced_delivery_retries_all_entries():
+def test_failed_coalesced_delivery_retries_all_entries(notification_clock):
     attempts = 0
 
     async def _deliver(_event):
@@ -452,6 +454,10 @@ def test_failed_coalesced_delivery_retries_all_entries():
 
     async def _exercise():
         assert await _enqueue_all() == [False, False]
+        notification_clock.advance(1.99)
+        assert await _enqueue_all() == [False, False]
+        assert adapter.handle_message.await_count == 1
+        notification_clock.advance(0.01)
         assert await _enqueue_all() == [True, True]
 
     asyncio.run(_exercise())
@@ -834,7 +840,7 @@ def test_single_async_event_latency_and_text_are_unchanged(
 
 
 def test_failed_coalesced_async_batch_releases_claims_and_retries(
-    monkeypatch, isolated_registry,
+    monkeypatch, isolated_registry, notification_clock,
 ):
     """A rejected consolidated injection leaves every durable row pending."""
     from tools import async_delegation
@@ -850,7 +856,7 @@ def test_failed_coalesced_async_batch_releases_claims_and_retries(
         handle_message=AdmittingHandler(side_effect=[RuntimeError("temporary"), None])
     )
     runner = _runner(adapter)
-    _stop_after_sleeps(monkeypatch, runner, count=3)
+    _stop_after_sleeps(monkeypatch, runner, count=3, clock=notification_clock)
 
     asyncio.run(runner._async_delegation_watcher(interval=0))
 
@@ -979,13 +985,13 @@ def test_idle_watch_drain_respects_notify_mode(monkeypatch, isolated_registry, e
     assert isolated_registry.completion_queue.empty()
 
 
-def test_watch_drain_retries_transport_failure(monkeypatch, isolated_registry):
+def test_watch_drain_retries_transport_failure(monkeypatch, isolated_registry, notification_clock):
     adapter = SimpleNamespace(handle_message=AdmittingHandler(side_effect=[RuntimeError("offline"), None]))
     runner = _runner(adapter)
     runner._load_background_notifications_mode = lambda: "concise"
     evt = dict(_completion_event(started_at=1), type="watch_match", pattern="READY", output="READY")
     isolated_registry.completion_queue.put(evt)
-    _stop_after_sleeps(monkeypatch, runner, count=3)
+    _stop_after_sleeps(monkeypatch, runner, count=3, clock=notification_clock)
     asyncio.run(runner._async_delegation_watcher(interval=0))
     assert adapter.handle_message.await_count == 2
     assert isolated_registry.completion_queue.empty()

@@ -57,7 +57,7 @@ async def test_coalesced_siblings_survive_lost_ack_and_owner_restart(tmp_path, m
 
 
 @pytest.mark.asyncio
-async def test_unowned_completion_refunds_every_sibling_without_consuming_budget(tmp_path, monkeypatch):
+async def test_unowned_completion_refunds_every_sibling_without_consuming_budget(tmp_path, monkeypatch, notification_clock):
     from gateway.config import GatewayConfig, Platform, PlatformConfig
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
@@ -93,6 +93,7 @@ async def test_unowned_completion_refunds_every_sibling_without_consuming_budget
     authority.db.create_session('other-owner', source='discord')
     for event in events:
         event['parent_session_id'] = 'other-owner'
+    notification_clock.advance(2)
     for _ in range(10):
         assert await runner._deliver_async_delegation_group(events) is False
     assert runner.session_store.peek_session_id(key) == sid
@@ -100,5 +101,6 @@ async def test_unowned_completion_refunds_every_sibling_without_consuming_budget
         record = delegation.get_durable_delegation(event['delegation_id'])
         assert (record['delivery_state'], record['delivery_attempts']) == ('pending', 0)
         event['parent_session_id'] = sid
+    notification_clock.advance(4)
     assert await runner._deliver_async_delegation_group(events) is True
     assert len(list_session_admissions(authority.db, session_id=sid, pending_only=False)) == 2

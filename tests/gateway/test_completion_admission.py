@@ -32,7 +32,7 @@ async def drain(adapter):
 
 
 @pytest.mark.asyncio
-async def test_completion_ack_requires_admission_and_replay_never_repeats(tmp_path):
+async def test_completion_ack_requires_admission_and_replay_never_repeats(tmp_path, notification_clock):
     runner = GatewayRunner(GatewayConfig())
     adapter = DiscordAdapter(PlatformConfig(enabled=True, typing_indicator=False))
     runner.adapters = {Platform.DISCORD: adapter}
@@ -63,6 +63,7 @@ async def test_completion_ack_requires_admission_and_replay_never_repeats(tmp_pa
         await adapter.handle_message(MessageEvent(text="human-active", source=source))
         await asyncio.wait_for(started.wait(), 2)
         await adapter.handle_message(MessageEvent(text="human-pending", source=source))
+        notification_clock.advance(2)
         adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
         runner._BUSY_QUEUE_MAX_PENDING = 1
         for _ in range(10):
@@ -76,6 +77,7 @@ async def test_completion_ack_requires_admission_and_replay_never_repeats(tmp_pa
         wrong = dict(events[0], session_key="agent:main:discord:dm:other",
                      platform="discord", chat_type="dm", chat_id="42")
         assert await runner._inject_watch_notification("wrong-route", wrong) is False
+        notification_clock.advance(4)
         runner._BUSY_QUEUE_MAX_PENDING = 4
         assert await runner._deliver_async_delegation_group(events) is True
         assert await runner._deliver_async_delegation_group(events) is None
