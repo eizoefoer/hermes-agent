@@ -1879,7 +1879,9 @@ def _lazy_attr(obj: Any, name: str, factory: Callable[[], Any]) -> Any:
 _strip_media_directives = _strip_media_tag_directives
 
 
-class BasePlatformAdapter(ABC):
+from gateway.platforms.base_final_delivery import BaseFinalDeliveryMixin
+
+class BasePlatformAdapter(BaseFinalDeliveryMixin, ABC):
     """Base class for platform adapters: connect/auth, receive, send, handle media."""
 
     # ``format_message`` renders ``` fences as real code blocks (tool-progress then sends a bare
@@ -2525,6 +2527,10 @@ class BasePlatformAdapter(ABC):
 
     def _source_session_key(self, source: SessionSource) -> str:
         self._canonicalize(source)  # identity FIRST; no key derivation before it
+        from gateway.project_routing import route_of
+        routed = route_of(source)
+        if routed is not None:
+            return routed.execution_key
         extra = self.config.extra
         return build_session_key(
             source, group_sessions_per_user=extra.get("group_sessions_per_user", True),
@@ -2533,7 +2539,9 @@ class BasePlatformAdapter(ABC):
 
     def _text_batch_key(self, event: MessageEvent) -> str:
         """Session-scoped key for text batching (subclasses may override)."""
-        return self._event_session_key(event)
+        from gateway.project_routing import adapter_routing_enabled
+        key = self._event_session_key(event)
+        return key + ':input:' + str(event.message_id) if adapter_routing_enabled(self, event) else key
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event (merging into a pending one) and restart the flush timer."""
@@ -3612,10 +3620,12 @@ class BasePlatformAdapter(ABC):
     @records_delivery
     async def _send_with_retry(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Any = None,
-        max_retries: int = 2, base_delay: float = 2.0) -> SendResult:
+        max_retries: int = 2, base_delay: float = 2.0, authorize_send: Optional[Callable] = None) -> SendResult:
         """Send with exponential-backoff retry on transient network errors; permanent
         failures fall back to a plain-text send, exhausted retries notify the user."""
         async def _send(text: str) -> SendResult:
+            if authorize_send is not None:
+                authorize_send()
             return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
 
         async def _send_again(previous: SendResult) -> Optional[SendResult]:
@@ -3624,6 +3634,8 @@ class BasePlatformAdapter(ABC):
             caller then keeps the partial failure rather than re-sending the already-visible head."""
             if not self._is_partial_delivery(previous):
                 return await _send(content)
+            if authorize_send is not None:
+                authorize_send()
             return await self._resume_partial_send(chat_id, previous, reply_to=reply_to, metadata=metadata)
 
         result = await _send(content)
@@ -4024,10 +4036,16 @@ class BasePlatformAdapter(ABC):
         # Identity FIRST: every key below (routing check, guard lookup, batch lane) derives from it.
         if self._drop_unresolved(event):
             return
+        from gateway.project_routing import prepare_adapter_event
+        if await prepare_adapter_event(self, event):
+            event._gateway_accepted = True
+            return
         expected_session_key = str((event.metadata or {}).get("gateway_session_key") or "").strip()
         # Explicitly routed events already name their destination; recovering a
         # different topic would redirect them and yield before the session claim.
-        if (not expected_session_key and getattr(self, "_topic_recovery_fn", None) is not None
+        from gateway.project_routing import adapter_routing_enabled
+        if (not adapter_routing_enabled(self, event) and not expected_session_key
+                and getattr(self, "_topic_recovery_fn", None) is not None
                 and event.source.platform == Platform.TELEGRAM and event.source.chat_type == "dm"):
             await asyncio.to_thread(self._apply_topic_recovery, event)
         session_key = self._event_session_key(event)
@@ -4228,40 +4246,6 @@ class BasePlatformAdapter(ABC):
         record_delivery(tts_result)
         return bool(caption and getattr(tts_result, "success", False))
 
-    async def _record_delivery_obligation(
-        self, event: MessageEvent, session_key: str, text_content: str,
-        delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool) -> Optional[str]:
-        """Ledger the final response BEFORE the send so a crash before platform ACK redelivers on
-        next boot; best-effort, skips slash-command and ephemeral replies. Returns the obligation id
-        or None."""
-        if is_ephemeral_response or str(event.text or "").lstrip().startswith(
-            ("/", self.typed_command_prefix or "!")):
-            return None
-        try:
-            from gateway.delivery_ledger import (
-                compute_obligation_id, ledger_enabled, mark_attempting, record_obligation)
-            if not await asyncio.to_thread(ledger_enabled):
-                return None
-            source = event.source
-            # ``ledger_message_id`` wins when set: a queued chain's final answers the last message
-            # of the chain, not the event that opened it (see ``MessageEvent.ledger_message_id``).
-            _ledger_id = getattr(event, "ledger_message_id", None)
-            if _ledger_id is None:
-                _ledger_id = getattr(event, "message_id", "")
-            obligation_id = compute_obligation_id(
-                session_key, str(_ledger_id or ""), text_content)
-            await asyncio.to_thread(
-                record_obligation, obligation_id=obligation_id, session_key=session_key,
-                platform=str(getattr(source.platform, "value", source.platform)),
-                chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
-                content=text_content,
-                adapter_profile=getattr(delivery_adapter, "_owner_profile", None))
-            await asyncio.to_thread(mark_attempting, obligation_id)
-            return obligation_id
-        except Exception:
-            logger.debug("delivery ledger record failed", exc_info=True)
-            return None
-
     async def _finalize_delivery_obligation(
         self, obligation_id: str, result: Any, event: MessageEvent,
         delivery_adapter: "BasePlatformAdapter") -> None:
@@ -4301,6 +4285,7 @@ class BasePlatformAdapter(ABC):
         ``send_multiple_images`` unless ``[[as_document]]``; otherwise audio → send_voice (MEDIA
         tags only, never bare local files), video → send_video, else send_document. Every failure is
         reported. Each send feeds ``record_delivery`` so media-only turns report SUCCESS."""
+        from gateway.project_routing import check_delivery, record_reply_anchor
         from urllib.parse import quote as _quote
 
         def _as_image(path: str) -> bool:
@@ -4316,6 +4301,7 @@ class BasePlatformAdapter(ABC):
         async def _send_one(path: str, *, is_voice: bool, media_tag: bool) -> SendResult:
             """MEDIA-tag files (``media_tag``) may route to send_voice; bare local files never
             do."""
+            check_delivery(self.gateway_runner, event.source)
             ext = Path(path).suffix.lower()
             if media_tag and should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
                 result = await self.send_voice(chat_id=chat_id, audio_path=path, metadata=metadata, is_voice=is_voice)
@@ -4329,6 +4315,7 @@ class BasePlatformAdapter(ABC):
                 logger.warning("[%s] Failed to send %s (%s): %s", self.name,
                                "media" if media_tag else "local file", ext, result.error)
                 await self._notify_media_delivery_failure(chat_id, path, is_voice=is_voice, metadata=metadata)
+            await record_reply_anchor(self.gateway_runner, event, result)
             return result
         queue = [(p, v, True) for p, v in media_files if v or not _as_image(p)]
         if queue:
@@ -4352,6 +4339,8 @@ class BasePlatformAdapter(ABC):
         """Batch-send images; a failure is logged (never raised) so other attachments still go.
         The batch result feeds ``record_delivery`` so media-only turns report their real
         outcome instead of FAILURE."""
+        from gateway.project_routing import check_delivery, record_reply_anchor
+        check_delivery(self.gateway_runner, event.source)
         try:
             result = await self.send_multiple_images(
                 chat_id=event.source.chat_id, images=images, metadata=metadata, human_delay=human_delay)
@@ -4359,32 +4348,8 @@ class BasePlatformAdapter(ABC):
             logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
             record_delivery(SendResult(success=False, error=str(batch_err)))
             return
+        await record_reply_anchor(self.gateway_runner, event, result)
         record_delivery(result)
-
-    async def send_final_ledgered(
-        self, event: MessageEvent, session_key: str, text_content: str, metadata: dict[str, Any], *,
-        reply_to: Optional[str], is_ephemeral_response: bool = False,
-    ) -> "tuple[SendResult, BasePlatformAdapter]":
-        """The delivery-ledger bracket every final text goes through, on the CURRENT transport
-        (a reconnect may have replaced this adapter): record the obligation before the send,
-        send with retry, finalize from the result — so a refused final (flood control, a dead
-        transport) leaves a ledger row the boot sweep / runtime redelivery can act on. ``event``
-        supplies the source and the ledger identity (``ledger_message_id`` or ``message_id``).
-        Returns the result with the adapter that sent it: that adapter owns ``result.message_id``
-        (an ephemeral delete must go to the same transport)."""
-        delivery_adapter = self._final_delivery_adapter(event.source)
-        logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
-                    len(text_content), event.source.chat_id)
-        obligation_id = await self._record_delivery_obligation(
-            event, session_key, text_content, delivery_adapter, is_ephemeral_response)
-        if obligation_id is not None:
-            await self._release_turn_marker(event)  # the ledger now owns the crash recovery
-        result = await delivery_adapter._send_with_retry(
-            chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
-        stop_reply_clock(delivery_adapter, event.source.chat_id, result)
-        if obligation_id is not None:
-            await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
-        return result, delivery_adapter
 
     async def _release_turn_marker(self, event: MessageEvent) -> None:
         """Clear the crash marker handed to this delivery lifecycle only once the final reply is ledgered or
@@ -4398,6 +4363,9 @@ class BasePlatformAdapter(ABC):
         self, event: MessageEvent, session_key: str, text_content: str, metadata: dict[str, Any],
         is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable) -> None:
         """Normal-lane final: the ledger bracket plus the message-id owner's ephemeral delete."""
+        from gateway.project_choices import deliver_choice
+        if await deliver_choice(self, event, text_content, metadata, record_delivery):
+            return
         result, delivery_adapter = await self.send_final_ledgered(
             event, session_key, text_content, metadata,
             reply_to=_reply_anchor_for_event(event), is_ephemeral_response=is_ephemeral_response)

@@ -813,7 +813,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 source, _scfg, _adapter, on_missing_cursor="fallback",
             )
             return GatewayStreamConsumer(
-                adapter=_adapter, chat_id=source.chat_id, config=_consumer_cfg,
+                adapter=_adapter, source=source, chat_id=source.chat_id, config=_consumer_cfg,
                 metadata=_thread_metadata, on_before_finalize=_pause_typing_before_finalize,
                 initial_reply_to_id=event_message_id, run_still_current=_run_still_current,
             )

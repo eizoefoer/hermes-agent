@@ -156,7 +156,10 @@ class GatewaySessionAgentMixin:
         src = ctx.source
         from gateway.session_policy import policy_for_source
         policy = policy_for_source(runner, src)
+        from gateway.project_routing import route_of
+        route = route_of(src)
         return ctx.AIAgent(
+            **({'cwd': route.cwd} if route else {}),
             model=turn_route["model"], **turn_route["runtime"], **_checkpoint_agent_kwargs(ctx.user_config),
             max_iterations=max_iterations, quiet_mode=not bool(policy and policy.verbose), verbose_logging=False,
             enabled_toolsets=ctx.enabled_toolsets, disabled_toolsets=ctx.disabled_toolsets,
@@ -191,9 +194,14 @@ class GatewaySessionAgentMixin:
         ctx = self._ctx
         runner = self._runner
         skip_context_files = self._skip_context_files(platform_key)
+        from gateway.project_routing import route_of
+        project = route_of(ctx.source)
+        cache_keys = runner._extract_cache_busting_config(ctx.user_config)
+        if project is not None:
+            cache_keys = {**cache_keys, 'project_workspace': (project.project_id, project.cwd)}
         sig = runner._agent_config_signature(
             turn_route["model"], turn_route["runtime"], ctx.enabled_toolsets, combined_ephemeral,
-            cache_keys=runner._extract_cache_busting_config(ctx.user_config),
+            cache_keys=cache_keys,
             user_id=getattr(ctx.source, "user_id", None),
             user_id_alt=getattr(ctx.source, "user_id_alt", None),
             skip_context_files=skip_context_files,

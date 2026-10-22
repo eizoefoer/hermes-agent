@@ -41,13 +41,13 @@ class StreamTransportMixin:
                     kwargs["metadata"] = self.metadata
             except (TypeError, ValueError):
                 pass
-        return await self.adapter.edit_message(**kwargs)
+        return await self._delivery_adapter.edit_message(**kwargs)
 
     async def _try_seed_frame(self, fail_log: str, *, exc_info: bool = False) -> bool:
         """Open a native stream with an empty seed frame (typing indicator before any token) as a
         bool; a raise logs ``fail_log`` at DEBUG (error formatted in, or the traceback when
         ``exc_info``) and reads as False."""
-        seed = self.adapter.send_stream_frame(
+        seed = self._delivery_adapter.send_stream_frame(
             "", chat_id=self.chat_id, reply_to=self._initial_reply_to_id, turn_id=self._turn_id)
         return await self._try_frame(seed, fail_log, exc_info=exc_info)
 
@@ -65,7 +65,7 @@ class StreamTransportMixin:
 
     async def _send_frame(self, text: str, *, finalize: bool):
         """One native-stream frame; every frame carries the same chat/reply/turn routing."""
-        return await self.adapter.send_stream_frame(
+        return await self._delivery_adapter.send_stream_frame(
             text, finalize=finalize, chat_id=self.chat_id, reply_to=self._initial_reply_to_id,
             turn_id=self._turn_id)
 
@@ -171,7 +171,7 @@ class StreamTransportMixin:
             self._use_draft_streaming = False
             return False
         try:
-            result = await self.adapter.send_draft(
+            result = await self._delivery_adapter.send_draft(
                 chat_id=self.chat_id, draft_id=self._draft_id, content=text,
                 metadata=self._draft_metadata())
         except Exception as e:
@@ -281,7 +281,7 @@ class StreamTransportMixin:
             return False
         stale_ids = self._stale_preview_ids()
         try:
-            result = await self.adapter.send(
+            result = await self._delivery_adapter.send(
                 chat_id=self.chat_id, content=text, metadata=self._metadata_for_send(final=True))
         except Exception as e:
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
@@ -457,7 +457,7 @@ class StreamTransportMixin:
                 "declined this destination for this run"
             )
             return False
-        result = await self.adapter.send(
+        result = await self._delivery_adapter.send(
             chat_id=self.chat_id, content=text, reply_to=self._initial_reply_to_id,
             metadata=self._metadata_for_send(final=finalize, expect_edits=not finalize))
         if not result.success:

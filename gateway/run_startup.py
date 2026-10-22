@@ -454,6 +454,8 @@ class GatewayStartupMixin:
                 content = row.get("marker", RECOVERED_MARKER) + content
             metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
             try:
+                from gateway.project_routing import recovered_delivery_source
+                project_source = recovered_delivery_source(self, row)
                 result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
             except Exception as send_err:
                 logger.warning("obligation %s: redelivery send raised: %s", row["obligation_id"], send_err)
@@ -461,6 +463,10 @@ class GatewayStartupMixin:
             with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
                 if result is not None and getattr(result, "success", False):
                     await asyncio.to_thread(mark_delivered, row["obligation_id"])
+                    if project_source is not None:
+                        from gateway.project_routing import record_reply_anchor
+                        from gateway.platforms.event import MessageEvent
+                        await record_reply_anchor(self, MessageEvent(text='', source=project_source), result)
                     redelivered += 1
                     logger.info(
                         "Redelivered recovered final response to %s:%s (obligation %s, attempt %d)",

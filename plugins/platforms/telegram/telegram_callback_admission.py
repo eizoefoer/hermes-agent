@@ -30,3 +30,7 @@ class TelegramCallbackAdmissionMixin:
         # Use the public compatibility seam: deployed plugins install their denial bridge here.
         from gateway import telegram_approval
         await telegram_approval.handle_callback(self, query)
+
+    async def _handle_project_choice_callback(self, query, data: str, cb: dict[str, Any]) -> None:
+        from gateway.project_choices import handle_callback
+        await handle_callback(self, query, data, cb)

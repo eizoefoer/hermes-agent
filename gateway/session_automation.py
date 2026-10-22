@@ -149,6 +149,11 @@ def snapshot_automation(authority, adapter, event, identity):
         'timestamp': datetime.fromtimestamp(0, UTC).isoformat(),
         'event': {'message_id': identity}, 'provenance': provenance,
         'automation': {'identity': identity, 'owner': owner}}
+    from gateway.project_routing import route_of
+    project_route = route_of(restored.source)
+    if project_route is not None:
+        from dataclasses import asdict
+        envelope['project_route'] = asdict(project_route)
     envelope['automation'].update(notification)
     if getattr(event, '_heartbeat_session_id', None):
         envelope['automation']['heartbeat'] = event._heartbeat_session_id
@@ -166,6 +171,9 @@ def check_automation_route(runner, payload, session_id, available_source, adapte
     authority = active_authority(runner)
     if authority is None:  # a late preflight for a profile this runtime no longer serves
         raise RuntimeStoreError('not_found')
+    if 'project_route' in envelope:
+        from gateway.project_routing import check_native_project_route
+        check_native_project_route(runner, payload, session_id, available_source)
     entry = _owner(runner, event, authority)
     if (entry.session_id != session_id
             or envelope['automation']['owner'] != authority.logical_owner(session_id)

@@ -171,6 +171,12 @@ class SessionAuthority:
         callers run it off the owner loop and publish the live entry on the loop."""
         self._require_admission_open()
         entry = self.runner.session_store.get_or_create_session(source)
+        from gateway.project_routing import route_of
+        project = route_of(source)
+        if project is not None:
+            row = self.db.get_session(entry.session_id)
+            if row and row.get('cwd') != project.cwd:
+                raise RuntimeStoreError('project_workspace_changed')
         sid = self.logical_owner(entry.session_id)
         # SessionStore reserves routing metadata before the first AIAgent exists.
         if self.db.get_session(sid) is None:
@@ -346,6 +352,8 @@ class SessionAuthority:
         payload = await prepare_native(self.runner, event)
         self._require_admission_open()
         source = restore_native_source(payload)  # no re-hash of the just-captured media on the loop
+        from gateway.project_routing import check_delivery
+        check_delivery(self.runner, source)
         from gateway.session_runtime_workers import tracked_write
         ref = self._publish_route(source, *await tracked_write(self, partial(self._reserve_route, source)))
         identity = json.dumps([source.profile, source.platform.value, source.chat_id,
@@ -365,8 +373,13 @@ class SessionAuthority:
         try:
             payload = reconcile_native_retry(self.db, principal_id=principal_id, session_id=session_id,
                                              request_id=request_id, payload=payload)
+            from gateway.project_routing import check_delivery
+            from gateway.session_envelope import restore_native_source
+            check_delivery(self.runner, restore_native_source(payload, self.runner))
+            from gateway.project_routing import admission_guard, project_write_guard
+            guard = admission_guard(payload, session_id, project_write_guard(self, payload, authorize))
             return admit_session_input(self.db, epoch=self.epoch, principal_id=principal_id, session_id=session_id,
-                                       request_id=request_id, payload=payload, _authorize_write=authorize)
+                                       request_id=request_id, payload=payload, _authorize_write=guard)
         except Exception:
             # A refused admission owns nothing it captured (unless another admission holds the same bytes).
             drop_capture_lease()
@@ -831,8 +844,10 @@ class SessionAuthority:
             live.rescan = False  # a _schedule from here on may not be visible to this claim's read
             # The row these checks validated, never whichever is first when the write runs: a
             # cancellation commits from a worker thread and can advance the FIFO at any point.
+            from gateway.project_routing import project_write_guard
+            claim_guard = project_write_guard(self, first['payload'] if first else None)
             row = await tracked_write(self, partial(claim_session_input, self.db, epoch=self.epoch,
-                                                    session_id=ref.session_id, _guard=self._admission_gate(),
+                                                    session_id=ref.session_id, _guard=self._admission_gate(claim_guard),
                                                     head=first['admission_id'] if first is not None else None),
                                       then=partial(self._stamp_claim, ref, live))
             # Input scheduled while this claim's transaction ran may postdate its read: re-read

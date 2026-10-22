@@ -86,6 +86,9 @@ class GatewayTopicThreadsMixin:
 
     def _is_telegram_topic_lane(self, source: SessionSource) -> bool:
         """True for a user-created Telegram private-chat topic lane."""
+        from gateway.project_routing import routing_enabled_source
+        if routing_enabled_source(self, source):
+            return False
         tid = str(source.thread_id or "")
         return (
             self._is_telegram_dm(source) and self._telegram_topic_mode_enabled(source)
@@ -167,6 +170,9 @@ class GatewayTopicThreadsMixin:
         """Pin lobby-shaped topic-mode DM replies (missing ``message_thread_id`` or General) to the
         user's most-recent bound topic. Never rewrite a non-lobby, unbound thread id: a brand-new DM
         topic is also "unknown" until its first message is recorded. None = leave the source alone."""
+        from gateway.project_routing import routing_enabled_source
+        if routing_enabled_source(self, source):
+            return None
         if (
             not self._is_telegram_dm(source) or not source.chat_id or not source.user_id
             or not self._telegram_topic_mode_enabled(source)

@@ -118,8 +118,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         on_new_message: Optional[callable] = None,
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
-        run_still_current: Optional[Callable[[], bool]] = None):
+        run_still_current: Optional[Callable[[], bool]] = None, source: Any = None):
         self.adapter = adapter
+        self._project_delivery_source = source
         self.chat_id = chat_id
         self.cfg = config or StreamConsumerConfig()
         self.metadata = metadata
@@ -225,6 +226,11 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # keeps legacy trust in ``delivered_final_matches`` (#95382 tightening) — re-sending there risks a
         # duplicate rather than recovering a loss.
         self._delivery_ambiguous = False
+
+    @property
+    def _delivery_adapter(self):
+        from gateway.project_delivery import project_delivery_adapter
+        return project_delivery_adapter(self.adapter, getattr(self, '_project_delivery_source', None))
 
     def _stream_is_message(self) -> bool:
         """Whether THIS chat's transport treats the stream as the message: per-chat probe
@@ -515,7 +521,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                        "falling back to send() for pre-prompt text (chat=%s)",
                        _reason, self.chat_id)
         try:
-            if getattr(await self.adapter.send(self.chat_id, finalize_text), "success", False):
+            if getattr(await self._delivery_adapter.send(self.chat_id, finalize_text), "success", False):
                 return True
         except Exception as send_err:
             logger.warning("%s boundary: fallback send also failed: %s", _reason, send_err)

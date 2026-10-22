@@ -327,6 +327,9 @@ def _held_media_paths(conn):
             references.extend(native or ())
             references.extend(hosted_document_references(request_id, {'text': text}))
         held.update(reference['path'] for reference in references)
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='project_route_inputs'").fetchone():
+        for row in conn.execute("SELECT json_extract(payload_json,'$.native_text_v1.media') FROM project_route_inputs"):
+            held.update(ref['path'] for ref in json.loads(row[0] or '[]'))
     return held
 
 

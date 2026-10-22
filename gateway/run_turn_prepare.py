@@ -20,7 +20,7 @@ from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.event import MessageEvent
 from gateway.session import (
-    SessionSource, _session_key_namespace, build_channel_continuity_note,
+    SessionContext, SessionSource, _session_key_namespace, build_channel_continuity_note,
     build_session_context,
 )
 from gateway.session_transcript import TranscriptReadError
@@ -117,6 +117,42 @@ def _recover_or_remember_model(runner, skey, model):
 
 
 class GatewayTurnPrepareMixin:
+    def _set_session_env(self, context: SessionContext) -> list:
+        """Set session context variables (contextvars, not os.environ, so concurrent messages can't
+        overwrite each other). Returns reset tokens for ``_clear_session_env`` in a ``finally``."""
+        from gateway.session_context import set_session_vars
+        # Async-delivery capability tells async tools whether this channel can wake a later turn. Default
+        # True keeps CLI/unknown paths working; stateless adapters (api_server) declare False.
+        _adapter = (getattr(self, "adapters", None) or {}).get(context.source.platform)
+        _async_delivery = getattr(_adapter, "supports_async_delivery", True)
+        # #98619: an admitted API turn carries its session-id provenance in the admission settings,
+        # and its rebound browser-controller identity; every other platform leaves both undeclared.
+        from gateway.session_api_turn import api_session_vars
+        _api_vars = api_session_vars()
+        _history_delivery = _api_vars.pop("session_history_delivery", None)
+        from gateway.project_routing import route_of
+        _project_route = route_of(context.source)
+        return set_session_vars(
+            platform=context.source.platform.value,
+            chat_id=context.source.chat_id,
+            chat_type=str(context.source.chat_type) if context.source.chat_type else "",
+            chat_name=context.source.chat_name or "",
+            thread_id=str(context.source.thread_id) if context.source.thread_id else "",
+            user_id=str(context.source.user_id) if context.source.user_id else "",
+            user_id_alt=str(context.source.user_id_alt) if context.source.user_id_alt else "",
+            user_name=str(context.source.user_name) if context.source.user_name else "",
+            scope_id=str(getattr(context.source, "scope_id", "") or ""),
+            parent_chat_id=str(getattr(context.source, "parent_chat_id", "") or ""),
+            session_key=context.session_key,
+            # A cached agent binds HERMES_SESSION_ID only on the turn that built it; every later turn
+            # (and a command it yields to the background) must still see its own session.
+            session_id=context.session_id or "",
+            message_id=str(context.source.message_id) if context.source.message_id else "",
+            profile=getattr(context.source, "profile", "") or "",
+            async_delivery=_async_delivery,
+            cwd=_project_route.cwd if _project_route else "",
+            cron_session="", session_history_delivery=_history_delivery, **_api_vars)
+
     def _resolve_session_agent_runtime(
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,
         user_config: Optional[dict] = None,
@@ -315,6 +351,11 @@ class GatewayTurnPrepareMixin:
         """Resolve ``source`` to its session entry (topic recovery, internal-route guards, Telegram
         topic-binding heal). Returns ``(source, session_entry, session_key)`` or ``None`` to drop
         the event."""
+        from gateway.project_routing import route_of
+        if route_of(source) is not None:
+            entry = await self.async_session_store.get_or_create_session(source)
+            self._cache_session_source(entry.session_key, source)
+            return source, entry, entry.session_key
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's last-active topic so a
         # cross-topic Reply doesn't fragment the conversation.
         event_metadata = getattr(event, "metadata", None) or {}
@@ -699,6 +740,9 @@ class GatewayTurnPrepareMixin:
             from gateway.session_results import record_unexecuted_failure
             return record_unexecuted_failure(t("gateway.errors.history_unavailable")), _session_env_tokens
 
+        from gateway.project_routing import project_handoff
+        if not history and (handoff := project_handoff(source)):
+            turn_sidecar_notes.append(handoff)
         await self._hmwa_first_contact_notes(source, history, turn_sidecar_notes, internal=event.internal)
 
         # Voice channel state rides the user message ONLY when changed (in the system prompt it
