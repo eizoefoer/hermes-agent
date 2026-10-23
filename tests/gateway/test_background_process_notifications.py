@@ -247,6 +247,7 @@ async def test_inject_watch_notification_routes_from_session_store_origin(monkey
     runner = _build_runner(monkeypatch, tmp_path, "all")
     adapter = runner.adapters[Platform.TELEGRAM]
     runner.session_store._entries["agent:main:telegram:group:-100:42"] = SimpleNamespace(
+        session_key="agent:main:telegram:group:-100:42",
         origin=SessionSource(
             platform=Platform.TELEGRAM,
             chat_id="-100",
@@ -299,6 +300,7 @@ async def test_post_turn_watch_drain_all_injects_from_queued_event_origin(monkey
     runner = _build_runner(monkeypatch, tmp_path, "all")
     adapter = runner.adapters[Platform.TELEGRAM]
     runner.session_store._entries["agent:main:telegram:dm:123:42"] = SimpleNamespace(
+        session_key="agent:main:telegram:dm:123:42",
         origin=SessionSource(
             platform=Platform.TELEGRAM,
             chat_id="123",
@@ -340,6 +342,7 @@ async def test_inject_watch_notification_drops_stale_trigger_reply_anchor(monkey
     runner = _build_runner(monkeypatch, tmp_path, "all")
     adapter = runner.adapters[Platform.TELEGRAM]
     runner.session_store._entries["agent:main:telegram:dm:123:24296"] = SimpleNamespace(
+        session_key="agent:main:telegram:dm:123:24296",
         origin=SessionSource(
             platform=Platform.TELEGRAM,
             chat_id="123",
@@ -385,6 +388,7 @@ async def test_inject_watch_notification_loads_session_store_off_loop(monkeypatc
     runner = _build_runner(monkeypatch, tmp_path, "all")
     adapter = runner.adapters[Platform.TELEGRAM]
     runner.session_store._entries["agent:main:telegram:dm:123:24296"] = SimpleNamespace(
+        session_key="agent:main:telegram:dm:123:24296",
         origin=SessionSource(
             platform=Platform.TELEGRAM,
             chat_id="123",
@@ -428,6 +432,7 @@ async def test_inject_watch_notification_ignores_foreground_event_source(monkeyp
 
     # Session store has the process's original thread (thread 42)
     runner.session_store._entries["agent:main:telegram:group:-100:42"] = SimpleNamespace(
+        session_key="agent:main:telegram:group:-100:42",
         origin=SessionSource(
             platform=Platform.TELEGRAM,
             chat_id="-100",
