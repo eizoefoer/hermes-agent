@@ -91,7 +91,15 @@ class SessionLifecycleMixin:
 
     def _route_reset_reason(self, entry: SessionEntry) -> Optional[str]:
         """Only explicit suspension replaces a routed conversation; time never does."""
-        return "suspended" if entry.suspended else None
+        if entry.suspended:
+            return 'suspended'
+        if ':telegram:project:' in entry.session_key:
+            db = self._db_for_key(entry.session_key)
+            tip = db.get_compression_tip(entry.session_id) or entry.session_id
+            row = db.get_session(tip)
+            if row and (row.get('archived') or row.get('end_reason')):
+                return 'project_session_boundary'
+        return None
 
     def _update_entry(self, session_key: str, mutate) -> bool:
         """Apply ``mutate(entry)`` under ``_lock`` and full-save; False when the entry is missing

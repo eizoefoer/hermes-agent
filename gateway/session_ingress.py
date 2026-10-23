@@ -233,7 +233,8 @@ async def execute_admission(authority, ref, row):
     event._turn_marker_handoff = True
     handed = False
     try:
-        with await _execution_scope(authority, home):
+        from gateway.project_routing import execution_scope
+        with await _execution_scope(authority, home), execution_scope(event.source):
             if is_api:
                 # Committed media resolves under the owning profile's home, like admission did.
                 prepared = prepare_api_execution(authority, ref, row['payload'])
@@ -367,6 +368,8 @@ async def dispatch_shared_busy(adapter, event, session_key):
         event._turn_marker_handoff = getattr(adapter, 'gateway_runner', None) is not None
         try:
             response = await adapter._message_handler(event)
+            from gateway.session_identity import replace_source
+            delivery_event.source = replace_source(event.source)
             # The ledgered send releases the marker off the event it sends.
             _move_marker(event, delivery_event)
             delivery_event._turn_marker_handoff = event._turn_marker_handoff

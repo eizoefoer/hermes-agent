@@ -1172,13 +1172,24 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin)
         if authority is not None and not event.get_command() and not is_internal:
             from gateway.session_ingress import admit_message, executing_admission
             if not executing_admission.get():
+                if await self._route_plaintext_approval_while_busy(event, _quick_key):
+                    return True, None
+                from gateway.project_routing import route_inbound, ProjectChoiceRequired
+                try:
+                    await route_inbound(self, authority, event)
+                except ProjectChoiceRequired as exc:
+                    return True, str(exc)
+                if getattr(source, '_project_status', None) is not None:
+                    return True, source._project_status
+                _quick_key = self._session_key_for_source(source)
                 # The durable FIFO only orders turns; busy_input_mode still decides what a follow-up
                 # does to the RUNNING one (steer into it, redirect it, or end it so the FIFO advances).
                 # Without this, ``interrupt`` degrades to ``queue`` behind a turn that may hang for
                 # its whole request timeout.
                 # A bare "yes"/"no" to a blocking dangerous-command approval answers it (#46866):
                 # never an interrupt (read as deny) nor a queued turn (auto-deny deadlock).
-                if self._is_session_running(_quick_key) and (
+                from gateway.project_routing import route_of
+                if route_of(source) is None and self._is_session_running(_quick_key) and (
                         await self._route_plaintext_approval_while_busy(event, _quick_key)
                         or await self._hm_busy_preempt(event, source, _quick_key)):
                     return True, None
@@ -1218,10 +1229,12 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin)
             return _paused_notice
 
         _quick_key = self._session_key_for_source(source)
-        _reply = None if is_internal else await self._hm_pending_reply_intercepts(event, source, _quick_key)
+        from gateway.project_routing import pending_project_reply
+        _reply = await pending_project_reply(self, event, is_internal, _quick_key)
         if _reply is not None:
             return _reply
 
+        _quick_key = self._session_key_for_source(source)
         _owned, _authority_reply = await self._hm_authority_admission(event, source, _quick_key, is_internal)
         if _owned:
             return _authority_reply
@@ -1280,7 +1293,9 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin)
                 if _consumed:
                     return _consumer_reply
             try:
-                _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+                from gateway.project_routing import execution_scope
+                with execution_scope(source):
+                    _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             except TurnLeaseTimeoutError as exc:
                 # A rejected message, not a completed turn: return before the /goal judge so it
                 # cannot consume the resend notice and enqueue a synthetic continuation loop.

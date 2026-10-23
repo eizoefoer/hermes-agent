@@ -213,6 +213,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         Only ``MEDIA:`` directives — the explicit attachment contract — trigger post-stream uploads. See
         #20834.
         """
+        from gateway.project_routing import check_delivery, record_reply_anchor
+        check_delivery(self, event.source)
         from urllib.parse import quote as _quote
         with _log_suppressed(logging.WARNING, "Post-stream media extraction failed: %s"):
             # Capture [[as_document]] before extract_media strips it: images then go via send_document.
@@ -245,20 +247,24 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             if image_paths:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                    await adapter.send_multiple_images(chat_id=chat_id, images=images, metadata=_thread_meta)
+                    check_delivery(self, event.source)
+                    result = await adapter.send_multiple_images(chat_id=chat_id, images=images, metadata=_thread_meta)
+                    await record_reply_anchor(self, event, result)
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
             for media_path, is_voice in non_image_media:
                 try:
+                    check_delivery(self, event.source)
                     ext = Path(media_path).suffix.lower()
                     if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
-                        await adapter.send_voice(
+                        result = await adapter.send_voice(
                             chat_id=chat_id, audio_path=media_path, metadata=_thread_meta, is_voice=is_voice,
                         )
                     elif ext in _VIDEO_EXTS:
-                        await adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=_thread_meta)
+                        result = await adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=_thread_meta)
                     else:
-                        await adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=_thread_meta)
+                        result = await adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=_thread_meta)
+                    await record_reply_anchor(self, event, result)
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
 
@@ -295,10 +301,13 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     and not getattr(stream_consumer, "_turn_split_delivery", False)
                 ):
                     try:
+                        from gateway.project_routing import check_delivery, record_reply_anchor
+                        check_delivery(self, source)
                         _edit_res = await adapter.edit_message(
                             chat_id=source.chat_id, message_id=_sc_msg_id, content=text_content, finalize=True,
                         )
                         if getattr(_edit_res, "success", False):
+                            await record_reply_anchor(self, MessageEvent(text='', source=source), _edit_res)
                             _reconciled = True
                             logger.info(
                                 "Queued-lane final reconciled by editing message %s in place (no duplicate send).",
@@ -633,9 +642,12 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 self.session_store._ensure_loaded()
                 entry = self.session_store._entries.get(session_key)
                 if entry and getattr(entry, "origin", None):
-                    return self._restored_source(entry)
+                    from gateway.session_automation import process_action_source
+                    return process_action_source(self, entry, self._restored_source(entry), evt)
             except Exception as exc:
                 logger.debug("Synthetic process-event session-store lookup failed for %s: %s", session_key, exc)
+            if ":telegram:project:" in session_key:
+                return None
             cached_source = self._get_cached_session_source(session_key)
             if cached_source is not None:
                 return cached_source

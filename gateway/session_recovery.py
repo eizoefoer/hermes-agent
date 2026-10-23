@@ -25,7 +25,12 @@ def _origin_json(source) -> Optional[str]:
     if source is None:
         return None
     try:
-        return json.dumps(source.to_dict())
+        from gateway.project_routing import route_of
+        route = route_of(source)
+        encoded = source.to_dict()
+        if route is not None:
+            encoded['project_route_receipt'] = route.receipt_id
+        return json.dumps(encoded)
     except Exception:
         return None
 
@@ -91,6 +96,10 @@ class SessionRecoveryMixin:
     def _generate_session_key(self, source: SessionSource, key_source: Optional[SessionSource] = None) -> str:
         """Session key for *source* (profile from *source*; key from *key_source* if given)."""
         from gateway.session import build_session_key
+        from gateway.project_routing import route_of
+        routed = route_of(source)
+        if routed is not None and key_source is None:
+            return routed.execution_key
         return build_session_key(
             key_source if key_source is not None else source,
             group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
@@ -264,9 +273,11 @@ class SessionRecoveryMixin:
         """Find and gate a recoverable row -> (entry or None, migrated_legacy). The legacy
         (pre-workspace) Slack key fallback lives here: exact-key lookup, claimed once per process;
         ``migrated_legacy`` tells the caller to rewrite the peer row to the scoped key."""
+        from gateway.project_routing import route_of
+        project = route_of(source)
         legacy_key = self._legacy_slack_session_key(source)
         recovered = self._find_gateway_session_row(
-            session_key=session_key, source=source, allow_peer_fallback=legacy_key is None,
+            session_key=session_key, source=source, allow_peer_fallback=legacy_key is None and project is None,
             raise_on_lookup_error=raise_on_lookup_error)
         migrated_legacy = False
         if not recovered and legacy_key and self._claim_legacy_slack_key(legacy_key):
@@ -275,6 +286,10 @@ class SessionRecoveryMixin:
                 raise_on_lookup_error=raise_on_lookup_error)
             migrated_legacy = bool(recovered)
         if not isinstance(recovered, dict):
+            return None, False
+        if project is not None and (recovered.get('archived') or recovered.get('end_reason')
+                                    or recovered.get('session_key') != session_key
+                                    or recovered.get('cwd') != project.cwd):
             return None, False
         if not self._recovered_row_matches_source_scope(recovered, source):
             return None, False
@@ -418,9 +433,12 @@ class SessionRecoveryMixin:
         (parent/_reset_from) land atomically in the INSERT so a crash right after cannot strand the
         row unroutable."""
         from gateway.session_identity import transport_profile_of
+        from gateway.project_routing import route_of
+        project = route_of(origin)
         return {
             "session_id": session_id,
             "source": source_value,
+            "cwd": project.cwd if project else None,
             "user_id": origin.user_id if origin else None,
             "session_key": session_key,
             "chat_id": origin.chat_id if origin else None,

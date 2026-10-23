@@ -44,6 +44,10 @@ def holds_busy_burst(adapter, session_key):
 async def dispatch_busy_burst(adapter, event, session_key):
     """``dispatch_shared_busy`` for one busy input, merging a same-sender PHOTO+PHOTO or
     queue-mode TEXT+TEXT burst first."""
+    from gateway.project_routing import adapter_routing_enabled
+    if adapter_routing_enabled(adapter, event):
+        from gateway.session_ingress import dispatch_shared_busy
+        return await dispatch_shared_busy(adapter, event, session_key)
     from gateway.platforms.base import merge_pending_message_event
     from gateway.session_ingress import dispatch_shared_busy
     kind, bursts = _kind(adapter, event), _state(adapter, '_shared_bursts')

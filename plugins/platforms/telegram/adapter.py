@@ -180,6 +180,7 @@ _MEDIA_KIND_KEYS = {
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from plugins.platforms.telegram.telegram_entities import expand_link_entities
 from plugins.platforms.telegram.telegram_callback_admission import TelegramCallbackAdmissionMixin
+from plugins.platforms.telegram.telegram_project_routing import TelegramProjectRoutingMixin
 from plugins.platforms.telegram.telegram_held_inbound import TelegramHeldInboundMixin
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
 from plugins.platforms.telegram.telegram_network import (
@@ -512,7 +513,7 @@ class _PollingStallError(RuntimeError):
     """
 
 
-class TelegramAdapter(TelegramCallbackAdmissionMixin, TelegramHeldInboundMixin, BasePlatformAdapter):
+class TelegramAdapter(TelegramProjectRoutingMixin, TelegramCallbackAdmissionMixin, TelegramHeldInboundMixin, BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
 
     # Bound for the per-(chat_id, status_key) status-message cache; FIFO half-trim on overflow.
@@ -4683,7 +4684,7 @@ class TelegramAdapter(TelegramCallbackAdmissionMixin, TelegramHeldInboundMixin, 
         for prefix, handler in (
             ("gt:", self._handle_gmail_triage_callback), ("ea:", self._handle_exec_approval_callback),
             ("sc:", self._handle_slash_confirm_callback), ("cl:", self._handle_clarify_callback),
-            ("pa:", self._handle_signed_approval_callback),
+            ("pa:", self._handle_signed_approval_callback), ("pr:", self._handle_project_choice_callback),
             ("update_prompt:", self._handle_update_prompt_callback)):
             if data.startswith(prefix):
                 await handler(query, data, cb)
@@ -6514,11 +6515,6 @@ class TelegramAdapter(TelegramCallbackAdmissionMixin, TelegramHeldInboundMixin, 
 
     # -- Text message aggregation (handles Telegram client-side splits) --
 
-    def _text_batch_key(self, event: MessageEvent) -> str:
-        """Session-scoped batching key; topic recovery first so DM-topic batches coalesce on the recovered lane."""
-        self._apply_topic_recovery(event)
-        return super()._text_batch_key(event)
-
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text chunk, or hold it while delayed delivery must be dropped."""
         if self._should_drop_delayed_delivery():
@@ -6616,16 +6612,6 @@ class TelegramAdapter(TelegramCallbackAdmissionMixin, TelegramHeldInboundMixin, 
         if prior_task and not prior_task.done():
             prior_task.cancel()
         self._pending_photo_batch_tasks[batch_key] = asyncio.create_task(self._flush_photo_batch(batch_key))
-
-    async def _route_photo_event(self, msg, event: MessageEvent) -> None:
-        """Album items debounce on media_group_id; singles go through the photo burst batcher."""
-        if self._drop_unresolved(event):  # identity FIRST: the batch lane is derived from it
-            return
-        media_group_id = getattr(msg, "media_group_id", None)
-        if media_group_id:
-            await self._queue_media_group_event(str(media_group_id), event)
-        else:
-            self._enqueue_photo_event(self._photo_batch_key(event, msg), event)
 
     @staticmethod
     def _ext_from_path(file_path: Optional[str], candidates, default: str) -> str:
@@ -6810,6 +6796,10 @@ class TelegramAdapter(TelegramCallbackAdmissionMixin, TelegramHeldInboundMixin, 
             if await self._cache_inbound_av(msg, event, msg.video, "video file", "video", ".mp4", "video/mp4"):
                 return
         elif msg.document and await self._cache_inbound_document(msg, event):
+            return
+        from gateway.project_routing import adapter_routing_enabled
+        if adapter_routing_enabled(self, event):
+            await self.handle_message(event)
             return
         media_group_id = getattr(msg, "media_group_id", None)
         if media_group_id:
@@ -7242,6 +7232,8 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
             extras.setdefault(key, value)
         _set_env(env, value)
 
+    if "project_routing" in telegram_cfg:
+        extras["project_routing"] = telegram_cfg["project_routing"]
     if "disable_topic_auto_rename" in telegram_cfg:
         extras.setdefault("disable_topic_auto_rename", telegram_cfg["disable_topic_auto_rename"])
     _effective_rm = telegram_cfg.get("require_mention", yaml_cfg.get("require_mention"))

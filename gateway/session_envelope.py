@@ -129,6 +129,15 @@ def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_sourc
                 'route': runner.session_store._generate_session_key(event.source),
                 'event': deepcopy({name: getattr(event, name) for name in _EVENT_FIELDS}),
                 'timestamp': event.timestamp.isoformat()}
+    from gateway.project_routing import route_of
+    routed = route_of(event.source)
+    if routed is not None:
+        from dataclasses import asdict
+        envelope['project_route'] = asdict(routed)
+    from gateway.project_choices import pending_choice
+    choice = pending_choice(event.source)
+    if choice is not None:
+        envelope['project_choice'] = deepcopy(choice)
     if event.source.platform.value == 'webhook':
         from gateway.platforms.webhook_delivery import route_digest, snapshot_destination
         adapter = runner._adapter_for_source(event.source)
@@ -178,6 +187,11 @@ def restore_native_source(payload, runner=None):
     envelope = payload['native_text_v1']
     source = SessionSource.from_dict(envelope['source'])
     source.is_bot = envelope['source']['is_bot']
+    if 'project_route' in envelope:
+        from gateway.project_routing import ProjectRoute
+        source._project_route = ProjectRoute(**envelope['project_route'])
+    if 'project_choice' in envelope:
+        source._project_choice = deepcopy(envelope['project_choice'])
     # Private descriptor requests a fresh check, never supplies the verdict.
     source.role_authorized = envelope.get('reauthorize') == 'roles'
     if 'provenance' in envelope:
@@ -225,6 +239,9 @@ async def check_native_route(runner, payload, session_id, available_source, adap
     _validate_native(runner, event, provenance, fresh_roles)
     route = payload['native_text_v1']['route']
     store = runner.session_store
+    if 'project_route' in payload['native_text_v1']:
+        from gateway.project_routing import check_native_project_route
+        check_native_project_route(runner, payload, session_id, available_source)
     if (store._generate_session_key(event.source) != route
             or store._generate_session_key(available_source) != route):
         raise RuntimeStoreError('admission_conflict')

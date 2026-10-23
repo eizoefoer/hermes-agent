@@ -1623,7 +1623,7 @@ DEFAULT_CONFIG = {
         # reply_prefix: None = built-in "☤ *Hermes Agent*" header; "" disables; \n allowed.
     },
 
-    "telegram": {
+    "telegram": {"project_routing": {"enabled": False, "eligible_projects": [], "aliases": {}, "references": {}},
         "reactions": False,  # add 👀/✅/❌ reactions to messages during processing
         # per-chat/topic ephemeral system prompts (topics inherit from parent group)
         "channel_prompts": {},

@@ -13,6 +13,12 @@
   "supported_hosts": ["Linux", "macOS"],
   "excluded_host_scope": ["Unrelated Windows desktop repair is not a release prerequisite; shared-code regressions remain blocking."],
   "required_paths": [
+    "tests/gateway/test_project_routing.py",
+    "tests/gateway/test_project_choices.py",
+    "tests/gateway/test_project_routing_native.py",
+    "tests/gateway/test_project_routing_authorization.py",
+    "tests/gateway/test_project_routing_agent.py",
+    "tests/gateway/test_project_routing_contracts.py",
     "tests/gateway/test_signed_approval_callback.py",
     "tests/gateway/test_signed_telegram_approval_compatibility.py",
     "tests/gateway/test_telegram_signed_approval_ingress.py",
