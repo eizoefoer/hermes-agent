@@ -248,3 +248,26 @@ async def test_session_deletion_releases_completed_project_media_after_history_r
     assert retained.exists(), 'native transcript ownership must retain completed media'
     r.authority.db.delete_session(sid)
     assert not retained.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['missing_trigger', 'invalid_authority'])
+async def test_process_origin_refusal_never_borrows_latest_topic(routed, monkeypatch, failure):
+    from hermes_state_runtime import RuntimeStoreError
+    r = routed
+    first = r.incoming('trading original', 101)
+    second = r.incoming('trading later', 102, thread='20198')
+    for ev in [first, second]:
+        await r.adapter.handle_message(ev)
+        await idle(r)
+    key = route_of(first.source).execution_key
+    monkeypatch.setattr(r.runner, '_get_cached_session_source', lambda _key: second.source)
+    event = {'session_key': key, 'message_id': first.message_id}
+    if failure == 'missing_trigger':
+        event.pop('message_id')
+    else:
+        def refuse(*args, **kwargs):
+            raise RuntimeStoreError('permission_denied')
+        monkeypatch.setattr('gateway.project_routing.validate_route', refuse)
+    with owner_scope(r.authority):
+        assert r.runner._build_process_event_source(event) is None

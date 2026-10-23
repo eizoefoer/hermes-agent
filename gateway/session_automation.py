@@ -121,8 +121,10 @@ def process_action_source(runner, entry, source, event):
     from gateway.project_routing import route_of, validate_route, routing_context
     route = route_of(source)
     trigger = str(event.get('message_id') or '').strip()
-    if route is None or not trigger:
-        return source
+    if route is None:
+        return None if ":telegram:project:" in entry.session_key else source
+    if not trigger:
+        return None
     from gateway.session_authorities import authority_for_home
     from gateway.session_envelope import restore_native_source
     from hermes_state_runtime import list_session_admissions
