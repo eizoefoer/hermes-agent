@@ -185,7 +185,7 @@ ready.touch()
 if sys.stdin.readline() != 'release\\n':
     raise SystemExit('missing explicit release command')
 os.close(fd)
-released.write_text(str(time.time()), encoding='utf-8')
+released.write_text(str(int(time.time())), encoding='utf-8')
 """
 
 
